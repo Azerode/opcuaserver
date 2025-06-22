@@ -1,3 +1,22 @@
+# Build directories
+build/
+bin/
+deps/
+
+# Project specific
+*.log
+*.pem
+*.der
+*.crt
+*.key
+
+# IDE specific files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
 # Prerequisites
 *.d
 
@@ -21,6 +40,7 @@
 *.a
 *.la
 *.lo
+
 
 # Shared objects (inc. Windows DLLs)
 *.dll
@@ -50,3 +70,8 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+
+# macOS specific
+.DS_Store
+.AppleDouble
+.LSOverride

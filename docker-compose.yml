@@ -1,0 +1,16 @@
+services:
+  opcua-server:
+    hostname: opcua-server-test 
+    build: .
+    ports:
+      - "62541:62541"
+    volumes:
+      - ./config:/app/config
+      - ./config/machines:/app/config/machine
+      - ./certificates:/etc/ssl/opcua-server
+    networks:
+      - opcua-network
+
+networks:
+  opcua-network:
+    driver: bridge

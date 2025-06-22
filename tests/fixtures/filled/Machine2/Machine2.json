@@ -1,0 +1,32 @@
+{
+    "Name": "Machine2",
+    "Url": "opc.tcp://server-opcua-test:4840",
+    "Namespace": "Machine2",
+    "Subscriptions": [
+        {
+            "Name": "FLAGS",
+            "Items": [
+                {
+                    "Name": "PC",
+                    "NodeId": "ns=3;i=1000",
+                    "Type": "System.Int16"
+                },
+                {
+                    "Name": "PLC",
+                    "NodeId": "ns=3;i=1001",
+                    "Type": "System.Int16"
+                }
+            ]
+        }, 
+        {
+            "Name": "DATA",
+            "Items": [
+                {
+                    "Name": "NB_POLES",
+                    "NodeId": "ns=3;i=1002",
+                    "Type": "System.Int32"
+                }
+            ]
+        }
+    ]
+}
