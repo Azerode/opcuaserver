@@ -1,30 +1,30 @@
 {
-    "Name": "Machine2",
-    "Url": "opc.tcp://server-opcua-test:4840",
-    "Namespace": "Machine2",
-    "Subscriptions": [
+    "name": "Machine2",
+    "url": "opc.tcp://server-opcua-test:4840",
+    "namespace": "Machine2",
+    "subscriptions": [
         {
-            "Name": "FLAGS",
-            "Items": [
+            "name": "FLAGS",
+            "items": [
                 {
-                    "Name": "PC",
-                    "NodeId": "ns=3;i=1000",
-                    "Type": "System.Int16"
+                    "name": "PC",
+                    "nodeId": "ns=3;i=1000",
+                    "type": "System.Int16"
                 },
                 {
-                    "Name": "PLC",
-                    "NodeId": "ns=3;i=1001",
-                    "Type": "System.Int16"
+                    "name": "PLC",
+                    "nodeId": "ns=3;i=1001",
+                    "type": "System.Int16"
                 }
             ]
         }, 
         {
-            "Name": "DATA",
-            "Items": [
+            "name": "DATA",
+            "items": [
                 {
-                    "Name": "NB_POLES",
-                    "NodeId": "ns=3;i=1002",
-                    "Type": "System.Int32"
+                    "name": "NB_POLES",
+                    "nodeId": "ns=3;i=1002",
+                    "type": "System.Int32"
                 }
             ]
         }

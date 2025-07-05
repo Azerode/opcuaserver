@@ -43,4 +43,4 @@ WORKDIR /app
 
 EXPOSE 62541
 
-CMD ["./opcuaserver", "/app/config/server/config.json5", "/app/config/machine"]
+ENTRYPOINT ["./opcuaserver", "-c", "/app/config/server/config.json5", "-m","/app/config/machine"]
