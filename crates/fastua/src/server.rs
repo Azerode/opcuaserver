@@ -112,7 +112,10 @@ pub struct Session {
     pub activated: AtomicBool,
     pub closed: AtomicBool,
     pub timeout_ms: f64,
-    /// Milliseconds since server start of the last request.
+    /// Set by every request (a plain store, no clock read on the hot path).
+    pub touched: AtomicBool,
+    /// Milliseconds since server start of the last activity, as seen by the
+    /// once-a-second sweeper.
     pub last_seen: AtomicU64,
     pub continuation_points: Mutex<Vec<ContinuationPoint>>,
     /// Security of the channel the session was created on.
@@ -291,6 +294,7 @@ impl Server {
             activated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             timeout_ms,
+            touched: AtomicBool::new(false),
             last_seen: AtomicU64::new(self.uptime_ms()),
             continuation_points: Mutex::new(Vec::new()),
             security,
@@ -316,6 +320,9 @@ impl Server {
         let now = self.uptime_ms();
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.retain(|_, s| {
+            if s.touched.swap(false, Ordering::Relaxed) {
+                s.last_seen.store(now, Ordering::Relaxed);
+            }
             let idle = now.saturating_sub(s.last_seen.load(Ordering::Relaxed)) as f64;
             let keep = idle <= s.timeout_ms;
             if !keep {

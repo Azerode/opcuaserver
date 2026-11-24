@@ -29,7 +29,8 @@ pub struct RequestHeader {
     pub handle: u32,
     pub return_diagnostics: u32,
     pub timeout_hint: u32,
-    /// Server clock when the request was decoded: the single clock read of a request.
+    /// Coarse server clock (1-4 ms resolution, a few ns to read) when the
+    /// request was decoded: the ResponseHeader timestamp.
     pub now: i64,
 }
 
@@ -42,7 +43,7 @@ impl RequestHeader {
         let _audit = r.str()?;
         let timeout_hint = r.u32()?;
         let _additional = r.extension_object_raw()?;
-        Ok(RequestHeader { auth_token, handle, return_diagnostics, timeout_hint, now: now_ticks() })
+        Ok(RequestHeader { auth_token, handle, return_diagnostics, timeout_hint, now: coarse_now_ticks() })
     }
 }
 
@@ -142,7 +143,7 @@ fn session_ref<'c>(ctx: &'c mut Ctx, header: &RequestHeader, must_be_active: boo
             return Err(status::BAD_SECURE_CHANNEL_ID_INVALID);
         }
     }
-    s.last_seen.store(ctx.server.uptime_ms(), Ordering::Relaxed);
+    s.touched.store(true, Ordering::Relaxed);
     Ok(s)
 }
 
@@ -489,11 +490,11 @@ fn write_bad(w: &mut Writer, code: u32) {
 
 /// DataValue for a non-Value attribute: only the server timestamp may apply.
 #[inline]
-fn write_attr(w: &mut Writer, v: &Variant, ts: Timestamps, now: i64) {
+fn write_attr(w: &mut Writer, v: &Variant, ts: Timestamps) {
     w.u8(0x01 | if ts.server { 0x08 } else { 0 });
     w.variant(v);
     if ts.server {
-        w.i64(now);
+        w.i64(now_ticks());
     }
 }
 
@@ -528,12 +529,17 @@ fn write_cell(w: &mut Writer, cell: &ValueCell, ts: Timestamps) {
 }
 
 #[inline]
-fn write_value(w: &mut Writer, space: &AddressSpace, src: &ValueSource, ts: Timestamps, now: i64) {
+/// Cell values carry their own timestamps; only generated values read the
+/// precise clock.
+fn write_value(w: &mut Writer, space: &AddressSpace, src: &ValueSource, ts: Timestamps) {
     match src {
         ValueSource::Cell(c) => write_cell(w, c, ts),
-        ValueSource::Static(v) => write_dynamic(w, v, ts, now),
-        ValueSource::CurrentTime => write_dynamic(w, &Variant::DateTime(now), ts, now),
-        ValueSource::ServerStatus => write_dynamic(w, &encode_server_status(&space.info), ts, now),
+        ValueSource::Static(v) => write_dynamic(w, v, ts, now_ticks()),
+        ValueSource::CurrentTime => {
+            let now = now_ticks();
+            write_dynamic(w, &Variant::DateTime(now), ts, now)
+        }
+        ValueSource::ServerStatus => write_dynamic(w, &encode_server_status(&space.info), ts, now_ticks()),
     }
 }
 
@@ -550,22 +556,14 @@ fn write_dynamic(w: &mut Writer, v: &Variant, ts: Timestamps, now: i64) {
     }
 }
 
-fn write_attribute(
-    w: &mut Writer,
-    space: &AddressSpace,
-    node: &Node,
-    attribute: u32,
-    ts: Timestamps,
-    now: i64,
-    can_write: bool,
-) {
+fn write_attribute(w: &mut Writer, space: &AddressSpace, node: &Node, attribute: u32, ts: Timestamps, can_write: bool) {
     use attr::*;
     let v = match (attribute, &node.kind) {
         (VALUE, NodeKind::Variable { value, access, .. }) => {
             if access & ACCESS_READ == 0 {
                 return write_bad(w, status::BAD_NOT_READABLE);
             }
-            return write_value(w, space, value, ts, now);
+            return write_value(w, space, value, ts);
         }
         (NODE_ID, _) => Variant::NodeId(Box::new(node.id.clone())),
         (NODE_CLASS, _) => Variant::Int32(node.class() as i32),
@@ -606,7 +604,7 @@ fn write_attribute(
         (HISTORIZING, NodeKind::Variable { .. }) => Variant::Boolean(false),
         _ => return write_bad(w, status::BAD_ATTRIBUTE_ID_INVALID),
     };
-    write_attr(w, &v, ts, now);
+    write_attr(w, &v, ts);
 }
 
 fn read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
@@ -628,7 +626,6 @@ fn read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SRe
     check_count(ctx, n)?;
 
     let space = ctx.server.store.cached(ctx.space);
-    let now = h.now;
     begin(w, ids::READ_RESPONSE, h);
     w.i32(n as i32);
     for _ in 0..n {
@@ -655,7 +652,7 @@ fn read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SRe
             write_bad(w, bad);
             continue;
         }
-        write_attribute(w, space, node, attribute, ts, now, can_write);
+        write_attribute(w, space, node, attribute, ts, can_write);
     }
     w.empty_array(); // diagnosticInfos
     Ok(())
@@ -666,7 +663,7 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
     let n = r.length(11).map_err(decode_err)?.unwrap_or(0);
     check_count(ctx, n)?;
     let space = ctx.server.store.cached(ctx.space);
-    let now = h.now;
+    let now = now_ticks(); // server timestamp of the written values
     begin(w, ids::WRITE_RESPONSE, h);
     w.i32(n as i32);
     for _ in 0..n {

@@ -425,6 +425,20 @@ pub fn now_ticks() -> i64 {
     (t.tv_sec as i64 + EPOCH_DIFF_SECS) * 10_000_000 + t.tv_nsec as i64 / 100
 }
 
+/// Like [`now_ticks`] from `CLOCK_REALTIME_COARSE`: the time of the last
+/// kernel tick (1-4 ms resolution), read without the hardware counter. Used
+/// where the resolution is enough (ResponseHeader timestamps): ~4x cheaper on
+/// aarch64, ~6x on x86_64.
+#[inline]
+#[allow(clippy::unnecessary_cast)] // time_t / c_long are not i64 on every target
+pub fn coarse_now_ticks() -> i64 {
+    const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid pointer; CLOCK_REALTIME_COARSE exists on every Linux.
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut t) };
+    (t.tv_sec as i64 + EPOCH_DIFF_SECS) * 10_000_000 + t.tv_nsec as i64 / 100
+}
+
 /// Well-known namespace 0 node ids (subset used by the server).
 pub mod ids {
     // Data types
