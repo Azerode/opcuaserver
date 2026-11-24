@@ -51,7 +51,12 @@ fn main() {
     let pki = Pki::open(&dir.join("pki"), "urn:bench", "localhost", false).unwrap();
     let mut config = ServerConfig::all_endpoints(addr.clone(), format!("opc.tcp://{addr}"));
     config.anonymous = Some(fastua::users::Access::ReadWrite);
-    let server = Server::new(store, config, pki, Users::default());
+    let spin_config = {
+        let mut c = config.clone();
+        c.busy_poll = std::time::Duration::from_micros(200);
+        c
+    };
+    let server = Server::new(store.clone(), config, pki.clone(), Users::default());
 
     // ---- 0. clock costs (one precise read per request is unavoidable)
     for (name, f) in [("now_ticks (CLOCK_REALTIME)", now_ticks as fn() -> i64), ("coarse clock", coarse_ticks)] {
@@ -128,12 +133,26 @@ fn main() {
         println!("service layer  Read x{batch:<4} {ns:>9.0} ns/request  {:>6.1} ns/value", ns / batch as f64);
     }
 
-    // ---- 2. loopback round trip
+    // ---- 2. loopback round trip (client and server threads on the same host)
     {
         let server = server.clone();
         std::thread::spawn(move || server.serve(listener));
     }
-    let mut c = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
+    let spin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let spin_addr = spin_listener.local_addr().unwrap().to_string();
+    {
+        let server = Server::new(store, spin_config, pki, Users::default());
+        std::thread::spawn(move || server.serve(spin_listener));
+    }
+    loopback("server blocking, client blocking ", &addr, false);
+    loopback("server busy-poll, client blocking", &spin_addr, false);
+    loopback("server busy-poll, client busy-poll", &spin_addr, true);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn loopback(label: &str, addr: &str, client_spin: bool) {
+    let mut c = Client::connect(addr, &format!("opc.tcp://{addr}")).unwrap();
+    c.spin = client_spin;
     c.create_session("bench").unwrap();
     let node = [(NodeId::Numeric(2, 42), 13)];
     for _ in 0..2_000 {
@@ -148,10 +167,9 @@ fn main() {
     }
     samples.sort_unstable();
     println!(
-        "loopback TCP   Read x1    p50 {:>6.1} us  p99 {:>6.1} us  p99.9 {:>6.1} us",
+        "loopback TCP   Read x1  {label}  p50 {:>6.1} us  p99 {:>6.1} us  p99.9 {:>6.1} us",
         percentile(&samples, 0.5) as f64 / 1000.0,
         percentile(&samples, 0.99) as f64 / 1000.0,
         percentile(&samples, 0.999) as f64 / 1000.0
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }

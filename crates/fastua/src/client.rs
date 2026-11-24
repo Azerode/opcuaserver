@@ -17,6 +17,8 @@ pub struct Client {
     pub auth_token: NodeId,
     tx: Vec<u8>,
     rx: Vec<u8>,
+    /// Busy-poll for responses instead of sleeping in `recv`.
+    pub spin: bool,
 }
 
 fn invalid(msg: &str) -> io::Error {
@@ -38,6 +40,7 @@ impl Client {
             auth_token: NodeId::NULL,
             tx: Vec::with_capacity(65536),
             rx: Vec::with_capacity(65536),
+            spin: false,
         };
         let mut w = Writer::new(&mut c.tx);
         w.raw(b"HELF");
@@ -61,6 +64,13 @@ impl Client {
 
     fn read_chunk(&mut self) -> io::Result<([u8; 3], u8)> {
         let mut hdr = [0u8; 8];
+        if self.spin {
+            // Wait for data without sleeping; MSG_PEEK leaves it in the socket.
+            let mut b = [0u8; 1];
+            while crate::net::try_peek(&self.stream, &mut b)?.is_none() {
+                std::hint::spin_loop();
+            }
+        }
         self.stream.read_exact(&mut hdr)?;
         let size = u32::from_le_bytes(hdr[4..8].try_into().unwrap()) as usize;
         if size < 8 {
@@ -135,14 +145,25 @@ impl Client {
     /// Returns the response body after the response type id is checked;
     /// the response header is returned undecoded at the start of `rx`.
     pub fn call(&mut self, request_type: u32, body: impl FnOnce(&mut Writer)) -> io::Result<(u32, &[u8])> {
-        self.tx.clear();
-        self.tx.resize(24, 0);
-        let mut w = Writer::new(&mut self.tx);
+        let mut tx = std::mem::take(&mut self.tx);
+        tx.clear();
+        self.push_request(&mut tx, request_type, body);
+        let r = self.stream.write_all(&tx);
+        self.tx = tx;
+        r?;
+        self.read_response()
+    }
+
+    /// Appends one complete MSG chunk to `tx`.
+    fn push_request(&mut self, tx: &mut Vec<u8>, request_type: u32, body: impl FnOnce(&mut Writer)) {
+        let start = tx.len();
+        tx.resize(start + 24, 0);
+        let mut w = Writer::new(tx);
         w.node_id(&NodeId::ns0(request_type));
         Self::write_request_header(&mut w, &self.auth_token, self.handle);
         body(&mut w);
-        let size = self.tx.len() as u32;
-        let h = &mut self.tx[..24];
+        let size = (tx.len() - start) as u32;
+        let h = &mut tx[start..start + 24];
         h[0..4].copy_from_slice(b"MSGF");
         h[4..8].copy_from_slice(&size.to_le_bytes());
         h[8..12].copy_from_slice(&self.channel_id.to_le_bytes());
@@ -152,9 +173,10 @@ impl Client {
         self.seq += 1;
         self.request_id += 1;
         self.handle += 1;
-        self.stream.write_all(&self.tx)?;
+    }
 
-        // Reassemble chunks.
+    /// Reads one (possibly multi-chunk) response.
+    fn read_response(&mut self) -> io::Result<(u32, &[u8])> {
         let mut body = Vec::new();
         loop {
             let (ty, chunk) = self.read_chunk()?;
@@ -171,6 +193,40 @@ impl Client {
         let ty = r.node_id().map_err(|_| invalid("bad type id"))?;
         let at = r.position();
         Ok((ty.as_ns0().unwrap_or(0), &self.rx[at..]))
+    }
+
+    /// Sends `n` Read requests in a single write (pipelining), then reads the
+    /// `n` responses in order.
+    pub fn read_pipelined(&mut self, items: &[(NodeId, u32)], n: usize) -> io::Result<Vec<Vec<DataValue>>> {
+        let mut tx = Vec::new();
+        for _ in 0..n {
+            self.push_request(&mut tx, ids::READ_REQUEST, |w| Self::read_body(w, items));
+        }
+        self.stream.write_all(&tx)?;
+        (0..n).map(|_| self.parse_read_response()).collect()
+    }
+
+    fn read_body(w: &mut Writer, items: &[(NodeId, u32)]) {
+        w.f64(0.0);
+        w.u32(2);
+        w.i32(items.len() as i32);
+        for (id, a) in items {
+            w.node_id(id);
+            w.u32(*a);
+            w.str(None);
+            w.u16(0);
+            w.str(None);
+        }
+    }
+
+    fn parse_read_response(&mut self) -> io::Result<Vec<DataValue>> {
+        let (ty, body) = self.read_response()?;
+        if ty != ids::READ_RESPONSE {
+            return Err(invalid(&format!("Read failed: {:08X}", service_result(body))));
+        }
+        let mut r = Reader::new(body);
+        skip_response_header(&mut r).map_err(|_| invalid("bad header"))?;
+        r.array(1, |r| r.data_value()).map_err(|_| invalid("bad results"))
     }
 
     /// CreateSession + ActivateSession (anonymous).
@@ -218,24 +274,13 @@ impl Client {
 
     /// Reads attributes; returns one DataValue per (node, attribute).
     pub fn read(&mut self, items: &[(NodeId, u32)]) -> io::Result<Vec<DataValue>> {
-        let (ty, body) = self.call(ids::READ_REQUEST, |w| {
-            w.f64(0.0);
-            w.u32(2);
-            w.i32(items.len() as i32);
-            for (id, a) in items {
-                w.node_id(id);
-                w.u32(*a);
-                w.str(None);
-                w.u16(0);
-                w.str(None);
-            }
-        })?;
-        if ty != ids::READ_RESPONSE {
-            return Err(invalid(&format!("Read failed: {:08X}", service_result(body))));
-        }
-        let mut r = Reader::new(body);
-        skip_response_header(&mut r).map_err(|_| invalid("bad header"))?;
-        r.array(1, |r| r.data_value()).map_err(|_| invalid("bad results"))
+        let mut tx = std::mem::take(&mut self.tx);
+        tx.clear();
+        self.push_request(&mut tx, ids::READ_REQUEST, |w| Self::read_body(w, items));
+        let r = self.stream.write_all(&tx);
+        self.tx = tx;
+        r?;
+        self.parse_read_response()
     }
 
     pub fn write(&mut self, items: &[(NodeId, Variant)]) -> io::Result<Vec<u32>> {
