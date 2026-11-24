@@ -137,7 +137,37 @@ impl<'a> Reader<'a> {
         Ok(self.take(16)?.try_into().unwrap())
     }
 
+    /// Numeric encodings (nearly every NodeId on the wire) are decoded
+    /// inline; the others go through an out-of-line call.
+    #[inline(always)]
     pub fn node_id(&mut self) -> DResult<NodeId> {
+        let b = &self.buf[self.pos..];
+        match *b {
+            [0x00, v, ..] => {
+                self.pos += 2;
+                Ok(NodeId::Numeric(0, v as u32))
+            }
+            [0x01, ns, lo, hi, ..] => {
+                self.pos += 4;
+                Ok(NodeId::Numeric(ns as u16, u16::from_le_bytes([lo, hi]) as u32))
+            }
+            [0x02, n0, n1, v0, v1, v2, v3, ..] => {
+                self.pos += 7;
+                Ok(NodeId::Numeric(u16::from_le_bytes([n0, n1]), u32::from_le_bytes([v0, v1, v2, v3])))
+            }
+            // Session authentication tokens are Guids.
+            [0x04, n0, n1, ref rest @ ..] if rest.len() >= 16 => {
+                let g: [u8; 16] = rest[..16].try_into().unwrap();
+                self.pos += 19;
+                Ok(NodeId::Guid(u16::from_le_bytes([n0, n1]), g))
+            }
+            _ => self.node_id_slow(),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn node_id_slow(&mut self) -> DResult<NodeId> {
         let enc = self.u8()?;
         self.node_id_body(enc & 0x3F)
     }
@@ -177,6 +207,12 @@ impl<'a> Reader<'a> {
         Ok(ExpandedNodeId { node_id, namespace_uri, server_index })
     }
 
+    /// QualifiedName without copying the name.
+    #[inline]
+    pub fn qualified_name_ref(&mut self) -> DResult<(u16, Option<&'a str>)> {
+        Ok((self.u16()?, self.str()?))
+    }
+
     pub fn qualified_name(&mut self) -> DResult<QualifiedName> {
         let ns = self.u16()?;
         let name = self.str()?.unwrap_or("").into();
@@ -192,6 +228,11 @@ impl<'a> Reader<'a> {
 
     /// Returns (type id, encoding, borrowed body).
     pub fn extension_object_raw(&mut self) -> DResult<(NodeId, u8, &'a [u8])> {
+        // Fast path: the null extension object (every RequestHeader carries one).
+        if self.buf.get(self.pos..self.pos + 3) == Some(&[0, 0, 0]) {
+            self.pos += 3;
+            return Ok((NodeId::NULL, 0, &[]));
+        }
         let type_id = self.node_id()?;
         let enc = self.u8()?;
         let body: &'a [u8] = match enc {
@@ -407,6 +448,21 @@ impl<'a> Writer<'a> {
     #[inline(always)]
     pub fn raw(&mut self, b: &[u8]) {
         self.buf.extend_from_slice(b);
+    }
+
+    /// Appends the first `n` bytes of `b` with one capacity check and one
+    /// fixed-size copy (no `memcpy` call, no per-field length updates).
+    #[inline(always)]
+    pub fn raw_prefix<const N: usize>(&mut self, b: &[u8; N], n: usize) {
+        assert!(n <= N);
+        self.buf.reserve(N);
+        let len = self.buf.len();
+        // SAFETY: `reserve` guarantees N writable bytes after `len`; the first
+        // `n <= N` of them are initialised by the copy before `set_len`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(b.as_ptr(), self.buf.as_mut_ptr().add(len), N);
+            self.buf.set_len(len + n);
+        }
     }
 
     #[inline(always)]

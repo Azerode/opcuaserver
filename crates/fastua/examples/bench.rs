@@ -73,22 +73,37 @@ fn main() {
             }
         }
         let mut cache = Some(session.clone());
+        let mut space = None;
         let mut out = Vec::with_capacity(65536);
         let iters = 2_000_000 / batch;
         for _ in 0..iters / 10 {
             out.clear();
-            let mut ctx =
-                services::Ctx { server: &server, channel_id: 1, security: &Security::NONE, session: &mut cache };
+            let mut ctx = services::Ctx {
+                server: &server,
+                channel_id: 1,
+                security: &Security::NONE,
+                session: &mut cache,
+                space: &mut space,
+            };
             services::dispatch(&mut ctx, &mut Reader::new(&req), &mut Writer::new(&mut out));
         }
-        let t = Instant::now();
-        for _ in 0..iters {
-            out.clear();
-            let mut ctx =
-                services::Ctx { server: &server, channel_id: 1, security: &Security::NONE, session: &mut cache };
-            black_box(services::dispatch(&mut ctx, &mut Reader::new(black_box(&req)), &mut Writer::new(&mut out)));
+        // Best of 7 runs: the minimum filters out scheduler / VM noise.
+        let mut ns = f64::MAX;
+        for _ in 0..7 {
+            let t = Instant::now();
+            for _ in 0..iters {
+                out.clear();
+                let mut ctx = services::Ctx {
+                    server: &server,
+                    channel_id: 1,
+                    security: &Security::NONE,
+                    session: &mut cache,
+                    space: &mut space,
+                };
+                black_box(services::dispatch(&mut ctx, &mut Reader::new(black_box(&req)), &mut Writer::new(&mut out)));
+            }
+            ns = ns.min(t.elapsed().as_nanos() as f64 / iters as f64);
         }
-        let ns = t.elapsed().as_nanos() as f64 / iters as f64;
         println!("service layer  Read x{batch:<4} {ns:>9.0} ns/request  {:>6.1} ns/value", ns / batch as f64);
     }
 

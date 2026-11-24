@@ -6,6 +6,7 @@
 //! signed and encrypted in place behind a reserved header and sent with one
 //! `write` syscall.
 
+use crate::address_space::AddressSpace;
 use crate::codec::{Reader, Writer};
 use crate::crypto::{self, ChannelKeys, Mode, Policy, SymKeys, SYM_SIGNATURE_LEN};
 use crate::pki::CertInfo;
@@ -80,6 +81,7 @@ pub struct Connection<'a> {
     assembly_chunks: u32,
     assembly_request: u32,
     session: Option<Arc<Session>>,
+    space: Option<Arc<AddressSpace>>,
 }
 
 #[derive(Debug)]
@@ -129,6 +131,7 @@ pub fn run(server: &Arc<Server>, stream: TcpStream) -> io::Result<()> {
         assembly_chunks: 0,
         assembly_request: 0,
         session: None,
+        space: None,
     };
     match c.serve() {
         Ok(()) | Err(Fatal::Closed) => Ok(()),
@@ -418,7 +421,7 @@ impl<'a> Connection<'a> {
             w.u32(seq_out);
             w.u32(request_id);
             w.node_id(&NodeId::ns0(ids::OPEN_SECURE_CHANNEL_RESPONSE));
-            services::write_response_header(&mut w, header.handle, status::GOOD);
+            services::write_response_header(&mut w, header.now, header.handle, status::GOOD);
             w.u32(PROTOCOL_VERSION);
             w.u32(id);
             w.u32(token_id);
@@ -593,6 +596,7 @@ impl<'a> Connection<'a> {
                 channel_id: ch.id,
                 security: &ch.security,
                 session: &mut self.session,
+                space: &mut self.space,
             };
             services::dispatch(&mut ctx, &mut r, &mut w)
         };

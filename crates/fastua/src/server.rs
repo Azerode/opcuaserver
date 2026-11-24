@@ -11,7 +11,7 @@ use crate::users::{Access, Users};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub const SECURITY_POLICY_NONE: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
 pub const TRANSPORT_PROFILE_BINARY: &str = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
@@ -128,7 +128,7 @@ pub struct Server {
     pki: Arc<Pki>,
     pub users: Users,
     pub config: ServerConfig,
-    started: Instant,
+    started: u64,
     sessions: Mutex<FxHashMap<NodeId, Arc<Session>>>,
     next_session: AtomicU32,
     next_channel: AtomicU32,
@@ -216,7 +216,7 @@ impl Server {
             pki,
             users,
             config,
-            started: Instant::now(),
+            started: coarse_ms(),
             sessions: Mutex::new(FxHashMap::default()),
             next_session: AtomicU32::new(1),
             next_channel: AtomicU32::new(1),
@@ -243,9 +243,11 @@ impl Server {
         &self.config.limits
     }
 
+    /// Milliseconds since start, from the coarse monotonic clock (a few ns,
+    /// ~1-4 ms resolution): only used for session idle timeouts.
     #[inline]
     pub fn uptime_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
+        coarse_ms().wrapping_sub(self.started)
     }
 
     pub fn endpoints_encoded(&self) -> &[u8] {
@@ -277,11 +279,13 @@ impl Server {
         if sessions.len() >= self.limits().max_sessions {
             return Err(status::BAD_TOO_MANY_SESSIONS);
         }
-        let mut token = [0u8; 32];
+        // 128 random bits as a Guid NodeId: decoded without a heap allocation
+        // on every request, unlike a ByteString token.
+        let mut token = [0u8; 16];
         random_bytes(&mut token);
         let session = Arc::new(Session {
             id: NodeId::Numeric(1, self.next_session.fetch_add(1, Ordering::Relaxed)),
-            token: NodeId::Opaque(1, token.into()),
+            token: NodeId::Guid(1, token),
             name,
             channel_id: AtomicU32::new(channel_id),
             activated: AtomicBool::new(false),
@@ -359,4 +363,14 @@ impl Server {
             crate::log!("cannot spawn connection thread: {e}");
         }
     }
+}
+
+/// CLOCK_MONOTONIC_COARSE in milliseconds: read from the vDSO without touching
+/// the TSC, ~6x cheaper than `Instant::now()`.
+#[inline]
+fn coarse_ms() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid pointer; CLOCK_MONOTONIC_COARSE exists on every Linux.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut t) };
+    t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000
 }
