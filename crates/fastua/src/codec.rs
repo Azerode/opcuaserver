@@ -58,6 +58,44 @@ impl<'a> Reader<'a> {
         &self.buf[self.pos..]
     }
 
+    /// The next `N` bytes without consuming them, if there are that many:
+    /// lets a fast path decode a fixed layout with one bounds check.
+    #[inline(always)]
+    pub fn peek<const N: usize>(&self) -> Option<&'a [u8; N]> {
+        self.buf.get(self.pos..self.pos + N).map(|b| b.try_into().unwrap())
+    }
+
+    #[inline(always)]
+    pub fn advance(&mut self, n: usize) {
+        debug_assert!(n <= self.remaining());
+        self.pos += n;
+    }
+
+    /// Fast path for the ReadValueId / WriteValue prefix of virtually every
+    /// client: numeric NodeId, attribute id, null or empty IndexRange (and,
+    /// with `encoding`, a null or empty DataEncoding name in namespace 0).
+    /// Returns `None` without consuming anything for any other layout.
+    #[inline(always)]
+    pub fn numeric_value_id(&mut self, encoding: bool) -> Option<(NodeId, u32)> {
+        let tail = 8 + if encoding { 6 } else { 0 };
+        let (id, idlen) = match *self.buf.get(self.pos..)? {
+            [0x00, v, ..] => (NodeId::Numeric(0, v as u32), 2),
+            [0x01, ns, lo, hi, ..] => (NodeId::Numeric(ns as u16, u16::from_le_bytes([lo, hi]) as u32), 4),
+            [0x02, n0, n1, v0, v1, v2, v3, ..] => {
+                (NodeId::Numeric(u16::from_le_bytes([n0, n1]), u32::from_le_bytes([v0, v1, v2, v3])), 7)
+            }
+            _ => return None,
+        };
+        let t = self.buf.get(self.pos + idlen..self.pos + idlen + tail)?;
+        let empty = |b: &[u8]| b == [0xFF; 4] || b == [0; 4];
+        if !empty(&t[4..8]) || (encoding && (t[8..10] != [0, 0] || !empty(&t[10..14]))) {
+            return None;
+        }
+        let attribute = u32::from_le_bytes(t[..4].try_into().unwrap());
+        self.pos += idlen + tail;
+        Some((id, attribute))
+    }
+
     #[inline(always)]
     pub fn take(&mut self, n: usize) -> DResult<&'a [u8]> {
         if n > self.remaining() {
@@ -403,7 +441,8 @@ macro_rules! write_le {
     ($name:ident, $t:ty) => {
         #[inline(always)]
         pub fn $name(&mut self, v: $t) {
-            self.buf.extend_from_slice(&v.to_le_bytes());
+            let b = v.to_le_bytes();
+            self.raw_prefix(&b, b.len());
         }
     };
 }
@@ -741,6 +780,42 @@ mod tests {
         let mut r = Reader::new(&buf);
         assert_eq!(r.variant().unwrap(), v);
         assert_eq!(r.remaining(), 0);
+    }
+
+    /// The ReadValueId fast path accepts only what the generic decoder would
+    /// read as a numeric id with null/empty IndexRange and DataEncoding.
+    #[test]
+    fn numeric_value_id_fast_path() {
+        let enc = |id: &NodeId, range: Option<&str>, qn_ns: u16, qn: Option<&str>| {
+            let mut b = Vec::new();
+            let mut w = Writer::new(&mut b);
+            w.node_id(id);
+            w.u32(13);
+            w.str(range);
+            w.u16(qn_ns);
+            w.str(qn);
+            w.u8(0xAA); // next field
+            b
+        };
+        for id in [NodeId::Numeric(0, 7), NodeId::Numeric(2, 300), NodeId::Numeric(300, 70_000)] {
+            for (range, qn) in [(None, None), (Some(""), Some(""))] {
+                let b = enc(&id, range, 0, qn);
+                let mut r = Reader::new(&b);
+                assert_eq!(r.numeric_value_id(true), Some((id.clone(), 13)));
+                assert_eq!(r.u8().unwrap(), 0xAA);
+            }
+            for b in
+                [enc(&id, Some("1:2"), 0, None), enc(&id, None, 0, Some("Default Binary")), enc(&id, None, 1, None)]
+            {
+                let mut r = Reader::new(&b);
+                assert_eq!(r.numeric_value_id(true), None);
+                assert_eq!(r.position(), 0, "nothing consumed on fallback");
+            }
+        }
+        let b = enc(&NodeId::String(2, "x".into()), None, 0, None);
+        assert_eq!(Reader::new(&b).numeric_value_id(true), None);
+        let b = enc(&NodeId::Numeric(2, 300), None, 0, None);
+        assert_eq!(Reader::new(&b[..b.len() - 3]).numeric_value_id(true), None, "truncated");
     }
 
     #[test]

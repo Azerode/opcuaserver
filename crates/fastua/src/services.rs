@@ -36,6 +36,23 @@ pub struct RequestHeader {
 
 impl RequestHeader {
     pub fn decode(r: &mut Reader) -> DResult<RequestHeader> {
+        // Fast path, one bounds check: Guid token (what this server issues),
+        // null auditEntryId, null additionalHeader.
+        if let Some(b) = r.peek::<46>() {
+            if b[0] == 0x04 && b[35..39] == [0xFF; 4] && b[43..46] == [0, 0, 0] {
+                let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+                let auth_token = NodeId::Guid(u16::from_le_bytes([b[1], b[2]]), b[3..19].try_into().unwrap());
+                let h = RequestHeader {
+                    auth_token,
+                    handle: u32_at(27),
+                    return_diagnostics: u32_at(31),
+                    timeout_hint: u32_at(39),
+                    now: coarse_now_ticks(),
+                };
+                r.advance(46);
+                return Ok(h);
+            }
+        }
         let auth_token = r.node_id()?;
         let _timestamp = r.i64()?;
         let handle = r.u32()?;
@@ -629,10 +646,16 @@ fn read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SRe
     begin(w, ids::READ_RESPONSE, h);
     w.i32(n as i32);
     for _ in 0..n {
-        let id = r.node_id().map_err(decode_err)?;
-        let attribute = r.u32().map_err(decode_err)?;
-        let range = r.str().map_err(decode_err)?;
-        let (_, enc_name) = r.qualified_name_ref().map_err(decode_err)?;
+        let (id, attribute, range, enc_name) = match r.numeric_value_id(true) {
+            Some((id, attribute)) => (id, attribute, None, None),
+            None => {
+                let id = r.node_id().map_err(decode_err)?;
+                let attribute = r.u32().map_err(decode_err)?;
+                let range = r.str().map_err(decode_err)?;
+                let (_, enc_name) = r.qualified_name_ref().map_err(decode_err)?;
+                (id, attribute, range, enc_name)
+            }
+        };
         let Some(node) = space.get(&id) else {
             write_bad(w, status::BAD_NODE_ID_UNKNOWN);
             continue;
@@ -1041,4 +1064,52 @@ fn unregister_nodes(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Wr
     check_count(ctx, n)?;
     begin(w, ids::UNREGISTER_NODES_RESPONSE, h);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header(token: &NodeId, audit: Option<&str>, extra: bool) -> Vec<u8> {
+        let mut b = Vec::new();
+        let mut w = Writer::new(&mut b);
+        w.node_id(token);
+        w.i64(123);
+        w.u32(0xDEAD_BEEF);
+        w.u32(7);
+        w.str(audit);
+        w.u32(5000);
+        if extra {
+            w.node_id(&NodeId::ns0(1));
+            w.u8(1);
+            w.bytes(Some(&[1, 2, 3]));
+        } else {
+            w.null_extension_object();
+        }
+        w.u8(0xAA);
+        b
+    }
+
+    /// The fixed-layout fast path and the generic decoder agree, and the
+    /// fast path is not taken for other layouts.
+    #[test]
+    fn request_header_fast_path() {
+        let guid = NodeId::Guid(1, [9; 16]);
+        for (token, audit, extra) in [
+            (&guid, None, false),
+            (&guid, Some("audit"), false),
+            (&guid, None, true),
+            (&NodeId::Opaque(1, vec![1; 32].into()), None, false),
+            (&NodeId::Numeric(1, 2), None, false),
+        ] {
+            let b = header(token, audit, extra);
+            let mut r = Reader::new(&b);
+            let h = RequestHeader::decode(&mut r).unwrap();
+            assert_eq!(&h.auth_token, token);
+            assert_eq!((h.handle, h.return_diagnostics, h.timeout_hint), (0xDEAD_BEEF, 7, 5000));
+            assert_eq!(r.u8().unwrap(), 0xAA, "decoder stops at the end of the header");
+        }
+        let b = header(&guid, None, false);
+        assert!(RequestHeader::decode(&mut Reader::new(&b[..40])).is_err());
+    }
 }
