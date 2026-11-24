@@ -2,9 +2,11 @@
 
 use fastua::address_space::ServerInfo;
 use fastua::client::Client;
+use fastua::pki::Pki;
 use fastua::reload::Store;
 use fastua::server::{Limits, Server, ServerConfig};
 use fastua::types::*;
+use fastua::users::{Access, Users};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -14,8 +16,11 @@ fn start(dir: &std::path::Path, limits: Limits) -> String {
     store.watch().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let server =
-        Server::new(store, ServerConfig { listen: addr.clone(), endpoint_url: format!("opc.tcp://{addr}"), limits });
+    let mut config = ServerConfig::all_endpoints(addr.clone(), format!("opc.tcp://{addr}"));
+    config.limits = limits;
+    config.anonymous = Some(Access::ReadWrite);
+    let pki = Pki::open(&dir.join("pki"), "urn:test:fastua", "localhost", false).unwrap();
+    let server = Server::new(store, config, pki, Users::default());
     std::thread::spawn(move || server.serve(listener));
     addr
 }

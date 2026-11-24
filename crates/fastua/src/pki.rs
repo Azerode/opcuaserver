@@ -477,6 +477,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    fn rsa_key() -> rcgen::KeyPair {
+        use aws_lc_rs::encoding::AsDer;
+        let kp = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
+        let der = kp.as_der().unwrap().as_ref().to_vec();
+        rcgen::KeyPair::from_pkcs8_der_and_sign_algo(&der.as_slice().into(), &rcgen::PKCS_RSA_SHA256).unwrap()
+    }
+
+    #[test]
+    fn ca_issued_certificate_with_crl() {
+        use rcgen::*;
+        let root = tmp("ca");
+        let pki = Pki::open(&root, "urn:test:server", "localhost", false).unwrap();
+
+        // CA (ECDSA P-256) and a leaf (RSA 2048) it signs.
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.distinguished_name.push(DnType::CommonName, "Test CA");
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, &ca_key);
+
+        let leaf_key = rsa_key();
+        let mut leaf_params = CertificateParams::new(vec!["client".to_string()]).unwrap();
+        leaf_params.distinguished_name.push(DnType::CommonName, "client");
+        leaf_params.subject_alt_names.push(SanType::URI("urn:test:client".try_into().unwrap()));
+        leaf_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyEncipherment,
+            KeyUsagePurpose::DataEncipherment,
+        ];
+        leaf_params.serial_number = Some(SerialNumber::from_slice(&[0x42]));
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap().der().to_vec();
+
+        // Issuer unknown.
+        assert_eq!(pki.validate_application(&leaf).unwrap_err(), BAD_CERTIFICATE_CHAIN_INCOMPLETE);
+        // CA trusted, but no CRL yet.
+        std::fs::write(root.join("trusted/certs/ca.der"), ca_cert.der()).unwrap();
+        assert_eq!(pki.validate_application(&leaf).unwrap_err(), BAD_CERTIFICATE_REVOCATION_UNKNOWN);
+
+        let now = ::time::OffsetDateTime::now_utc();
+        let crl = |revoked: Vec<RevokedCertParams>| {
+            CertificateRevocationListParams {
+                this_update: now - ::time::Duration::hours(1),
+                next_update: now + ::time::Duration::days(30),
+                crl_number: SerialNumber::from_slice(&[1]),
+                issuing_distribution_point: None,
+                revoked_certs: revoked,
+                key_identifier_method: KeyIdMethod::Sha256,
+            }
+            .signed_by(&issuer)
+            .unwrap()
+            .der()
+            .to_vec()
+        };
+        // Sleep so the directory mtime changes even on coarse clocks.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(root.join("trusted/crl/ca.crl"), crl(vec![])).unwrap();
+        pki.validate_application(&leaf).unwrap();
+
+        // Leaf revoked.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let revoked = RevokedCertParams {
+            serial_number: SerialNumber::from_slice(&[0x42]),
+            revocation_time: now - ::time::Duration::minutes(1),
+            reason_code: None,
+            invalidity_date: None,
+        };
+        std::fs::remove_file(root.join("trusted/crl/ca.crl")).unwrap();
+        std::fs::write(root.join("trusted/crl/ca2.crl"), crl(vec![revoked])).unwrap();
+        assert_eq!(pki.validate_application(&leaf).unwrap_err(), BAD_CERTIFICATE_REVOKED);
+
+        // A chain sent by the client (leaf + CA) is accepted when the leaf is trusted.
+        let _ = std::fs::remove_dir_all(&root);
+        let pki = Pki::open(&root, "urn:test:server", "localhost", false).unwrap();
+        std::fs::write(root.join("trusted/certs/leaf.der"), &leaf).unwrap();
+        std::fs::write(root.join("trusted/crl/ca.crl"), crl(vec![])).unwrap();
+        let mut chain = leaf.clone();
+        chain.extend_from_slice(ca_cert.der());
+        pki.validate_application(&chain).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn chain_splitting() {
         let (a, _) = generate_self_signed("urn:a", "a").unwrap();

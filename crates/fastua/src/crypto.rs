@@ -265,6 +265,23 @@ impl SymKeys {
         hmac::verify(&self.signing, data, sig).is_ok()
     }
 
+    /// HMAC over the concatenation of `parts`.
+    #[inline]
+    pub fn sign_parts(&self, parts: &[&[u8]]) -> [u8; SYM_SIGNATURE_LEN] {
+        let mut ctx = hmac::Context::with_key(&self.signing);
+        for p in parts {
+            ctx.update(p);
+        }
+        ctx.sign().as_ref().try_into().unwrap()
+    }
+
+    /// Constant-time check of an HMAC over the concatenation of `parts`.
+    #[inline]
+    pub fn verify_parts(&self, parts: &[&[u8]], sig: &[u8]) -> bool {
+        let expected = self.sign_parts(parts);
+        sig.len() == SYM_SIGNATURE_LEN && aws_lc_rs::constant_time::verify_slices_are_equal(&expected, sig).is_ok()
+    }
+
     /// In-place AES-CBC; `data.len()` must be a multiple of 16.
     #[inline]
     pub fn encrypt(&self, data: &mut [u8]) -> CResult<()> {

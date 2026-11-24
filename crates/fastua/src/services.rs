@@ -2,8 +2,13 @@
 //! connection's transmit buffer: no intermediate response structs.
 
 use crate::address_space::*;
+use crate::channel::Security;
 use crate::codec::{DResult, Reader, Writer};
-use crate::server::{random_bytes, ContinuationPoint, Server, Session, ANONYMOUS_POLICY_ID, TRANSPORT_PROFILE_BINARY};
+use crate::crypto::{self, Mode, Policy};
+use crate::server::{
+    random_bytes, ContinuationPoint, Server, Session, CERTIFICATE_POLICY_ID, TRANSPORT_PROFILE_BINARY,
+    USERNAME_POLICY_ID,
+};
 use crate::types::*;
 use crate::value::ValueCell;
 use std::sync::atomic::Ordering;
@@ -12,6 +17,7 @@ use std::sync::Arc;
 pub struct Ctx<'a> {
     pub server: &'a Arc<Server>,
     pub channel_id: u32,
+    pub security: &'a Security,
     /// Last session used on this connection: avoids the global table lookup.
     pub session: &'a mut Option<Arc<Session>>,
 }
@@ -165,93 +171,247 @@ fn find_servers(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer
 
 // ---------------------------------------------------------------- Sessions
 
-fn skip_application_description(r: &mut Reader) -> DResult<()> {
-    r.str()?;
+/// Reads an ApplicationDescription, returning its applicationUri.
+fn read_application_uri(r: &mut Reader) -> DResult<Option<String>> {
+    let uri = r.str()?.map(str::to_string);
     r.str()?;
     r.localized_text()?;
     r.i32()?;
     r.str()?;
     r.str()?;
-    r.skip_string_array()
+    r.skip_string_array()?;
+    Ok(uri)
 }
 
+const BAD_NONCE_INVALID: u32 = 0x8024_0000;
+const BAD_USER_SIGNATURE_INVALID: u32 = 0x8057_0000;
+const BAD_APPLICATION_SIGNATURE_INVALID: u32 = 0x8058_0000;
+
 fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
-    let mut parse = || -> DResult<(String, f64)> {
-        skip_application_description(r)?;
+    #[allow(clippy::type_complexity)]
+    let mut parse = || -> DResult<(Option<String>, String, Vec<u8>, Option<Vec<u8>>, f64)> {
+        let app_uri = read_application_uri(r)?;
         let _server_uri = r.str()?;
         let _endpoint_url = r.str()?;
         let name = r.str()?.unwrap_or("").to_string();
-        let _client_nonce = r.bytes()?;
-        let _client_cert = r.bytes()?;
+        let nonce = r.bytes()?.unwrap_or(&[]).to_vec();
+        let cert = r.bytes()?.filter(|c| !c.is_empty()).map(<[u8]>::to_vec);
         let timeout = r.f64()?;
         let _max_response = r.u32()?;
-        Ok((name, timeout))
+        Ok((app_uri, name, nonce, cert, timeout))
     };
-    let (name, requested_timeout) = parse().map_err(decode_err)?;
+    let (app_uri, name, client_nonce, client_cert, requested_timeout) = parse().map_err(decode_err)?;
+    let security = ctx.security.clone();
+    let pki = ctx.server.pki();
+
+    // Part 4 §5.6.2: checks tied to the secure channel.
+    let server_signature = if security.policy == Policy::None {
+        if !ctx.server.endpoint_enabled(Policy::None, Mode::None) {
+            return Err(status::BAD_SECURITY_POLICY_REJECTED);
+        }
+        None
+    } else {
+        let channel_cert = security.client_cert.as_ref().ok_or(status::BAD_SECURITY_CHECKS_FAILED)?;
+        if client_cert.as_deref() != Some(&channel_cert.der[..]) {
+            // The session certificate must be the channel's leaf certificate.
+            let leaf = client_cert.as_deref().and_then(|c| crate::pki::split_chain(c).ok()).map(|c| c[0].to_vec());
+            if leaf.as_deref() != Some(&channel_cert.der[..]) {
+                return Err(status::BAD_SECURITY_CHECKS_FAILED);
+            }
+        }
+        if app_uri.is_none() || channel_cert.application_uri != app_uri {
+            return Err(crate::pki::codes::BAD_CERTIFICATE_URI_INVALID);
+        }
+        if client_nonce.len() < crypto::NONCE_LEN {
+            return Err(BAD_NONCE_INVALID);
+        }
+        let mut data = channel_cert.der.clone();
+        data.extend_from_slice(&client_nonce);
+        let sig = security.policy.asym_sign(&pki.key.sign, &data).map_err(|_| status::BAD_INTERNAL_ERROR)?;
+        Some(sig)
+    };
+
     let limits = ctx.server.limits();
     let timeout = if requested_timeout.is_finite() && requested_timeout > 0.0 {
         requested_timeout.clamp(limits.min_session_timeout_ms, limits.max_session_timeout_ms)
     } else {
         60_000.0
     };
-    let session = ctx.server.create_session(name, ctx.channel_id, timeout)?;
-    let mut nonce = [0u8; 32];
+    let mut nonce = vec![0u8; crypto::NONCE_LEN];
     random_bytes(&mut nonce);
+    let session = ctx.server.create_session(name, ctx.channel_id, timeout, security.clone(), nonce.clone())?;
 
     begin(w, ids::CREATE_SESSION_RESPONSE, h.handle);
     w.node_id(&session.id);
     w.node_id(&session.token);
     w.f64(timeout);
     w.bytes(Some(&nonce));
-    w.bytes(None); // server certificate
+    w.bytes(Some(&pki.cert_der));
     w.raw(ctx.server.endpoints_encoded());
     w.empty_array(); // serverSoftwareCertificates
-    w.str(None); // signature algorithm
-    w.bytes(None); // signature
+    match &server_signature {
+        Some(sig) => {
+            w.string(security.policy.asym_signature_uri());
+            w.bytes(Some(sig));
+        }
+        None => {
+            w.str(None);
+            w.bytes(None);
+        }
+    }
     w.u32(limits.max_message_size);
-    crate::log!("session '{}' ({}) created", session.name, session.id);
+    crate::log!("session '{}' ({}) created, {:?}/{:?}", session.name, session.id, security.policy, security.mode);
     *ctx.session = Some(session);
     Ok(())
 }
 
+/// Security policy protecting a user token: the token policy's own on an
+/// unsecured channel (we advertise Basic256Sha256), else the channel's.
+fn token_policy(ctx: &Ctx) -> Policy {
+    match ctx.security.policy {
+        Policy::None => Policy::Basic256Sha256,
+        p => p,
+    }
+}
+
+/// Decrypts a legacy-format secret: `len(u32) | secret | serverNonce` (Part 4 §7.41.2.2).
+fn decrypt_secret(ctx: &Ctx, data: &[u8], algorithm: Option<&str>, nonce: &[u8]) -> Result<Vec<u8>, u32> {
+    let policy = token_policy(ctx);
+    let plain = match algorithm.filter(|a| !a.is_empty()) {
+        None => {
+            // Clear-text passwords only travel inside an encrypted channel.
+            if ctx.security.mode != Mode::SignAndEncrypt {
+                return Err(status::BAD_IDENTITY_TOKEN_INVALID);
+            }
+            return Ok(data.to_vec());
+        }
+        Some(a) if a == policy.asym_encryption_uri() => {
+            let mut out = Vec::new();
+            policy
+                .asym_decrypt(&ctx.server.pki().key.decrypt, data, &mut out)
+                .map_err(|_| status::BAD_IDENTITY_TOKEN_INVALID)?;
+            out
+        }
+        Some(_) => return Err(status::BAD_IDENTITY_TOKEN_INVALID),
+    };
+    if plain.len() < 4 {
+        return Err(status::BAD_IDENTITY_TOKEN_INVALID);
+    }
+    let len = u32::from_le_bytes(plain[..4].try_into().unwrap()) as usize;
+    if len != plain.len() - 4 || len < nonce.len() {
+        return Err(status::BAD_IDENTITY_TOKEN_INVALID);
+    }
+    let (secret, tail) = plain[4..].split_at(len - nonce.len());
+    if aws_lc_rs::constant_time::verify_slices_are_equal(tail, nonce).is_err() {
+        return Err(status::BAD_IDENTITY_TOKEN_INVALID);
+    }
+    Ok(secret.to_vec())
+}
+
 fn activate_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
     let s = session(ctx, h, false)?;
-    let mut parse = || -> DResult<(NodeId, Option<String>)> {
-        r.str()?; // client signature algorithm
-        r.bytes()?; // client signature
+    #[allow(clippy::type_complexity)]
+    let mut parse = || -> DResult<(Option<String>, Vec<u8>, NodeId, Vec<u8>, Option<String>, Vec<u8>)> {
+        let alg = r.str()?.map(str::to_string);
+        let sig = r.bytes()?.unwrap_or(&[]).to_vec();
         let n = r.length(1)?.unwrap_or(0);
         for _ in 0..n {
             r.bytes()?;
             r.bytes()?;
         }
         r.skip_string_array()?; // localeIds
-        let (type_id, enc, body) = r.extension_object_raw()?;
-        let policy = if enc == 1 { Reader::new(body).str()?.map(str::to_string) } else { None };
-        Ok((type_id, policy))
+        let (type_id, _enc, body) = r.extension_object_raw()?;
+        let body = body.to_vec();
+        let user_alg = r.str()?.map(str::to_string);
+        let user_sig = r.bytes()?.unwrap_or(&[]).to_vec();
+        Ok((alg, sig, type_id, body, user_alg, user_sig))
     };
-    let (token_type, policy) = parse().map_err(decode_err)?;
+    let (client_alg, client_sig, token_type, token_body, user_alg, user_sig) = parse().map_err(decode_err)?;
+    let pki = ctx.server.pki();
+    let nonce = s.server_nonce.lock().unwrap_or_else(|e| e.into_inner()).clone();
 
-    // Only anonymous identities are accepted until encrypted channels land:
-    // a password over SecurityPolicy None would travel in clear text.
-    let anonymous = match token_type.as_ns0() {
-        Some(0) => true,
-        Some(ids::ANONYMOUS_IDENTITY_TOKEN_ENCODING) => {
-            policy.as_deref().is_none_or(|p| p == ANONYMOUS_POLICY_ID || p.is_empty())
-        }
-        Some(ids::USERNAME_IDENTITY_TOKEN_ENCODING) | Some(ids::X509_IDENTITY_TOKEN_ENCODING) => {
-            return Err(status::BAD_IDENTITY_TOKEN_REJECTED)
-        }
-        _ => false,
-    };
-    if !anonymous {
-        return Err(status::BAD_IDENTITY_TOKEN_INVALID);
+    // The session may only move to a channel with the same security and certificate.
+    let same_cert =
+        s.security.client_cert.as_ref().map(|c| &c.der) == ctx.security.client_cert.as_ref().map(|c| &c.der);
+    if s.security.policy != ctx.security.policy || s.security.mode != ctx.security.mode || !same_cert {
+        return Err(status::BAD_SECURITY_CHECKS_FAILED);
     }
+
+    // Proof of possession of the client certificate's private key.
+    if let Some(cert) = &ctx.security.client_cert {
+        let policy = ctx.security.policy;
+        let mut data = pki.cert_der.clone();
+        data.extend_from_slice(&nonce);
+        if client_alg.as_deref() != Some(policy.asym_signature_uri())
+            || policy.asym_verify(&cert.rsa_public_key, &data, &client_sig).is_err()
+        {
+            return Err(BAD_APPLICATION_SIGNATURE_INVALID);
+        }
+    }
+
+    let mut br = Reader::new(&token_body);
+    let config = &ctx.server.config;
+    let access = match token_type.as_ns0() {
+        Some(0) | Some(ids::ANONYMOUS_IDENTITY_TOKEN_ENCODING) => {
+            config.anonymous.ok_or(status::BAD_IDENTITY_TOKEN_REJECTED)?
+        }
+        Some(ids::USERNAME_IDENTITY_TOKEN_ENCODING) => {
+            #[allow(clippy::type_complexity)]
+            let mut parse = || -> DResult<(Option<&str>, String, Vec<u8>, Option<String>)> {
+                let policy_id = br.str()?;
+                let user = br.str()?.unwrap_or("").to_string();
+                let password = br.bytes()?.unwrap_or(&[]).to_vec();
+                let alg = br.str()?.map(str::to_string);
+                Ok((policy_id, user, password, alg))
+            };
+            let (policy_id, user, password, alg) = parse().map_err(|_| status::BAD_IDENTITY_TOKEN_INVALID)?;
+            if policy_id != Some(USERNAME_POLICY_ID) || ctx.server.users.is_empty() {
+                return Err(status::BAD_IDENTITY_TOKEN_INVALID);
+            }
+            let password = decrypt_secret(ctx, &password, alg.as_deref(), &nonce)?;
+            match ctx.server.users.authenticate(&user, &password) {
+                Some(a) => a,
+                None => {
+                    crate::log!("login failed for user '{user}'");
+                    return Err(status::BAD_USER_ACCESS_DENIED);
+                }
+            }
+        }
+        Some(ids::X509_IDENTITY_TOKEN_ENCODING) => {
+            let mut parse = || -> DResult<(Option<&str>, Vec<u8>)> {
+                let policy_id = br.str()?;
+                let cert = br.bytes()?.unwrap_or(&[]).to_vec();
+                Ok((policy_id, cert))
+            };
+            let (policy_id, cert) = parse().map_err(|_| status::BAD_IDENTITY_TOKEN_INVALID)?;
+            if policy_id != Some(CERTIFICATE_POLICY_ID) {
+                return Err(status::BAD_IDENTITY_TOKEN_INVALID);
+            }
+            let info = pki.validate_user(&cert).map_err(|code| {
+                crate::log!("user certificate rejected (0x{code:08X})");
+                status::BAD_IDENTITY_TOKEN_REJECTED
+            })?;
+            let policy = token_policy(ctx);
+            let mut data = pki.cert_der.clone();
+            data.extend_from_slice(&nonce);
+            if user_alg.as_deref() != Some(policy.asym_signature_uri())
+                || policy.asym_verify(&info.rsa_public_key, &data, &user_sig).is_err()
+            {
+                return Err(BAD_USER_SIGNATURE_INVALID);
+            }
+            config.x509_users
+        }
+        _ => return Err(status::BAD_IDENTITY_TOKEN_INVALID),
+    };
+
     // Activation may move the session to the calling channel (Part 4 §5.6.3).
     s.channel_id.store(ctx.channel_id, Ordering::Release);
+    s.can_write.store(access.can_write(), Ordering::Release);
     s.activated.store(true, Ordering::Release);
 
-    let mut nonce = [0u8; 32];
+    let mut nonce = vec![0u8; crypto::NONCE_LEN];
     random_bytes(&mut nonce);
+    *s.server_nonce.lock().unwrap_or_else(|e| e.into_inner()) = nonce.clone();
     begin(w, ids::ACTIVATE_SESSION_RESPONSE, h.handle);
     w.bytes(Some(&nonce));
     w.empty_array(); // results
@@ -369,7 +529,15 @@ fn write_dynamic(w: &mut Writer, v: &Variant, ts: Timestamps, now: i64) {
     }
 }
 
-fn write_attribute(w: &mut Writer, space: &AddressSpace, node: &Node, attribute: u32, ts: Timestamps, now: i64) {
+fn write_attribute(
+    w: &mut Writer,
+    space: &AddressSpace,
+    node: &Node,
+    attribute: u32,
+    ts: Timestamps,
+    now: i64,
+    can_write: bool,
+) {
     use attr::*;
     let v = match (attribute, &node.kind) {
         (VALUE, NodeKind::Variable { value, access, .. }) => {
@@ -408,7 +576,10 @@ fn write_attribute(w: &mut Writer, space: &AddressSpace, node: &Node, attribute:
                 dims: None,
             }))
         }
-        (ACCESS_LEVEL | USER_ACCESS_LEVEL, NodeKind::Variable { access, .. }) => Variant::Byte(*access),
+        (ACCESS_LEVEL, NodeKind::Variable { access, .. }) => Variant::Byte(*access),
+        (USER_ACCESS_LEVEL, NodeKind::Variable { access, .. }) => {
+            Variant::Byte(if can_write { *access } else { *access & !ACCESS_WRITE })
+        }
         (ACCESS_LEVEL_EX, NodeKind::Variable { access, .. }) => Variant::UInt32(*access as u32),
         (MINIMUM_SAMPLING_INTERVAL, NodeKind::Variable { .. }) => Variant::Double(0.0),
         (HISTORIZING, NodeKind::Variable { .. }) => Variant::Boolean(false),
@@ -418,7 +589,7 @@ fn write_attribute(w: &mut Writer, space: &AddressSpace, node: &Node, attribute:
 }
 
 fn read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
-    session(ctx, h, true)?;
+    let can_write = session(ctx, h, true)?.can_write.load(Ordering::Relaxed);
     let max_age = r.f64().map_err(decode_err)?;
     let ttr = r.u32().map_err(decode_err)?;
     if max_age.is_nan() || max_age < 0.0 {
@@ -463,14 +634,14 @@ fn read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SRe
             write_bad(w, bad);
             continue;
         }
-        write_attribute(w, &space, node, attribute, ts, now);
+        write_attribute(w, &space, node, attribute, ts, now, can_write);
     }
     w.empty_array(); // diagnosticInfos
     Ok(())
 }
 
 fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
-    session(ctx, h, true)?;
+    let can_write = session(ctx, h, true)?.can_write.load(Ordering::Relaxed);
     let n = r.length(11).map_err(decode_err)?.unwrap_or(0);
     check_count(ctx, n)?;
     let space = ctx.server.store.load();
@@ -499,6 +670,9 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
             }
             if access & ACCESS_WRITE == 0 {
                 return Err(status::BAD_NOT_WRITABLE);
+            }
+            if !can_write {
+                return Err(status::BAD_USER_ACCESS_DENIED);
             }
             if range.is_some_and(|s| !s.is_empty()) {
                 return Err(status::BAD_INDEX_RANGE_INVALID);

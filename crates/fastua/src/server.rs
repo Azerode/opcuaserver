@@ -1,9 +1,13 @@
 //! Server state shared by all connections: configuration, endpoints, sessions.
 
 use crate::address_space::{AddressSpace, ServerInfo};
+use crate::channel::Security;
 use crate::codec::Writer;
+use crate::crypto::{Mode, Policy};
+use crate::pki::Pki;
 use crate::reload::Store;
 use crate::types::*;
+use crate::users::{Access, Users};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -12,6 +16,8 @@ use std::time::{Duration, Instant};
 pub const SECURITY_POLICY_NONE: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
 pub const TRANSPORT_PROFILE_BINARY: &str = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
 pub const ANONYMOUS_POLICY_ID: &str = "anonymous";
+pub const USERNAME_POLICY_ID: &str = "username";
+pub const CERTIFICATE_POLICY_ID: &str = "certificate";
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -56,6 +62,31 @@ pub struct ServerConfig {
     pub listen: String,
     pub endpoint_url: String,
     pub limits: Limits,
+    /// Offered (policy, mode) pairs. (None, None) is the unsecured endpoint.
+    pub endpoints: Vec<(Policy, Mode)>,
+    /// Rights of anonymous users; `None` disables anonymous login.
+    pub anonymous: Option<Access>,
+    /// Rights of users authenticated by a trusted X.509 certificate.
+    pub x509_users: Access,
+}
+
+impl ServerConfig {
+    /// Every supported endpoint, anonymous users read-only.
+    pub fn all_endpoints(listen: String, endpoint_url: String) -> ServerConfig {
+        let mut endpoints = vec![(Policy::None, Mode::None)];
+        for p in Policy::SECURE {
+            endpoints.push((p, Mode::Sign));
+            endpoints.push((p, Mode::SignAndEncrypt));
+        }
+        ServerConfig {
+            listen,
+            endpoint_url,
+            limits: Limits::default(),
+            endpoints,
+            anonymous: Some(Access::ReadOnly),
+            x509_users: Access::ReadWrite,
+        }
+    }
 }
 
 /// A paused Browse (Part 4 §5.8.2 / §7.6).
@@ -84,10 +115,18 @@ pub struct Session {
     /// Milliseconds since server start of the last request.
     pub last_seen: AtomicU64,
     pub continuation_points: Mutex<Vec<ContinuationPoint>>,
+    /// Security of the channel the session was created on.
+    pub security: Security,
+    /// Last nonce sent to the client (CreateSession / ActivateSession).
+    pub server_nonce: Mutex<Vec<u8>>,
+    /// Rights of the identity given at the last ActivateSession.
+    pub can_write: AtomicBool,
 }
 
 pub struct Server {
     pub store: Arc<Store>,
+    pki: Arc<Pki>,
+    pub users: Users,
     pub config: ServerConfig,
     started: Instant,
     sessions: Mutex<FxHashMap<NodeId, Arc<Session>>>,
@@ -131,25 +170,40 @@ fn write_application_description(w: &mut Writer, info: &ServerInfo, discovery_ur
 }
 
 impl Server {
-    pub fn new(store: Arc<Store>, config: ServerConfig) -> Arc<Server> {
+    pub fn new(store: Arc<Store>, config: ServerConfig, pki: Arc<Pki>, users: Users) -> Arc<Server> {
         let info = store.info().clone();
         let mut endpoints_encoded = Vec::new();
         {
             let mut w = Writer::new(&mut endpoints_encoded);
-            w.i32(1);
-            w.string(&config.endpoint_url);
-            write_application_description(&mut w, &info, &config.endpoint_url);
-            w.bytes(None); // server certificate
-            w.i32(1); // MessageSecurityMode None
-            w.string(SECURITY_POLICY_NONE);
-            w.i32(1);
-            w.string(ANONYMOUS_POLICY_ID);
-            w.i32(0); // UserTokenType Anonymous
-            w.str(None);
-            w.str(None);
-            w.str(None);
-            w.string(TRANSPORT_PROFILE_BINARY);
-            w.u8(0); // securityLevel
+            w.i32(config.endpoints.len() as i32);
+            for &(policy, mode) in &config.endpoints {
+                w.string(&config.endpoint_url);
+                write_application_description(&mut w, &info, &config.endpoint_url);
+                w.bytes(Some(&pki.cert_der));
+                w.i32(mode as i32);
+                w.string(policy.uri());
+                // Credentials on an unsecured channel are protected with
+                // Basic256Sha256 against the server certificate.
+                let token_policy = if policy == Policy::None { Some(Policy::Basic256Sha256.uri()) } else { None };
+                let mut tokens: Vec<(&str, i32, Option<&str>)> = Vec::new();
+                if config.anonymous.is_some() {
+                    tokens.push((ANONYMOUS_POLICY_ID, 0, None));
+                }
+                if !users.is_empty() {
+                    tokens.push((USERNAME_POLICY_ID, 1, token_policy));
+                }
+                tokens.push((CERTIFICATE_POLICY_ID, 2, token_policy));
+                w.i32(tokens.len() as i32);
+                for (id, ty, sec) in tokens {
+                    w.string(id);
+                    w.i32(ty);
+                    w.str(None);
+                    w.str(None);
+                    w.str(sec);
+                }
+                w.string(TRANSPORT_PROFILE_BINARY);
+                w.u8(policy.security_level(mode));
+            }
         }
         let mut application_encoded = Vec::new();
         {
@@ -159,6 +213,8 @@ impl Server {
         }
         Arc::new(Server {
             store,
+            pki,
+            users,
             config,
             started: Instant::now(),
             sessions: Mutex::new(FxHashMap::default()),
@@ -167,6 +223,19 @@ impl Server {
             endpoints_encoded,
             application_encoded,
         })
+    }
+
+    #[inline]
+    pub fn pki(&self) -> &Pki {
+        &self.pki
+    }
+
+    pub fn policy_enabled(&self, p: Policy) -> bool {
+        self.config.endpoints.iter().any(|(q, _)| *q == p)
+    }
+
+    pub fn endpoint_enabled(&self, p: Policy, m: Mode) -> bool {
+        self.config.endpoints.contains(&(p, m))
     }
 
     #[inline]
@@ -196,7 +265,14 @@ impl Server {
         }
     }
 
-    pub fn create_session(&self, name: String, channel_id: u32, timeout_ms: f64) -> Result<Arc<Session>, u32> {
+    pub fn create_session(
+        &self,
+        name: String,
+        channel_id: u32,
+        timeout_ms: f64,
+        security: Security,
+        server_nonce: Vec<u8>,
+    ) -> Result<Arc<Session>, u32> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if sessions.len() >= self.limits().max_sessions {
             return Err(status::BAD_TOO_MANY_SESSIONS);
@@ -213,6 +289,9 @@ impl Server {
             timeout_ms,
             last_seen: AtomicU64::new(self.uptime_ms()),
             continuation_points: Mutex::new(Vec::new()),
+            security,
+            server_nonce: Mutex::new(server_nonce),
+            can_write: AtomicBool::new(false),
         });
         sessions.insert(session.token.clone(), session.clone());
         Ok(session)

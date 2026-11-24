@@ -8,12 +8,15 @@
 //!    kernel network stack on both sides, which dominates).
 
 use fastua::address_space::ServerInfo;
+use fastua::channel::Security;
 use fastua::client::Client;
 use fastua::codec::{Reader, Writer};
+use fastua::pki::Pki;
 use fastua::reload::Store;
-use fastua::server::{Limits, Server, ServerConfig};
+use fastua::server::{Server, ServerConfig};
 use fastua::services;
 use fastua::types::*;
+use fastua::users::Users;
 use std::hint::black_box;
 use std::net::TcpListener;
 use std::sync::atomic::Ordering;
@@ -38,13 +41,13 @@ fn main() {
     let store = Store::open(&dir, ServerInfo::default()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
-    let server = Server::new(
-        store,
-        ServerConfig { listen: addr.clone(), endpoint_url: format!("opc.tcp://{addr}"), limits: Limits::default() },
-    );
+    let pki = Pki::open(&dir.join("pki"), "urn:bench", "localhost", false).unwrap();
+    let mut config = ServerConfig::all_endpoints(addr.clone(), format!("opc.tcp://{addr}"));
+    config.anonymous = Some(fastua::users::Access::ReadWrite);
+    let server = Server::new(store, config, pki, Users::default());
 
     // ---- 1. service layer
-    let session = server.create_session("bench".into(), 1, 60_000.0).unwrap();
+    let session = server.create_session("bench".into(), 1, 60_000.0, Security::NONE, vec![]).unwrap();
     session.activated.store(true, Ordering::Release);
     for batch in [1usize, 10, 100] {
         let mut req = Vec::new();
@@ -74,13 +77,15 @@ fn main() {
         let iters = 2_000_000 / batch;
         for _ in 0..iters / 10 {
             out.clear();
-            let mut ctx = services::Ctx { server: &server, channel_id: 1, session: &mut cache };
+            let mut ctx =
+                services::Ctx { server: &server, channel_id: 1, security: &Security::NONE, session: &mut cache };
             services::dispatch(&mut ctx, &mut Reader::new(&req), &mut Writer::new(&mut out));
         }
         let t = Instant::now();
         for _ in 0..iters {
             out.clear();
-            let mut ctx = services::Ctx { server: &server, channel_id: 1, session: &mut cache };
+            let mut ctx =
+                services::Ctx { server: &server, channel_id: 1, security: &Security::NONE, session: &mut cache };
             black_box(services::dispatch(&mut ctx, &mut Reader::new(black_box(&req)), &mut Writer::new(&mut out)));
         }
         let ns = t.elapsed().as_nanos() as f64 / iters as f64;

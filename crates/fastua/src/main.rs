@@ -1,43 +1,95 @@
 use fastua::address_space::ServerInfo;
+use fastua::crypto::{Mode, Policy};
+use fastua::pki::Pki;
 use fastua::reload::Store;
-use fastua::server::{Limits, Server, ServerConfig};
+use fastua::server::{Server, ServerConfig};
+use fastua::users::{hash_password, Access, Users};
 use std::net::TcpListener;
 use std::path::PathBuf;
 
-const USAGE: &str = "usage: fastua [--config DIR] [--listen ADDR:PORT] [--endpoint URL] [--application-uri URI]
+const USAGE: &str = "usage: fastua [options]
+       fastua hash-password            read a password on stdin, print its hash for the users file
 
-  --config DIR          directory of namespace files, watched for changes (default: config/machines)
-  --listen ADDR:PORT    address to bind (default: 0.0.0.0:4840)
-  --endpoint URL        endpoint URL advertised to clients (default: opc.tcp://<hostname>:<port>)
-  --application-uri URI ApplicationUri of this server (default: urn:<hostname>:fastua)";
+  --config DIR            directory of namespace files, watched for changes (default: config/machines)
+  --listen ADDR:PORT      address to bind (default: 0.0.0.0:4840)
+  --endpoint URL          endpoint URL advertised to clients (default: opc.tcp://<hostname>:<port>)
+  --application-uri URI   ApplicationUri of this server (default: urn:<hostname>:fastua)
+  --pki DIR               certificate store (default: pki); a self-signed certificate is created if missing
+  --endpoints LIST        comma-separated endpoints to offer (default: all):
+                            none, basic256sha256-sign, basic256sha256-encrypt,
+                            aes128-sign, aes128-encrypt, aes256-sign, aes256-encrypt
+  --users FILE            users file enabling user name / password login
+  --anonymous off|read|write   rights of anonymous users (default: read)
+  --x509-users read|write      rights of users with a trusted certificate (default: write)
+  --trust-all-clients     accept any client certificate (development only)";
+
+fn fail(msg: String) -> ! {
+    eprintln!("{msg}");
+    std::process::exit(2)
+}
+
+fn parse_endpoints(list: &str) -> Vec<(Policy, Mode)> {
+    list.split(',')
+        .map(|e| match e.trim().to_ascii_lowercase().as_str() {
+            "none" => (Policy::None, Mode::None),
+            "basic256sha256-sign" => (Policy::Basic256Sha256, Mode::Sign),
+            "basic256sha256-encrypt" => (Policy::Basic256Sha256, Mode::SignAndEncrypt),
+            "aes128-sign" => (Policy::Aes128Sha256RsaOaep, Mode::Sign),
+            "aes128-encrypt" => (Policy::Aes128Sha256RsaOaep, Mode::SignAndEncrypt),
+            "aes256-sign" => (Policy::Aes256Sha256RsaPss, Mode::Sign),
+            "aes256-encrypt" => (Policy::Aes256Sha256RsaPss, Mode::SignAndEncrypt),
+            other => fail(format!("unknown endpoint '{other}'\n\n{USAGE}")),
+        })
+        .collect()
+}
+
+fn parse_access(v: &str, allow_off: bool) -> Option<Access> {
+    match v {
+        "off" if allow_off => None,
+        "read" => Some(Access::ReadOnly),
+        "write" => Some(Access::ReadWrite),
+        _ => fail(format!("invalid access '{v}'\n\n{USAGE}")),
+    }
+}
 
 fn main() {
     let mut config_dir = PathBuf::from("config/machines");
+    let mut pki_dir = PathBuf::from("pki");
     let mut listen = "0.0.0.0:4840".to_string();
     let mut endpoint: Option<String> = None;
     let mut app_uri: Option<String> = None;
+    let mut endpoints: Option<Vec<(Policy, Mode)>> = None;
+    let mut users_file: Option<PathBuf> = None;
+    let mut anonymous = Some(Access::ReadOnly);
+    let mut x509_users = Access::ReadWrite;
+    let mut trust_all = false;
 
-    let mut args = std::env::args().skip(1);
+    let mut args = std::env::args().skip(1).peekable();
+    if args.peek().map(String::as_str) == Some("hash-password") {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).expect("cannot read stdin");
+        println!("{}", hash_password(line.trim_end_matches(['\r', '\n'])));
+        return;
+    }
     while let Some(a) = args.next() {
-        let mut value = |name: &str| {
-            args.next().unwrap_or_else(|| {
-                eprintln!("missing value for {name}\n\n{USAGE}");
-                std::process::exit(2)
-            })
-        };
+        let mut value =
+            |name: &str| args.next().unwrap_or_else(|| fail(format!("missing value for {name}\n\n{USAGE}")));
         match a.as_str() {
             "--config" => config_dir = PathBuf::from(value("--config")),
+            "--pki" => pki_dir = PathBuf::from(value("--pki")),
             "--listen" => listen = value("--listen"),
             "--endpoint" => endpoint = Some(value("--endpoint")),
             "--application-uri" => app_uri = Some(value("--application-uri")),
+            "--endpoints" => endpoints = Some(parse_endpoints(&value("--endpoints"))),
+            "--users" => users_file = Some(PathBuf::from(value("--users"))),
+            "--anonymous" => anonymous = parse_access(&value("--anonymous"), true),
+            "--x509-users" => x509_users = parse_access(&value("--x509-users"), false).unwrap(),
+            "--trust-all-clients" => trust_all = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
             }
-            other => {
-                eprintln!("unknown argument '{other}'\n\n{USAGE}");
-                std::process::exit(2);
-            }
+            other => fail(format!("unknown argument '{other}'\n\n{USAGE}")),
         }
     }
 
@@ -47,19 +99,22 @@ fn main() {
         .unwrap_or_else(|_| "localhost".into());
     let port = listen.rsplit(':').next().unwrap_or("4840");
     let endpoint = endpoint.unwrap_or_else(|| format!("opc.tcp://{hostname}:{port}"));
-
     let info = ServerInfo {
         application_uri: app_uri.unwrap_or_else(|| format!("urn:{hostname}:fastua")),
         ..ServerInfo::default()
     };
 
-    let store = match Store::open(&config_dir, info) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("cannot load configuration: {e}");
-            std::process::exit(1);
-        }
+    let pki = Pki::open(&pki_dir, &info.application_uri, &hostname, trust_all)
+        .unwrap_or_else(|e| fail(format!("cannot open PKI: {e}")));
+    if trust_all {
+        fastua::log!("WARNING: --trust-all-clients accepts any client certificate");
+    }
+    let users = match &users_file {
+        Some(f) => Users::load(f).unwrap_or_else(|e| fail(format!("cannot load users: {e}"))),
+        None => Users::default(),
     };
+
+    let store = Store::open(&config_dir, info).unwrap_or_else(|e| fail(format!("cannot load configuration: {e}")));
     {
         let s = store.load();
         fastua::log!("loaded {} nodes in {} namespaces from {}", s.len(), s.namespaces.len(), config_dir.display());
@@ -68,21 +123,22 @@ fn main() {
         }
     }
     if let Err(e) = store.watch() {
-        eprintln!("cannot watch {}: {e}", config_dir.display());
-        std::process::exit(1);
+        fail(format!("cannot watch {}: {e}", config_dir.display()));
     }
 
-    let listener = match TcpListener::bind(&listen) {
-        Ok(l) => l,
-        Err(e) => {
-            eprintln!("cannot listen on {listen}: {e}");
-            std::process::exit(1);
-        }
-    };
-    fastua::log!("listening on {listen}, endpoint {endpoint}");
-    let server = Server::new(store, ServerConfig { listen, endpoint_url: endpoint, limits: Limits::default() });
+    let listener = TcpListener::bind(&listen).unwrap_or_else(|e| fail(format!("cannot listen on {listen}: {e}")));
+    let mut config = ServerConfig::all_endpoints(listen.clone(), endpoint.clone());
+    if let Some(e) = endpoints {
+        config.endpoints = e;
+    }
+    config.anonymous = anonymous;
+    config.x509_users = x509_users;
+    for (p, m) in &config.endpoints {
+        fastua::log!("endpoint {endpoint} {p:?} {m:?}");
+    }
+    fastua::log!("listening on {listen}");
+    let server = Server::new(store, config, pki, users);
     if let Err(e) = server.serve(listener) {
-        eprintln!("server stopped: {e}");
-        std::process::exit(1);
+        fail(format!("server stopped: {e}"));
     }
 }
