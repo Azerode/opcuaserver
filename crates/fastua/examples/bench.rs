@@ -26,6 +26,13 @@ fn percentile(sorted: &[u64], p: f64) -> u64 {
     sorted[((sorted.len() as f64 - 1.0) * p) as usize]
 }
 
+fn coarse_ticks() -> i64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut t) };
+    t.tv_sec * 10_000_000 + t.tv_nsec / 100
+}
+
 fn main() {
     let dir = std::env::temp_dir().join(format!("fastua-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -45,6 +52,20 @@ fn main() {
     let mut config = ServerConfig::all_endpoints(addr.clone(), format!("opc.tcp://{addr}"));
     config.anonymous = Some(fastua::users::Access::ReadWrite);
     let server = Server::new(store, config, pki, Users::default());
+
+    // ---- 0. clock costs (one precise read per request is unavoidable)
+    for (name, f) in [("now_ticks (CLOCK_REALTIME)", now_ticks as fn() -> i64), ("coarse clock", coarse_ticks)] {
+        let n = 5_000_000;
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = Instant::now();
+            for _ in 0..n {
+                black_box(f());
+            }
+            best = best.min(t.elapsed().as_nanos() as f64 / n as f64);
+        }
+        println!("clock          {name:<27} {best:>5.1} ns");
+    }
 
     // ---- 1. service layer
     let session = server.create_session("bench".into(), 1, 60_000.0, Security::NONE, vec![]).unwrap();
