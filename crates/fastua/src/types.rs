@@ -135,7 +135,7 @@ fn format_guid(g: &[u8; 16]) -> String {
     )
 }
 
-fn decode_base64(text: &str) -> Option<Vec<u8>> {
+pub fn decode_base64(text: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => (c - b'A') as u32,
