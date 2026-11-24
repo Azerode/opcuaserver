@@ -1,5 +1,7 @@
 # OPC UA Server Project
 
+> **New:** a Rust rewrite focused on raw performance and hot-reloaded configuration lives in `crates/fastua`. See [docs/RustServer.md](docs/RustServer.md).
+
 ## Description
 A C-based OPC UA Server implementation using open62541 library and JSON-C for configuration.
 

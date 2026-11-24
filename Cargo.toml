@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/fastua"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.82"
+
+# Every cycle counts: whole-program optimisation, no unwinding tables,
+# a single codegen unit so the optimiser sees everything at once.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+strip = "symbols"
+incremental = false
+
+[profile.bench]
+inherits = "release"
+debug = true
+strip = "none"
