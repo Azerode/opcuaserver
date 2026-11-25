@@ -8,6 +8,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
 
 - **Transport:** UA TCP binary (HEL/ACK/ERR, chunking both ways, pipelined requests).
 - **Security:** SecureChannel with SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, in Sign and SignAndEncrypt modes.
+  - ECC policies (OPC UA 1.05.04+): ECC_nistP256, ECC_nistP384 and ECC_curve25519, each with AesGcm and ChaChaPoly. They use ephemeral ECDH / X25519 key agreement, HKDF, ECDSA / Ed25519 signatures and AEAD messages, with the SecureChannelEnhancements (channel-bound session signatures, IKM chaining on renewal). A certificate per curve is created in the PKI. User names are not offered on ECC endpoints yet (EccEncryptedSecret); anonymous and X.509 users are.
   - Mutual certificate authentication.
   - Token renewal and lifetime, sequence checks.
   - A PKI with chain, CRL and ApplicationUri validation.
@@ -39,7 +40,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: the full namespace 0 nodeset, condition branches and shelving, dialog conditions, index ranges on MonitoredItems and in writes, event history, history persistence across restarts, ECC policies, the HTTPS transport (`opc.https`).
+Not yet: the full namespace 0 nodeset, condition branches and shelving, dialog conditions, index ranges on MonitoredItems and in writes, event history, history persistence across restarts, user name tokens on ECC endpoints (EccEncryptedSecret), the deprecated non-AEAD ECC policies, the HTTPS transport (`opc.https`).
 
 ## Build and run
 
@@ -61,7 +62,7 @@ Main options (`fastua --help` lists them all):
 | `--config DIR` | Namespace files, watched for changes (default `config/machines`). |
 | `--listen ADDR:PORT` | Address to bind (default `0.0.0.0:4840`). |
 | `--endpoint URL`, `--application-uri URI` | Advertised endpoint URL and ApplicationUri. |
-| `--endpoints LIST` | Endpoints to offer: `none`, `basic256sha256-sign`, `basic256sha256-encrypt`, `aes128-sign`, `aes128-encrypt`, `aes256-sign`, `aes256-encrypt` (default: all). |
+| `--endpoints LIST` | Endpoints to offer: `none`, `basic256sha256-sign`, `basic256sha256-encrypt`, `aes128-sign`, `aes128-encrypt`, `aes256-sign`, `aes256-encrypt`, `ecc-<curve>-<cipher>-sign\|encrypt` with curve `nistp256`, `nistp384` or `curve25519` and cipher `aesgcm` or `chachapoly` (default: all). |
 | `--pki DIR` | Certificate store (default `pki`). A self-signed certificate is created if missing. |
 | `--users FILE` | Enables user name / password login. |
 | `--anonymous off\|read\|write`, `--x509-users read\|write` | Rights of anonymous users and of certificate users. |
@@ -107,6 +108,8 @@ The numbers below were measured by CI on GitHub runners. Run `cargo run --releas
 | Server crypto per Read, Sign | ~290 ns | ~280 ns |
 | Server crypto per Read, SignAndEncrypt | ~410 ns | ~410 ns |
 | Round trip p50, SignAndEncrypt, `--busy-poll` | 8.8 µs | 9.7 µs |
+| Server crypto per Read, ECC_nistP256_AesGcm SignAndEncrypt | ECC_CI_X | ECC_CI_A |
+| Server crypto per Read, ECC_nistP256_ChaChaPoly SignAndEncrypt | CHA_CI_X | CHA_CI_A |
 | Subscription sampling pass, unchanged value | 0.02 ns/item | 0.02 ns/item |
 | Subscription sampling pass, 1 % of values changed | 1.1 ns/item | 2.7 ns/item |
 | Subscription changed value (sample + queue + encode) | 22 ns/item | 26 ns/item |
@@ -127,7 +130,7 @@ How it gets there:
 - **Lookups and decoding:** values live in seqlocks, so reads are wait-free.
   - Numeric NodeIds use a dense index; RequestHeader and ReadValueId are decoded through fixed-layout fast paths.
   - One coarse clock read per request.
-- **Security:** HMAC-SHA256 uses states precomputed per channel key and hardware SHA instructions.
+- **Security:** HMAC-SHA256 uses states precomputed per channel key and hardware SHA instructions. The ECC policies seal and open each chunk in place with one AEAD call (AES-GCM or ChaCha20-Poly1305), with no padding.
 - **Subscriptions:** sampling and publishing are driven by the connection thread, which waits for the next deadline with `ppoll`.
   - Value cells share a change stamp per block of 64: a write stores a value unique to (cell, write) into it, and a sampling pass skips a block of unchanged values with one load.
   - Samples go into fixed 32-byte entries, encoded straight from the value cell into the response.
@@ -152,9 +155,12 @@ cargo test                                   # unit + end-to-end tests
 cargo clippy --all-targets -- -D warnings
 pip install asyncua cryptography
 python3 crates/fastua/tests/interop/asyncua_interop.py target/release/fastua config/machines
+# ECC policies against the open62541 client (built with UA_ENABLE_ENCRYPTION=OPENSSL)
+cc crates/fastua/tests/interop/open62541_ecc.c -lopen62541 -lssl -lcrypto -o open62541_ecc
+crates/fastua/tests/interop/open62541_ecc.sh target/release/fastua config/machines ./open62541_ecc
 ```
 
-`.github/workflows/rust.yml` builds, tests, benchmarks and runs the asyncua interoperability suite natively on x86_64 and aarch64.
+`.github/workflows/rust.yml` builds, tests, benchmarks and runs the asyncua and open62541 (ECC) interoperability suites natively on x86_64 and aarch64.
 
 ## Legacy C server
 

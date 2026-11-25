@@ -322,10 +322,7 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
         if client_nonce.len() < crypto::NONCE_LEN {
             return Err(BAD_NONCE_INVALID);
         }
-        let mut data = channel_cert.der.clone();
-        data.extend_from_slice(&client_nonce);
-        let sig = security.policy.asym_sign(&pki.key.sign, &data).map_err(|_| status::BAD_INTERNAL_ERROR)?;
-        Some(sig)
+        Some(channel_cert.clone())
     };
 
     let limits = ctx.server.limits();
@@ -336,7 +333,31 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
     };
     let mut nonce = vec![0u8; crypto::NONCE_LEN];
     random_bytes(&mut nonce);
-    let session = ctx.server.create_session(name, ctx.channel_id, timeout, security.clone(), nonce.clone())?;
+    let server_signature = match server_signature {
+        None => None,
+        Some(channel_cert) => Some(match security.policy {
+            Policy::Ecc(suite) => {
+                // Channel-bound (SecureChannelEnhancements): ChannelThumbprint |
+                // clientNonce | H(server cert) | H(client cert) | serverNonce.
+                let own = pki.ecc_own(suite.curve).ok_or(status::BAD_INTERNAL_ERROR)?;
+                let data = ecc_signature_data(&security, &client_nonce, &[&own.cert_der, &channel_cert.der], &nonce)?;
+                own.key.sign(&data).map_err(|_| status::BAD_INTERNAL_ERROR)?
+            }
+            p => {
+                let mut data = channel_cert.der.clone();
+                data.extend_from_slice(&client_nonce);
+                p.asym_sign(&pki.key.sign, &data).map_err(|_| status::BAD_INTERNAL_ERROR)?
+            }
+        }),
+    };
+    let session = ctx.server.create_session(
+        name,
+        ctx.channel_id,
+        timeout,
+        security.clone(),
+        nonce.clone(),
+        client_nonce.clone(),
+    )?;
     let thumbprint = client_cert.as_deref().map(|c| crate::pki::hex(&crypto::thumbprint(c)));
     let channel = ctx.channel_id;
     ctx.server.session_event(
@@ -358,12 +379,13 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
     w.node_id(&session.token);
     w.f64(timeout);
     w.bytes(Some(&nonce));
-    w.bytes(Some(&pki.cert_der));
+    w.bytes(Some(pki.certificate_for(security.policy)));
     w.raw(ctx.server.endpoints_encoded());
     w.empty_array(); // serverSoftwareCertificates
     match &server_signature {
         Some(sig) => {
-            w.string(security.policy.asym_signature_uri());
+            // SecureChannelEnhancements: the algorithm is left empty.
+            w.str((!security.policy.is_ecc()).then(|| security.policy.asym_signature_uri()));
             w.bytes(Some(sig));
         }
         None => {
@@ -375,6 +397,21 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
     crate::log!("session '{}' ({}) created, {:?}/{:?}", session.name, session.id, security.policy, security.mode);
     *ctx.session = Some(session);
     Ok(())
+}
+
+/// Data of a channel-bound ECC signature (SecureChannelEnhancements):
+/// ChannelThumbprint | first nonce | certificate hashes | last nonce.
+fn ecc_signature_data(security: &Security, first: &[u8], certs: &[&[u8]], last: &[u8]) -> Result<Vec<u8>, u32> {
+    let suite = security.policy.ecc().ok_or(status::BAD_INTERNAL_ERROR)?;
+    let tp = security.channel_thumbprint.as_deref().ok_or(status::BAD_SECURITY_CHECKS_FAILED)?;
+    let mut data = Vec::with_capacity(tp.len() + first.len() + certs.len() * 48 + last.len());
+    data.extend_from_slice(tp);
+    data.extend_from_slice(first);
+    for c in certs {
+        data.extend_from_slice(&suite.certificate_hash(c));
+    }
+    data.extend_from_slice(last);
+    Ok(data)
 }
 
 /// Security policy protecting a user token: the token policy's own on an
@@ -467,12 +504,21 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
 
     // Proof of possession of the client certificate's private key.
     if let Some(cert) = &ctx.security.client_cert {
-        let policy = ctx.security.policy;
-        let mut data = pki.cert_der.clone();
-        data.extend_from_slice(&nonce);
-        if client_alg.as_deref() != Some(policy.asym_signature_uri())
-            || policy.asym_verify(&cert.rsa_public_key, &data, &client_sig).is_err()
-        {
+        let ok = match ctx.security.policy {
+            // Channel-bound; the algorithm field is ignored.
+            Policy::Ecc(suite) => {
+                let own = &pki.ecc_own(suite.curve).ok_or(status::BAD_INTERNAL_ERROR)?.cert_der;
+                let data = ecc_signature_data(ctx.security, &nonce, &[own, own, &cert.der], &s.client_nonce)?;
+                suite.verify(&cert.rsa_public_key, &data, &client_sig).is_ok()
+            }
+            policy => {
+                let mut data = pki.cert_der.clone();
+                data.extend_from_slice(&nonce);
+                client_alg.as_deref() == Some(policy.asym_signature_uri())
+                    && policy.asym_verify(&cert.rsa_public_key, &data, &client_sig).is_ok()
+            }
+        };
+        if !ok {
             return Err(BAD_APPLICATION_SIGNATURE_INVALID);
         }
     }
@@ -493,7 +539,8 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
                 Ok((policy_id, user, password, alg))
             };
             let (policy_id, user, password, alg) = parse().map_err(|_| status::BAD_IDENTITY_TOKEN_INVALID)?;
-            if policy_id != Some(USERNAME_POLICY_ID) || ctx.server.users.is_empty() {
+            // Not offered on ECC endpoints (needs EccEncryptedSecret).
+            if policy_id != Some(USERNAME_POLICY_ID) || ctx.server.users.is_empty() || ctx.security.policy.is_ecc() {
                 return Err(status::BAD_IDENTITY_TOKEN_INVALID);
             }
             let password = decrypt_secret(ctx, &password, alg.as_deref(), &nonce)?;
@@ -519,12 +566,22 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
                 crate::log!("user certificate rejected (0x{code:08X})");
                 status::BAD_IDENTITY_TOKEN_REJECTED
             })?;
-            let policy = token_policy(ctx);
-            let mut data = pki.cert_der.clone();
-            data.extend_from_slice(&nonce);
-            if user_alg.as_deref() != Some(policy.asym_signature_uri())
-                || policy.asym_verify(&info.rsa_public_key, &data, &user_sig).is_err()
-            {
+            let ok = match token_policy(ctx) {
+                // Channel-bound, signed with a user key on the same curve.
+                Policy::Ecc(suite) => {
+                    let own = &pki.ecc_own(suite.curve).ok_or(status::BAD_INTERNAL_ERROR)?.cert_der;
+                    let client = &ctx.security.client_cert.as_ref().ok_or(status::BAD_SECURITY_CHECKS_FAILED)?.der;
+                    let data = ecc_signature_data(ctx.security, &nonce, &[own, own, client, client], &s.client_nonce)?;
+                    info.curve == Some(suite.curve) && suite.verify(&info.rsa_public_key, &data, &user_sig).is_ok()
+                }
+                policy => {
+                    let mut data = pki.cert_der.clone();
+                    data.extend_from_slice(&nonce);
+                    user_alg.as_deref() == Some(policy.asym_signature_uri())
+                        && policy.asym_verify(&info.rsa_public_key, &data, &user_sig).is_ok()
+                }
+            };
+            if !ok {
                 return Err(BAD_USER_SIGNATURE_INVALID);
             }
             let thumb: String = info.thumbprint.iter().map(|b| format!("{b:02x}")).collect();

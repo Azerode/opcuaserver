@@ -17,7 +17,10 @@ const USAGE: &str = "usage: fastua [options]
   --pki DIR               certificate store (default: pki); a self-signed certificate is created if missing
   --endpoints LIST        comma-separated endpoints to offer (default: all):
                             none, basic256sha256-sign, basic256sha256-encrypt,
-                            aes128-sign, aes128-encrypt, aes256-sign, aes256-encrypt
+                            aes128-sign, aes128-encrypt, aes256-sign, aes256-encrypt,
+                            ecc-<curve>-<cipher>-sign|encrypt with curve nistp256,
+                            nistp384 or curve25519 and cipher aesgcm or chachapoly
+                            (e.g. ecc-nistp256-aesgcm-encrypt)
   --users FILE            users file enabling user name / password login
   --anonymous off|read|write   rights of anonymous users (default: read)
   --x509-users read|write      rights of users with a trusted certificate (default: write)
@@ -42,9 +45,27 @@ fn parse_endpoints(list: &str) -> Vec<(Policy, Mode)> {
             "aes128-encrypt" => (Policy::Aes128Sha256RsaOaep, Mode::SignAndEncrypt),
             "aes256-sign" => (Policy::Aes256Sha256RsaPss, Mode::Sign),
             "aes256-encrypt" => (Policy::Aes256Sha256RsaPss, Mode::SignAndEncrypt),
-            other => fail(format!("unknown endpoint '{other}'\n\n{USAGE}")),
+            other => {
+                parse_ecc_endpoint(other).unwrap_or_else(|| fail(format!("unknown endpoint '{other}'\n\n{USAGE}")))
+            }
         })
         .collect()
+}
+
+/// `ecc-<curve>-<cipher>-sign|encrypt`.
+fn parse_ecc_endpoint(name: &str) -> Option<(Policy, Mode)> {
+    let rest = name.strip_prefix("ecc-")?;
+    let (suite, mode) = rest.rsplit_once('-')?;
+    let mode = match mode {
+        "sign" => Mode::Sign,
+        "encrypt" => Mode::SignAndEncrypt,
+        _ => return None,
+    };
+    let suite = fastua::ecc::Suite::ALL.into_iter().find(|s| {
+        let uri = s.uri().rsplit_once("#ECC_").map(|(_, n)| n.to_ascii_lowercase().replace('_', "-"));
+        uri.as_deref() == Some(suite)
+    })?;
+    Some((Policy::Ecc(suite), mode))
 }
 
 fn parse_access(v: &str, allow_off: bool) -> Option<Access> {

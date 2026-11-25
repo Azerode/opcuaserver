@@ -4,6 +4,7 @@
 
 use crate::codec::{Reader, Writer};
 use crate::crypto::{self, ChannelKeys, Mode, Policy, PrivateKey, AES_BLOCK, SYM_SIGNATURE_LEN};
+use crate::ecc::{self, EccKeys, SigningKey, TAG_LEN};
 use crate::pki::CertInfo;
 use crate::server::SECURITY_POLICY_NONE;
 use crate::types::*;
@@ -15,6 +16,8 @@ pub struct Client {
     channel_id: u32,
     token_id: u32,
     seq: u32,
+    /// Last sequence number received (ECC IV masking).
+    last_rx_seq: u32,
     request_id: u32,
     handle: u32,
     pub auth_token: NodeId,
@@ -30,9 +33,35 @@ struct Secure {
     policy: Policy,
     mode: Mode,
     cert: Vec<u8>,
-    key: PrivateKey,
+    key: ClientKey,
     server: CertInfo,
     keys: Option<ChannelKeys>,
+    /// ECC: channel keys (server view: we seal with `remote`, open with
+    /// `local`), IKM accumulator and ChannelThumbprint.
+    ecc_keys: Option<EccKeys>,
+    ikm: Vec<u8>,
+    thumbprint: Vec<u8>,
+}
+
+enum ClientKey {
+    Rsa(PrivateKey),
+    Ecc(SigningKey),
+}
+
+impl Secure {
+    fn rsa(&self) -> &PrivateKey {
+        match &self.key {
+            ClientKey::Rsa(k) => k,
+            ClientKey::Ecc(_) => panic!("RSA key expected"),
+        }
+    }
+
+    fn ecc(&self) -> &SigningKey {
+        match &self.key {
+            ClientKey::Ecc(k) => k,
+            ClientKey::Rsa(_) => panic!("ECC key expected"),
+        }
+    }
 }
 
 /// Bytes of a MSG chunk sent in clear: header (8), channel id, token id.
@@ -60,9 +89,25 @@ impl Client {
         key_pkcs8: &[u8],
         server_cert: &[u8],
     ) -> io::Result<Client> {
-        let key = PrivateKey::from_pkcs8(key_pkcs8).map_err(|_| invalid("bad client key"))?;
+        let key = match policy.ecc() {
+            Some(s) => {
+                ClientKey::Ecc(SigningKey::from_pkcs8(s.curve, key_pkcs8).map_err(|_| invalid("bad client key"))?)
+            }
+            None => ClientKey::Rsa(PrivateKey::from_pkcs8(key_pkcs8).map_err(|_| invalid("bad client key"))?),
+        };
         let server = crate::pki::inspect(server_cert).map_err(|_| invalid("bad server certificate"))?;
-        let sec = Secure { policy, mode, cert: cert.to_vec(), key, server, keys: None };
+        let ikm = vec![0u8; policy.ecc().map_or(0, |s| s.secret_len())];
+        let sec = Secure {
+            policy,
+            mode,
+            cert: cert.to_vec(),
+            key,
+            server,
+            keys: None,
+            ecc_keys: None,
+            ikm,
+            thumbprint: Vec::new(),
+        };
         Self::connect_with(addr, endpoint, Some(sec))
     }
 
@@ -73,7 +118,9 @@ impl Client {
             stream,
             channel_id: 0,
             token_id: 0,
-            seq: 1,
+            // ECC sequence numbers start at 0.
+            seq: if sec.as_ref().is_some_and(|s| s.policy.is_ecc()) { 0 } else { 1 },
+            last_rx_seq: 0,
             request_id: 1,
             handle: 1,
             auth_token: NodeId::NULL,
@@ -136,8 +183,26 @@ impl Client {
         if sec.mode == Mode::None {
             return Ok(());
         }
-        let keys = &sec.keys.as_ref().ok_or_else(|| invalid("no keys"))?.local;
         let bad = || invalid("bad secured response");
+        if let Some(k) = &sec.ecc_keys {
+            let token = u32::from_le_bytes(self.rx[4..8].try_into().unwrap());
+            let end = self.rx.len().checked_sub(TAG_LEN).filter(|&e| e >= 16).ok_or_else(bad)?;
+            let (msg, tag) = self.rx.split_at_mut(end);
+            if sec.mode == Mode::SignAndEncrypt {
+                let mut aad = [0u8; 16];
+                aad[..8].copy_from_slice(hdr);
+                aad[8..].copy_from_slice(&msg[..8]);
+                k.local.open(token, self.last_rx_seq, &aad, &mut msg[8..], tag).map_err(|_| bad())?;
+            } else {
+                let mut aad = hdr.to_vec();
+                aad.extend_from_slice(msg);
+                k.local.open(token, self.last_rx_seq, &aad, &mut [], tag).map_err(|_| bad())?;
+            }
+            self.rx.truncate(end);
+            self.last_rx_seq = u32::from_le_bytes(self.rx[8..12].try_into().unwrap());
+            return Ok(());
+        }
+        let keys = &sec.keys.as_ref().ok_or_else(|| invalid("no keys"))?.local;
         if sec.mode == Mode::SignAndEncrypt {
             keys.decrypt(&mut self.rx[8..]).map_err(|_| bad())?;
         }
@@ -169,6 +234,15 @@ impl Client {
         let (policy, mode) = self.sec.as_ref().map(|s| (s.policy, s.mode)).unwrap_or((Policy::None, Mode::None));
         let mut client_nonce = vec![0u8; policy.nonce_len()];
         crate::server::random_bytes(&mut client_nonce);
+        let eph = match policy.ecc() {
+            Some(s) => {
+                let e = ecc::Ephemeral::generate(s).map_err(|_| invalid("key generation"))?;
+                client_nonce.copy_from_slice(&e.public);
+                Some(e)
+            }
+            None => None,
+        };
+        let mut request_sig = Vec::new();
         // Sequence header + OpenSecureChannelRequest.
         let mut body = Vec::with_capacity(256);
         {
@@ -201,6 +275,18 @@ impl Client {
                 let len = w.len() as u32;
                 w.patch_u32(4, len);
             }
+            Some(sec) if policy.is_ecc() => {
+                w.string(policy.uri());
+                w.bytes(Some(&sec.cert));
+                w.bytes(Some(&sec.server.thumbprint));
+                body.push(0);
+                let len = (w.len() + body.len() + policy.ecc().unwrap().signature_len()) as u32;
+                w.patch_u32(4, len);
+                w.raw(&body);
+                let sig = sec.ecc().sign(w.buf).map_err(|_| invalid("signing failed"))?;
+                w.raw(&sig);
+                request_sig = sig;
+            }
             Some(sec) => {
                 // Mirror of the server's OPN response: pad, sign with our key,
                 // encrypt with the server's.
@@ -209,7 +295,7 @@ impl Client {
                 w.bytes(Some(&sec.server.thumbprint));
                 let server_bytes = sec.server.key_bits / 8;
                 let block_in = server_bytes - policy.oaep_overhead();
-                let sig_len = sec.key.size_bytes();
+                let sig_len = sec.rsa().size_bytes();
                 let extra = server_bytes > 256;
                 let (pad, _) = crypto::padding(body.len(), sig_len, block_in, extra);
                 body.extend(std::iter::repeat_n((pad & 0xFF) as u8, pad + 1));
@@ -221,7 +307,7 @@ impl Client {
                 w.patch_u32(4, len);
                 let mut signed = w.buf.clone();
                 signed.extend_from_slice(&body);
-                let sig = policy.asym_sign(&sec.key.sign, &signed).map_err(|_| invalid("signing failed"))?;
+                let sig = policy.asym_sign(&sec.rsa().sign, &signed).map_err(|_| invalid("signing failed"))?;
                 body.extend_from_slice(&sig);
                 policy.asym_encrypt(&sec.server.spki, &body, w.buf).map_err(|_| invalid("encryption failed"))?;
             }
@@ -244,11 +330,28 @@ impl Client {
         r.bytes().map_err(|_| p())?;
         r.bytes().map_err(|_| p())?;
         let asym_end = r.position();
-        let plain = match &self.sec {
+        let plain = match &mut self.sec {
             None => self.rx[asym_end..].to_vec(),
+            Some(sec) if policy.is_ecc() => {
+                let suite = policy.ecc().unwrap();
+                let end = self.rx.len().checked_sub(suite.signature_len()).ok_or_else(p)?;
+                let mut signed = hdr.to_vec();
+                signed.extend_from_slice(&self.rx[..end]);
+                let first = sec.thumbprint.is_empty();
+                if first {
+                    signed.extend_from_slice(&request_sig);
+                }
+                suite
+                    .verify(&sec.server.rsa_public_key, &signed, &self.rx[end..])
+                    .map_err(|_| invalid("OPN response signature invalid"))?;
+                if first {
+                    sec.thumbprint = self.rx[end..].to_vec();
+                }
+                self.rx[asym_end..end].to_vec()
+            }
             Some(sec) => {
                 let mut plain = Vec::new();
-                policy.asym_decrypt(&sec.key.decrypt, &self.rx[asym_end..], &mut plain).map_err(|_| p())?;
+                policy.asym_decrypt(&sec.rsa().decrypt, &self.rx[asym_end..], &mut plain).map_err(|_| p())?;
                 let sig_len = sec.server.key_bits / 8;
                 let end = plain.len().checked_sub(sig_len).ok_or_else(p)?;
                 let mut signed = hdr.to_vec();
@@ -258,13 +361,13 @@ impl Client {
                     .asym_verify(&sec.server.rsa_public_key, &signed, &plain[end..])
                     .map_err(|_| invalid("OPN response signature invalid"))?;
                 let body_end =
-                    crate::channel::strip_padding(&plain[..end], sec.key.size_bytes() > 256).ok_or_else(p)?;
+                    crate::channel::strip_padding(&plain[..end], sec.rsa().size_bytes() > 256).ok_or_else(p)?;
                 plain.truncate(body_end);
                 plain
             }
         };
         let mut r = Reader::new(&plain);
-        r.u32().map_err(|_| p())?;
+        self.last_rx_seq = r.u32().map_err(|_| p())?;
         r.u32().map_err(|_| p())?;
         r.node_id().map_err(|_| p())?;
         skip_response_header(&mut r).map_err(|_| p())?;
@@ -275,7 +378,14 @@ impl Client {
         r.u32().map_err(|_| p())?;
         let server_nonce = r.bytes().map_err(|_| p())?.unwrap_or(&[]).to_vec();
         if let Some(sec) = &mut self.sec {
-            sec.keys = Some(ChannelKeys::derive(policy, &client_nonce, &server_nonce).map_err(|_| p())?);
+            match (policy.ecc(), eph) {
+                (Some(suite), Some(eph)) => {
+                    let secret = eph.agree(suite, &server_nonce).map_err(|_| p())?;
+                    let keys = EccKeys::derive(suite, &mut sec.ikm, &secret, &client_nonce, &server_nonce);
+                    sec.ecc_keys = Some(keys.map_err(|_| p())?);
+                }
+                _ => sec.keys = Some(ChannelKeys::derive(policy, &client_nonce, &server_nonce).map_err(|_| p())?),
+            }
         }
         Ok(())
     }
@@ -302,6 +412,28 @@ impl Client {
         Self::write_request_header(&mut w, &self.auth_token, self.handle);
         body(&mut w);
         let mode = self.sec.as_ref().map(|s| s.mode).unwrap_or(Mode::None);
+        if let Some(k) = self.sec.as_ref().and_then(|s| s.ecc_keys.as_ref()) {
+            let size = (tx.len() - start + TAG_LEN) as u32;
+            let h = &mut tx[start..start + 24];
+            h[0..4].copy_from_slice(b"MSGF");
+            h[4..8].copy_from_slice(&size.to_le_bytes());
+            h[8..12].copy_from_slice(&self.channel_id.to_le_bytes());
+            h[12..16].copy_from_slice(&self.token_id.to_le_bytes());
+            h[16..20].copy_from_slice(&self.seq.to_le_bytes());
+            h[20..24].copy_from_slice(&self.request_id.to_le_bytes());
+            let prev = self.seq.wrapping_sub(1);
+            let tag = if mode == Mode::SignAndEncrypt {
+                let (aad, data) = tx[start..].split_at_mut(SYM_CLEAR_LEN);
+                k.remote.seal(self.token_id, prev, aad, data)
+            } else {
+                k.remote.seal(self.token_id, prev, &tx[start..], &mut [])
+            };
+            tx.extend_from_slice(&tag.expect("seal"));
+            self.seq = self.seq.wrapping_add(1);
+            self.request_id += 1;
+            self.handle += 1;
+            return;
+        }
         if mode == Mode::SignAndEncrypt {
             let plain = tx.len() - start - SYM_CLEAR_LEN;
             let (pad, _) = crypto::padding(plain, SYM_SIGNATURE_LEN, AES_BLOCK, false);
@@ -407,28 +539,52 @@ impl Client {
         if ty != ids::CREATE_SESSION_RESPONSE {
             return Err(invalid(&format!("CreateSession failed: {:08X}", service_result(body))));
         }
-        let mut r = Reader::new(body);
+        let body = body.to_vec();
+        let mut r = Reader::new(&body);
         skip_response_header(&mut r).map_err(|_| invalid("bad header"))?;
         let _session_id = r.node_id().map_err(|_| invalid("bad session id"))?;
         let token = r.node_id().map_err(|_| invalid("bad token"))?;
         r.f64().map_err(|_| invalid("bad timeout"))?;
         let server_nonce = r.bytes().map_err(|_| invalid("bad nonce"))?.unwrap_or(&[]).to_vec();
-        self.auth_token = token;
 
-        // Proof of possession of our key: sign serverCertificate || serverNonce.
         let signature = match &self.sec {
+            Some(sec) if sec.policy.is_ecc() => {
+                // Channel-bound signatures (SecureChannelEnhancements).
+                let suite = sec.policy.ecc().unwrap();
+                let bound = |first: &[u8], certs: &[&[u8]], last: &[u8]| {
+                    let mut d = sec.thumbprint.clone();
+                    d.extend_from_slice(first);
+                    for c in certs {
+                        d.extend_from_slice(&suite.certificate_hash(c));
+                    }
+                    d.extend_from_slice(last);
+                    d
+                };
+                r.bytes().map_err(|_| invalid("bad certificate"))?;
+                r.array(0, |r| skip_endpoint(r)).map_err(|_| invalid("bad endpoints"))?;
+                r.array(0, |r| r.bytes().map(|_| ())).map_err(|_| invalid("bad software certificates"))?;
+                r.str().map_err(|_| invalid("bad signature"))?;
+                let server_sig = r.bytes().map_err(|_| invalid("bad signature"))?.unwrap_or(&[]).to_vec();
+                let data = bound(&client_nonce, &[&sec.server.der, &sec.cert], &server_nonce);
+                suite
+                    .verify(&sec.server.rsa_public_key, &data, &server_sig)
+                    .map_err(|_| invalid("server signature invalid"))?;
+                let data = bound(&server_nonce, &[&sec.server.der, &sec.server.der, &sec.cert], &client_nonce);
+                Some((None, sec.ecc().sign(&data).map_err(|_| invalid("signing failed"))?))
+            }
             Some(sec) if sec.policy != Policy::None => {
                 let mut data = sec.server.der.clone();
                 data.extend_from_slice(&server_nonce);
-                let sig = sec.policy.asym_sign(&sec.key.sign, &data).map_err(|_| invalid("signing failed"))?;
-                Some((sec.policy.asym_signature_uri(), sig))
+                let sig = sec.policy.asym_sign(&sec.rsa().sign, &data).map_err(|_| invalid("signing failed"))?;
+                Some((Some(sec.policy.asym_signature_uri()), sig))
             }
             _ => None,
         };
+        self.auth_token = token;
         let (ty, body) = self.call(ids::ACTIVATE_SESSION_REQUEST, |w| {
             match &signature {
                 Some((alg, sig)) => {
-                    w.string(alg);
+                    w.str(*alg);
                     w.bytes(Some(sig));
                 }
                 None => {
@@ -781,6 +937,30 @@ pub struct HistoryResult {
     pub values: Vec<DataValue>,
     /// (modification time, HistoryUpdateType, user name).
     pub modifications: Vec<(i64, u32, String)>,
+}
+
+/// Skips an EndpointDescription.
+fn skip_endpoint(r: &mut Reader) -> crate::codec::DResult<()> {
+    r.str()?;
+    r.str()?;
+    r.str()?;
+    r.localized_text()?;
+    r.i32()?;
+    r.str()?;
+    r.str()?;
+    r.skip_string_array()?;
+    r.bytes()?;
+    r.u32()?;
+    r.str()?;
+    r.array(0, |r| {
+        r.str()?;
+        r.i32()?;
+        r.str()?;
+        r.str()?;
+        r.str().map(|_| ())
+    })?;
+    r.str()?;
+    r.u8().map(|_| ())
 }
 
 pub fn skip_response_header(r: &mut Reader) -> crate::codec::DResult<u32> {

@@ -8,7 +8,8 @@
 
 use crate::address_space::AddressSpace;
 use crate::codec::{Reader, Writer};
-use crate::crypto::{self, ChannelKeys, Mode, Policy, SymKeys, SYM_SIGNATURE_LEN};
+use crate::crypto::{self, ChannelKeys, Mode, Policy, SYM_SIGNATURE_LEN};
+use crate::ecc::{self, EccKeys, TAG_LEN};
 use crate::pki::CertInfo;
 use crate::server::{random_bytes, Server, Session};
 use crate::services;
@@ -34,11 +35,27 @@ pub struct Security {
     pub policy: Policy,
     pub mode: Mode,
     pub client_cert: Option<Arc<CertInfo>>,
+    /// ECC SecureChannelEnhancements: our signature of the first
+    /// OpenSecureChannel response, binding session signatures to the channel.
+    pub channel_thumbprint: Option<Arc<[u8]>>,
 }
 
 impl Security {
-    pub const NONE: Security = Security { policy: Policy::None, mode: Mode::None, client_cert: None };
+    pub const NONE: Security =
+        Security { policy: Policy::None, mode: Mode::None, client_cert: None, channel_thumbprint: None };
 }
+
+/// Symmetric keys of one security token. The RSA keys stay inline (no
+/// pointer chase on the hot path); the size difference costs nothing, there
+/// are two per channel.
+#[allow(clippy::large_enum_variant)]
+enum Keys {
+    Rsa(ChannelKeys),
+    Ecc(EccKeys),
+}
+
+/// A verified ECC OPN: plain text, client certificate, request signature.
+type VerifiedOpn = (Vec<u8>, Arc<CertInfo>, Vec<u8>);
 
 struct Channel {
     id: u32,
@@ -47,17 +64,19 @@ struct Channel {
     token_created: Instant,
     lifetime_ms: u32,
     security: Security,
-    keys: Option<ChannelKeys>,
-    prev_keys: Option<ChannelKeys>,
+    keys: Option<Keys>,
+    prev_keys: Option<Keys>,
+    /// ECC: input keying material, XORed with each exchange's shared secret.
+    ikm: Vec<u8>,
 }
 
 impl Channel {
     /// Token and keys to secure outgoing messages: the previous token stays in
     /// use until the client has sent something with the new one.
-    fn sending(&self) -> (u32, Option<&SymKeys>) {
+    fn sending(&self) -> (u32, Option<&Keys>) {
         match self.prev_token_id {
-            Some(prev) => (prev, self.prev_keys.as_ref().map(|k| &k.local)),
-            None => (self.token_id, self.keys.as_ref().map(|k| &k.local)),
+            Some(prev) => (prev, self.prev_keys.as_ref()),
+            None => (self.token_id, self.keys.as_ref()),
         }
     }
 }
@@ -74,6 +93,9 @@ pub struct Connection<'a> {
     channel: Option<Channel>,
     next_seq: u32,
     last_client_seq: Option<u32>,
+    /// Part 6 §6.7.2.4 legacy sequence numbers (RSA): wrap below 1024.
+    /// ECC policies count from 0 and wrap from u32::MAX to 0.
+    legacy_seq: bool,
     hdr: [u8; 8],
     /// Receive buffer: the header and body of a chunk (and pipelined
     /// requests) arrive with one `recv` instead of two `read_exact`.
@@ -136,6 +158,7 @@ pub fn run(server: &Arc<Server>, stream: TcpStream) -> io::Result<()> {
         channel: None,
         next_seq: 1,
         last_client_seq: None,
+        legacy_seq: true,
         hdr: [0; 8],
         inbuf: vec![0; limits.buffer_size.max(MIN_BUFFER) as usize].into_boxed_slice(),
         in_start: 0,
@@ -400,8 +423,9 @@ impl<'a> Connection<'a> {
 
     fn check_sequence(&mut self, seq: u32) -> Result<(), Fatal> {
         if let Some(last) = self.last_client_seq {
-            // Part 6 §6.7.2.4: strictly +1, wrapping below 1024 once past 2^32-1024.
-            let ok = seq == last.wrapping_add(1) || (last > u32::MAX - 1024 && seq < 1024);
+            // Part 6 §6.7.2.4: strictly +1, wrapping below 1024 once past
+            // 2^32-1024 (legacy) or from 2^32-1 to 0.
+            let ok = seq == last.wrapping_add(1) || (self.legacy_seq && last > u32::MAX - 1024 && seq < 1024);
             if !ok {
                 return Err(Fatal::Protocol(status::BAD_SEQUENCE_NUMBER_INVALID, "sequence number out of order"));
             }
@@ -413,8 +437,8 @@ impl<'a> Connection<'a> {
     #[inline(always)]
     fn next_sequence(&mut self) -> u32 {
         let s = self.next_seq;
-        // Wrap to 1 before reaching the forbidden range near 2^32.
-        self.next_seq = if s >= u32::MAX - 1024 { 1 } else { s + 1 };
+        // Legacy: wrap to 1 before reaching the forbidden range near 2^32.
+        self.next_seq = if self.legacy_seq && s >= u32::MAX - 1024 { 1 } else { s.wrapping_add(1) };
         s
     }
 
@@ -482,6 +506,46 @@ impl<'a> Connection<'a> {
         Ok((plain, Arc::new(info)))
     }
 
+    /// Verifies an ECC OPN (signed, never encrypted). Returns the plain text,
+    /// the validated client certificate and the request signature.
+    fn unprotect_ecc(
+        &self,
+        suite: ecc::Suite,
+        rx: &[u8],
+        asym_end: usize,
+        sender_cert: Option<&[u8]>,
+        thumbprint: Option<&[u8]>,
+    ) -> Result<VerifiedOpn, Fatal> {
+        let pki = self.server.pki();
+        let own = pki.ecc_own(suite.curve).ok_or(checks_failed("no certificate for the curve"))?;
+        let cert = sender_cert.filter(|c| !c.is_empty()).ok_or(checks_failed("missing client certificate"))?;
+        let info = pki.validate_application(cert).map_err(|code| {
+            crate::log!("client certificate rejected (0x{code:08X})");
+            Fatal::Protocol(code, "client certificate rejected")
+        })?;
+        if info.curve != Some(suite.curve) {
+            return Err(Fatal::Protocol(status::BAD_SECURITY_POLICY_REJECTED, "client key not on the policy curve"));
+        }
+        if thumbprint != Some(&own.thumbprint[..]) {
+            return Err(checks_failed("receiver certificate thumbprint mismatch"));
+        }
+        if let Some(ch) = &self.channel {
+            if ch.security.client_cert.as_ref().map(|c| &c.der) != Some(&info.der) {
+                return Err(checks_failed("certificate changed on renew"));
+            }
+        }
+        let sig_len = suite.signature_len();
+        let end =
+            rx.len().checked_sub(sig_len).filter(|&e| e >= asym_end + 8).ok_or(checks_failed("message too short"))?;
+        let mut signed = Vec::with_capacity(8 + end);
+        signed.extend_from_slice(&self.hdr);
+        signed.extend_from_slice(&rx[..end]);
+        suite.verify(&info.rsa_public_key, &signed, &rx[end..]).map_err(|_| checks_failed("signature invalid"))?;
+        // The padding byte (0x00, no padding) is left in place: the decoder
+        // stops at the end of the request.
+        Ok((rx[asym_end..end].to_vec(), Arc::new(info), rx[end..].to_vec()))
+    }
+
     fn open_channel_inner(&mut self, rx: &[u8]) -> Result<(), Fatal> {
         let mut r = Reader::new(rx);
         let channel_id = r.u32()?;
@@ -498,11 +562,18 @@ impl<'a> Connection<'a> {
             }
         }
 
-        let (plain, client_cert) = if policy == Policy::None {
-            (rx[asym_end..].to_vec(), None)
-        } else {
-            let (p, c) = self.unprotect_asymmetric(policy, rx, asym_end, sender_cert, thumbprint)?;
-            (p, Some(c))
+        let mut request_sig = Vec::new();
+        let (plain, client_cert) = match policy {
+            Policy::None => (rx[asym_end..].to_vec(), None),
+            Policy::Ecc(suite) => {
+                let (p, c, sig) = self.unprotect_ecc(suite, rx, asym_end, sender_cert, thumbprint)?;
+                request_sig = sig;
+                (p, Some(c))
+            }
+            _ => {
+                let (p, c) = self.unprotect_asymmetric(policy, rx, asym_end, sender_cert, thumbprint)?;
+                (p, Some(c))
+            }
         };
 
         let mut r = Reader::new(&plain);
@@ -511,6 +582,7 @@ impl<'a> Connection<'a> {
         // A new channel restarts the client's sequence numbering.
         if self.channel.is_none() {
             self.last_client_seq = None;
+            self.legacy_seq = !policy.is_ecc();
         }
         self.check_sequence(seq)?;
         let type_id = r.node_id()?;
@@ -532,22 +604,40 @@ impl<'a> Connection<'a> {
             return Err(Fatal::Protocol(status::BAD_SECURITY_POLICY_REJECTED, "security mode not supported"));
         }
         let mut server_nonce = vec![0u8; policy.nonce_len()];
-        if policy != Policy::None {
-            if client_nonce.len() != policy.nonce_len() {
-                return Err(Fatal::Protocol(BAD_NONCE_INVALID, "client nonce has wrong length"));
-            }
-            random_bytes(&mut server_nonce);
+        if policy != Policy::None && client_nonce.len() != policy.nonce_len() {
+            return Err(Fatal::Protocol(BAD_NONCE_INVALID, "client nonce has wrong length"));
         }
+        let mut ikm = Vec::new();
         let keys = match policy {
             Policy::None => None,
-            p => Some(
-                ChannelKeys::derive(p, &client_nonce, &server_nonce).map_err(|_| checks_failed("key derivation"))?,
-            ),
+            Policy::Ecc(suite) => {
+                // Ephemeral key agreement; the nonces are the public keys.
+                let kd = || checks_failed("key derivation");
+                let eph = ecc::Ephemeral::generate(suite).map_err(|_| kd())?;
+                server_nonce.copy_from_slice(&eph.public);
+                let secret = eph
+                    .agree(suite, &client_nonce)
+                    .map_err(|_| Fatal::Protocol(BAD_NONCE_INVALID, "bad client nonce"))?;
+                ikm = match &self.channel {
+                    Some(ch) => ch.ikm.clone(),
+                    None => vec![0u8; suite.secret_len()],
+                };
+                Some(Keys::Ecc(
+                    EccKeys::derive(suite, &mut ikm, &secret, &client_nonce, &server_nonce).map_err(|_| kd())?,
+                ))
+            }
+            p => {
+                random_bytes(&mut server_nonce);
+                Some(Keys::Rsa(
+                    ChannelKeys::derive(p, &client_nonce, &server_nonce)
+                        .map_err(|_| checks_failed("key derivation"))?,
+                ))
+            }
         };
 
         let limits = self.server.limits();
         let lifetime = requested_lifetime.clamp(limits.min_token_lifetime_ms, limits.max_token_lifetime_ms);
-        let security = Security { policy, mode, client_cert: client_cert.clone() };
+        let security = Security { policy, mode, client_cert: client_cert.clone(), channel_thumbprint: None };
         let ch = match (request_type, self.channel.as_mut()) {
             (0, None) => {
                 if channel_id != 0 {
@@ -562,13 +652,19 @@ impl<'a> Connection<'a> {
                     security,
                     keys,
                     prev_keys: None,
+                    ikm,
                 });
+                // ECC sequence numbers start at 0 with this response.
+                if policy.is_ecc() {
+                    self.next_seq = 0;
+                }
                 self.channel.as_ref().unwrap()
             }
             (1, Some(ch)) if ch.id == channel_id && ch.security.mode == mode => {
                 ch.prev_token_id = Some(ch.token_id);
                 ch.prev_keys = ch.keys.take();
                 ch.keys = keys;
+                ch.ikm = ikm;
                 ch.token_id = ch.token_id.wrapping_add(1).max(1);
                 ch.token_created = Instant::now();
                 ch.lifetime_ms = lifetime;
@@ -579,6 +675,7 @@ impl<'a> Connection<'a> {
             }
         };
         let (id, token_id) = (ch.id, ch.token_id);
+        let first = request_type == 0;
 
         // Response body (sequence header + OpenSecureChannelResponse).
         let seq_out = self.next_sequence();
@@ -610,6 +707,39 @@ impl<'a> Connection<'a> {
                 w.raw(&body);
                 let len = w.len() as u32;
                 w.patch_u32(4, len);
+            }
+            Some(client) if policy.is_ecc() => {
+                let suite = policy.ecc().unwrap();
+                let own =
+                    self.server.pki().ecc_own(suite.curve).ok_or(checks_failed("no certificate for the curve"))?;
+                w.bytes(Some(&own.cert_der));
+                w.bytes(Some(&client.thumbprint));
+                // No encryption: one padding byte (no padding), then the
+                // signature.
+                body.push(0);
+                let sig_len = suite.signature_len();
+                let len = (w.len() + body.len() + sig_len) as u32;
+                w.patch_u32(4, len);
+                w.raw(&body);
+                // First exchange (SecureChannelEnhancements): the signature
+                // also covers the client's request signature and becomes the
+                // ChannelThumbprint.
+                let sig = if first {
+                    let mut signed = Vec::with_capacity(w.len() + request_sig.len());
+                    signed.extend_from_slice(w.buf);
+                    signed.extend_from_slice(&request_sig);
+                    own.key.sign(&signed)
+                } else {
+                    own.key.sign(w.buf)
+                };
+                let sig = sig.map_err(|_| checks_failed("signing failed"))?;
+                w.raw(&sig);
+                debug_assert_eq!(w.buf.len() as u32, len);
+                if first {
+                    if let Some(ch) = self.channel.as_mut() {
+                        ch.security.channel_thumbprint = Some(sig.into());
+                    }
+                }
             }
             Some(client) => {
                 let pki = self.server.pki();
@@ -672,10 +802,34 @@ impl<'a> Connection<'a> {
         }
 
         let mut end = rx.len();
+        let encrypt = ch.security.mode == Mode::SignAndEncrypt;
         if ch.security.mode != Mode::None {
             let keys = if use_prev { ch.prev_keys.as_ref() } else { ch.keys.as_ref() };
-            let keys = &keys.ok_or(checks_failed("no keys"))?.remote;
-            let encrypt = ch.security.mode == Mode::SignAndEncrypt;
+            let keys = match keys.ok_or(checks_failed("no keys"))? {
+                Keys::Rsa(k) => &k.remote,
+                Keys::Ecc(k) => {
+                    // AEAD: the IV is masked with the token and the last
+                    // sequence number received.
+                    let prev = self.last_client_seq.unwrap_or(0);
+                    end = end.checked_sub(TAG_LEN).filter(|&e| e >= 16).ok_or(checks_failed("message too short"))?;
+                    let (msg, tag) = rx.split_at_mut(end);
+                    let ok = if encrypt {
+                        let mut aad = [0u8; 16];
+                        aad[..8].copy_from_slice(&self.hdr);
+                        aad[8..].copy_from_slice(&msg[..8]);
+                        k.remote.open(token_id, prev, &aad, &mut msg[8..], tag)
+                    } else {
+                        // Sign: the tag authenticates the whole chunk.
+                        let aad = &mut self.out;
+                        aad.clear();
+                        aad.extend_from_slice(&self.hdr);
+                        aad.extend_from_slice(msg);
+                        k.remote.open(token_id, prev, aad, &mut [], tag)
+                    };
+                    ok.map_err(|_| checks_failed("authentication failed"))?;
+                    return self.accept(use_prev, end);
+                }
+            };
             if encrypt {
                 keys.decrypt(&mut rx[8..]).map_err(|_| checks_failed("decryption failed"))?;
             }
@@ -690,6 +844,13 @@ impl<'a> Connection<'a> {
                 end = 8 + strip_padding(&rx[8..end], false).ok_or(checks_failed("padding invalid"))?;
             }
         }
+        self.accept(use_prev, end)
+    }
+
+    /// Second half of [`Self::unprotect`], once the chunk is authentic.
+    #[inline(always)]
+    fn accept(&mut self, use_prev: bool, end: usize) -> Result<(u32, usize, usize), Fatal> {
+        let ch = self.channel.as_mut().ok_or(checks_failed("no channel"))?;
         if !use_prev && ch.prev_token_id.is_some() {
             // The client switched to the new token: retire the old one.
             ch.prev_token_id = None;
@@ -781,9 +942,12 @@ impl<'a> Connection<'a> {
 
     /// Frames `tx[24..]` into one or more MSG chunks, secures and sends them.
     fn send_response(&mut self, request_id: u32, tx: &mut Vec<u8>, handle: u32) -> Result<(), Fatal> {
-        let mode = self.channel.as_ref().map(|c| c.security.mode).unwrap_or(Mode::None);
+        let (policy, mode) =
+            self.channel.as_ref().map(|c| (c.security.policy, c.security.mode)).unwrap_or((Policy::None, Mode::None));
         let max_body = match mode {
             Mode::None => self.send_buffer as usize - MSG_HEADER_LEN,
+            // AEAD: a tag, no padding.
+            _ if policy.is_ecc() => self.send_buffer as usize - MSG_HEADER_LEN - TAG_LEN,
             Mode::Sign => self.send_buffer as usize - MSG_HEADER_LEN - SYM_SIGNATURE_LEN,
             Mode::SignAndEncrypt => {
                 let encrypted = (self.send_buffer as usize - SYM_CLEAR_LEN) / crypto::AES_BLOCK * crypto::AES_BLOCK;
@@ -830,10 +994,16 @@ impl<'a> Connection<'a> {
     /// `send_response(tx)` leaves the body of `tx` as it is: no encryption in
     /// place and no BadResponseTooLarge fault instead of it.
     fn sent_intact(&self, tx: &[u8]) -> bool {
-        match self.channel.as_ref().map(|c| c.security.mode).unwrap_or(Mode::None) {
+        let (policy, mode) =
+            self.channel.as_ref().map(|c| (c.security.policy, c.security.mode)).unwrap_or((Policy::None, Mode::None));
+        match mode {
             Mode::SignAndEncrypt => false,
             mode => {
-                let sig = if mode == Mode::Sign { SYM_SIGNATURE_LEN } else { 0 };
+                let sig = match mode {
+                    Mode::None => 0,
+                    _ if policy.is_ecc() => TAG_LEN,
+                    _ => SYM_SIGNATURE_LEN,
+                };
                 let max_body = self.send_buffer as usize - MSG_HEADER_LEN - sig;
                 let body_len = tx.len() - MSG_HEADER_LEN;
                 !self.too_big(body_len, body_len.div_ceil(max_body).max(1))
@@ -855,6 +1025,24 @@ impl<'a> Connection<'a> {
     ) -> Result<(), Fatal> {
         let ch = self.channel.as_ref().ok_or(Fatal::Protocol(status::BAD_SECURE_CHANNEL_ID_INVALID, "no channel"))?;
         let (token, keys) = ch.sending();
+        if let Some(Keys::Ecc(k)) = keys {
+            let size = (buf.len() - start + TAG_LEN) as u32;
+            write_msg_header(&mut buf[start..start + MSG_HEADER_LEN], kind, size, ch.id, token, seq, request_id);
+            // The receiver masks the IV with the last sequence number it got.
+            let prev = seq.wrapping_sub(1);
+            let tag = if mode == Mode::SignAndEncrypt {
+                let (aad, data) = buf[start..].split_at_mut(SYM_CLEAR_LEN);
+                k.local.seal(token, prev, aad, data)
+            } else {
+                k.local.seal(token, prev, &buf[start..], &mut [])
+            };
+            buf.extend_from_slice(&tag.map_err(|_| checks_failed("encryption failed"))?);
+            return Ok(());
+        }
+        let keys = match keys {
+            Some(Keys::Rsa(k)) => Some(&k.local),
+            _ => None,
+        };
         if mode == Mode::SignAndEncrypt {
             let plain = buf.len() - start - SYM_CLEAR_LEN;
             let (pad, _) = crypto::padding(plain, SYM_SIGNATURE_LEN, crypto::AES_BLOCK, false);

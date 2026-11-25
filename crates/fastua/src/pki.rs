@@ -104,9 +104,9 @@ pub fn inspect(der: &[u8]) -> Result<CertInfo, u32> {
     let curve = key_curve(&cert);
     let key_bits = match curve {
         Some(_) => 0,
-        None => aws_lc_rs::rsa::PublicEncryptingKey::from_der(&spki)
-            .map_err(|_| BAD_CERTIFICATE_INVALID)?
-            .key_size_bits(),
+        None => {
+            aws_lc_rs::rsa::PublicEncryptingKey::from_der(&spki).map_err(|_| BAD_CERTIFICATE_INVALID)?.key_size_bits()
+        }
     };
     let application_uri = cert.subject_alternative_name().ok().flatten().and_then(|san| {
         san.value.general_names.iter().find_map(|g| match g {
@@ -370,6 +370,14 @@ impl Pki {
     pub fn ecc_own(&self, curve: crate::ecc::Curve) -> Option<&EccOwn> {
         self.ecc.iter().find(|e| e.curve == curve)
     }
+
+    /// Our certificate on endpoints and channels of `policy`.
+    pub fn certificate_for(&self, policy: crate::crypto::Policy) -> &[u8] {
+        match policy.ecc().and_then(|s| self.ecc_own(s.curve)) {
+            Some(own) => &own.cert_der,
+            None => &self.cert_der,
+        }
+    }
 }
 
 fn curve_name(curve: crate::ecc::Curve) -> &'static str {
@@ -387,8 +395,7 @@ fn load_ecc(root: &Path, curve: crate::ecc::Curve, application_uri: &str, hostna
     let key_path = root.join(format!("own/private/fastua_{name}.pk8"));
     let io = |e: std::io::Error| format!("{}: {e}", root.display());
     if !cert_path.exists() || !key_path.exists() {
-        let (cert, key) =
-            generate_self_signed_ecc(curve, application_uri, hostname).map_err(|e| format!("{e:?}"))?;
+        let (cert, key) = generate_self_signed_ecc(curve, application_uri, hostname).map_err(|e| format!("{e:?}"))?;
         write_private(&key_path, &key).map_err(io)?;
         std::fs::write(&cert_path, &cert).map_err(io)?;
         crate::log!("generated self-signed certificate {}", cert_path.display());
@@ -545,11 +552,8 @@ pub fn generate_self_signed_ecc(
         SanType::URI(application_uri.try_into().map_err(|_| CryptoError)?),
         SanType::DnsName(hostname.try_into().map_err(|_| CryptoError)?),
     ];
-    params.key_usages = vec![
-        KeyUsagePurpose::DigitalSignature,
-        KeyUsagePurpose::ContentCommitment,
-        KeyUsagePurpose::KeyCertSign,
-    ];
+    params.key_usages =
+        vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::ContentCommitment, KeyUsagePurpose::KeyCertSign];
     params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
     params.is_ca = IsCa::ExplicitNoCa;
     params.use_authority_key_identifier_extension = true;

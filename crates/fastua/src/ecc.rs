@@ -296,7 +296,13 @@ impl EccKeys {
     /// Keys of one OpenSecureChannel exchange. `ikm` is the channel's IKM
     /// accumulator (zeros before the first exchange): IKM_n = IKM_n-1 XOR
     /// shared secret, kept for the next renewal.
-    pub fn derive(suite: Suite, ikm: &mut [u8], secret: &[u8], client_nonce: &[u8], server_nonce: &[u8]) -> CResult<EccKeys> {
+    pub fn derive(
+        suite: Suite,
+        ikm: &mut [u8],
+        secret: &[u8],
+        client_nonce: &[u8],
+        server_nonce: &[u8],
+    ) -> CResult<EccKeys> {
         if ikm.len() != secret.len() {
             return Err(CryptoError);
         }
@@ -361,8 +367,7 @@ mod tests {
             let keys = EccKeys::derive(suite, &mut ikm, &s_secret, &cn, &sn).unwrap();
             // The client's sending keys: label opcua-client, client nonce first.
             let len = suite.sym_key_len() + IV_LEN;
-            let client_local =
-                AeadKeys::new(suite, &derive(suite, &ikm, b"opcua-client", &cn, &sn, len)).unwrap();
+            let client_local = AeadKeys::new(suite, &derive(suite, &ikm, b"opcua-client", &cn, &sn, len)).unwrap();
             let mut msg = *b"hello secure channel";
             let tag = client_local.seal(7, 41, b"header", &mut msg).unwrap();
             assert_ne!(&msg, b"hello secure channel");

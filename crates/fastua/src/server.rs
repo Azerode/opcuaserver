@@ -106,7 +106,8 @@ impl ServerConfig {
     /// Every supported endpoint, anonymous users read-only.
     pub fn all_endpoints(listen: String, endpoint_url: String) -> ServerConfig {
         let mut endpoints = vec![(Policy::None, Mode::None)];
-        for p in Policy::SECURE {
+        let ecc = crate::ecc::Suite::ALL.into_iter().map(Policy::Ecc);
+        for p in Policy::SECURE.into_iter().chain(ecc) {
             endpoints.push((p, Mode::Sign));
             endpoints.push((p, Mode::SignAndEncrypt));
         }
@@ -155,6 +156,8 @@ pub struct Session {
     pub security: Security,
     /// Last nonce sent to the client (CreateSession / ActivateSession).
     pub server_nonce: Mutex<Vec<u8>>,
+    /// CreateSession clientNonce (channel-bound ECC signatures).
+    pub client_nonce: Vec<u8>,
     /// Rights of the identity given at the last ActivateSession.
     pub can_write: AtomicBool,
     /// User identity of the last ActivateSession ("anonymous", "user:<name>",
@@ -223,8 +226,16 @@ fn write_application_description(w: &mut Writer, info: &ServerInfo, discovery_ur
 }
 
 impl Server {
-    pub fn new(store: Arc<Store>, config: ServerConfig, pki: Arc<Pki>, users: Users) -> Arc<Server> {
+    pub fn new(store: Arc<Store>, mut config: ServerConfig, pki: Arc<Pki>, users: Users) -> Arc<Server> {
         let info = store.info().clone();
+        // An ECC endpoint needs our certificate on its curve.
+        config.endpoints.retain(|(p, _)| match p.ecc() {
+            Some(s) if pki.ecc_own(s.curve).is_none() => {
+                crate::log!("no {:?} certificate: {} not offered", s.curve, p.uri());
+                false
+            }
+            _ => true,
+        });
         let mut endpoints_encoded = Vec::new();
         {
             let mut w = Writer::new(&mut endpoints_encoded);
@@ -232,7 +243,7 @@ impl Server {
             for &(policy, mode) in &config.endpoints {
                 w.string(&config.endpoint_url);
                 write_application_description(&mut w, &info, &config.endpoint_url);
-                w.bytes(Some(&pki.cert_der));
+                w.bytes(Some(pki.certificate_for(policy)));
                 w.i32(mode as i32);
                 w.string(policy.uri());
                 // Credentials on an unsecured channel are protected with
@@ -242,7 +253,8 @@ impl Server {
                 if config.anonymous.is_some() {
                     tokens.push((ANONYMOUS_POLICY_ID, 0, None));
                 }
-                if !users.is_empty() {
+                // ECC: user names need EccEncryptedSecret (not supported).
+                if !users.is_empty() && !policy.is_ecc() {
                     tokens.push((USERNAME_POLICY_ID, 1, token_policy));
                 }
                 tokens.push((CERTIFICATE_POLICY_ID, 2, token_policy));
@@ -329,6 +341,7 @@ impl Server {
         timeout_ms: f64,
         security: Security,
         server_nonce: Vec<u8>,
+        client_nonce: Vec<u8>,
     ) -> Result<Arc<Session>, u32> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if sessions.len() >= self.limits().max_sessions {
@@ -351,6 +364,7 @@ impl Server {
             continuation_points: Mutex::new(Vec::new()),
             security,
             server_nonce: Mutex::new(server_nonce),
+            client_nonce,
             can_write: AtomicBool::new(false),
             identity: Mutex::new(Arc::from("")),
             subs: Mutex::new(SessionSubs::default()),
