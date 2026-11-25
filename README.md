@@ -143,6 +143,8 @@ How it gets there:
 - **Aggregates:** computed in place on the ring under the lock: no copy of the window and no allocation per interval. Interpolation at the interval bounds is a binary search; time-weighted areas are summed on the fly.
 - **Build:** release profile with fat LTO, 1 codegen unit and `panic = "abort"`.
 
+**Against open62541:** CI runs the same load client against fastua and the open62541 server (same machine, same 100 variables, None / Basic256Sha256 / ECC nistP256) and publishes the comparison in the job summary. See [crates/fastua/tests/compare](crates/fastua/tests/compare/README.md).
+
 Details: [docs/RustServer.md](docs/RustServer.md).
 
 ## Security
