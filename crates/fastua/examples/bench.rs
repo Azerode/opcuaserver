@@ -335,6 +335,44 @@ fn history_engine() {
         }
         println!("history        read raw x{count:<5}    {best:>8.0} ns  {:>6.1} ns/value", best / count as f64);
     }
+    aggregates_engine(h, last);
+}
+
+/// Processed reads as the service computes them: one window, then every
+/// interval of 100 values.
+fn aggregates_engine(h: &fastua::history::History, last: i64) {
+    use fastua::aggregates::{compute, intervals, Config, Window};
+    let n = 10_000i64;
+    let (start, end) = (last - n + 1, last + 1);
+    let cfg = Config::default();
+    let mut best = f64::MAX;
+    for _ in 0..7 {
+        let t = Instant::now();
+        black_box(h.window_with(start, end, |w| w.values.len()));
+        best = best.min(t.elapsed().as_nanos() as f64);
+    }
+    println!("aggregates     window       10000 values                  {:>6.1} ns/value", best / n as f64);
+    for (name, agg) in [("Average", 2342u32), ("TimeAverage", 2343), ("Minimum", 2346), ("StdDev", 11426)] {
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let t = Instant::now();
+            h.window_with(start, end, |all| {
+                let values = all.values;
+                for (s, e, partial, ts) in intervals(start, end, 0.01) {
+                    let a = values.partition_point(|x| x.source_ts < s);
+                    let b = values.partition_point(|x| x.source_ts < e);
+                    let w = Window {
+                        before: if a > 0 { values.get(a - 1) } else { all.before },
+                        values: &values[a..b],
+                        after: values.get(b).or(all.after),
+                    };
+                    black_box(compute(agg, h.kind(), false, &cfg, s, e, partial, ts, &w));
+                }
+            });
+            best = best.min(t.elapsed().as_nanos() as f64);
+        }
+        println!("aggregates     {name:<12} 10000 values / 100 intervals  {:>6.1} ns/value", best / n as f64);
+    }
 }
 
 fn event_engine(store: &Store) {

@@ -116,6 +116,8 @@ The numbers below were measured by CI on GitHub runners. Run `cargo run --releas
 | Write, variable without history | 8.1 ns | 12.7 ns |
 | Write, historized variable | 24 ns | 43 ns |
 | HistoryRead raw, 1000 values, per value | 9.7 ns | 15.4 ns |
+| Processed read, Average, 100 values per interval, per value | ci | ci |
+| Processed read, TimeAverage, 100 values per interval, per value | ci | ci |
 
 How it gets there:
 
@@ -133,7 +135,8 @@ How it gets there:
   - Buffers are recycled, so the steady state allocates nothing (`tests/no_alloc.rs`).
   - A notification leaves at the end of the publishing interval, as the specification requires, so the publishing interval sets the latency.
 - **Events:** event items pull from a shared ring only when their subscription is serviced. Subscriptions without event items never look at it, and raising an event costs one atomic load while nobody subscribes.
-- **History:** a write checks one flag that sits in the cell's padding; a historized write takes a short mutex and pushes into a ring that stops allocating once full. HistoryRead encodes each DataValue straight from the ring under the lock, without copying the values. Continuation points carry the resume position, so they hold no server memory.
+- **History:** a write checks one flag that sits in the cell's padding. A historized numeric write is staged in a 64-slot lock-free buffer with plain stores, while the writer still holds the cell's seqlock (which makes it the only producer). The ring mutex is taken once per 32 writes, to append the staged batch in one move, and by readers, which drain the buffer first. The ring stops allocating once full. HistoryRead encodes each DataValue straight from the ring under the lock, without copying the values. Continuation points carry the resume position, so they hold no server memory.
+- **Aggregates:** computed in place on the ring under the lock: no copy of the window and no allocation per interval. Interpolation at the interval bounds is a binary search; time-weighted areas are summed on the fly.
 - **Build:** release profile with fat LTO, 1 codegen unit and `panic = "abort"`.
 
 Details: [docs/RustServer.md](docs/RustServer.md).
