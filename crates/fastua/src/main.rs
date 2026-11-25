@@ -27,6 +27,8 @@ const USAGE: &str = "usage: fastua [options]
   --trust-all-clients     accept any client certificate (development only)
   --busy-poll US          poll each connection for US microseconds before sleeping
                           (lower latency, one busy core per active connection; default: off)
+  --busy-poll-threads N   at most N connections busy-poll at once, the others sleep
+                          (default: cores - 1); fewer when the CPUs are busy
   --min-publishing-interval MS   fastest subscription publishing interval (default: 1, minimum 0.05)
   --min-sampling-interval MS     fastest monitored item sampling interval (default: 1, minimum 0.05)";
 
@@ -89,6 +91,7 @@ fn main() {
     let mut x509_users = Access::ReadWrite;
     let mut trust_all = false;
     let mut busy_poll = std::time::Duration::ZERO;
+    let mut busy_poll_threads = 0;
     let mut min_publishing: Option<f64> = None;
     let mut min_sampling: Option<f64> = None;
 
@@ -117,6 +120,14 @@ fn main() {
                 let v = value("--busy-poll");
                 let us: u64 = v.parse().unwrap_or_else(|_| fail(format!("invalid --busy-poll '{v}'\n\n{USAGE}")));
                 busy_poll = std::time::Duration::from_micros(us);
+            }
+            "--busy-poll-threads" => {
+                let v = value("--busy-poll-threads");
+                busy_poll_threads = v
+                    .parse()
+                    .ok()
+                    .filter(|n: &usize| *n > 0)
+                    .unwrap_or_else(|| fail(format!("invalid --busy-poll-threads '{v}'\n\n{USAGE}")));
             }
             "--min-publishing-interval" | "--min-sampling-interval" => {
                 let v = value(&a);
@@ -188,6 +199,7 @@ fn main() {
     config.anonymous = anonymous;
     config.x509_users = x509_users;
     config.busy_poll = busy_poll;
+    config.busy_poll_threads = busy_poll_threads;
     config.limits = limits;
     if !busy_poll.is_zero() {
         fastua::log!("busy-polling connections for {} us before sleeping", busy_poll.as_micros());
