@@ -306,8 +306,10 @@ fn security_diagnostics(w: &mut Writer, s: &crate::server::Session) {
         _ => "Anonymous",
     };
     w.string(mechanism);
-    w.string("UA Binary");
-    w.string(if s.security.https {
+    w.string(if s.security.json { "UA JSON" } else { "UA Binary" });
+    w.string(if s.security.json {
+        crate::https::TRANSPORT_PROFILE_HTTPS_JSON
+    } else if s.security.https {
         crate::https::TRANSPORT_PROFILE_HTTPS
     } else {
         crate::server::TRANSPORT_PROFILE_BINARY

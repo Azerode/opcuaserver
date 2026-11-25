@@ -121,7 +121,10 @@ fn services_over_https() {
     let only = endpoints(&mut c, &[fastua::https::TRANSPORT_PROFILE_HTTPS]);
     assert_eq!(only.len(), 1);
     let tcp = endpoints(&mut c, &[TRANSPORT_PROFILE_BINARY]);
-    assert_eq!(tcp.len(), all.len() - 1);
+    assert_eq!(tcp.len(), all.len() - 2);
+    let json = endpoints(&mut c, &[fastua::https::TRANSPORT_PROFILE_HTTPS_JSON]);
+    assert_eq!(json.len(), 1);
+    assert_eq!(json[0].0, https[0].0);
     assert!(tcp.iter().all(|e| e.1 == TRANSPORT_PROFILE_BINARY));
 
     c.create_session("https").unwrap();
@@ -145,6 +148,110 @@ fn services_over_https() {
     let p = c.publish(&[(p.subscription, p.message.seq)]).unwrap();
     writer.join().unwrap();
     assert_eq!(p.message.data[0].1.value, Some(Variant::Double(9.0)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// https-uajson: the same services with JSON bodies, transcoded around
+/// the binary service layer.
+#[test]
+fn json_encoding() {
+    let (addr, https_addr, cert, dir) = start("json");
+    let mut c = Client::connect_https(&https_addr, "localhost", &cert).unwrap();
+    let call = |c: &mut Client, json: String| -> serde_json::Value {
+        let out = c.call_json(&json).unwrap();
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"))
+    };
+
+    // GetEndpoints, sessionless: the type id may be the DataType or its
+    // binary encoding.
+    let v = call(
+        &mut c,
+        r#"{"TypeId":"i=426","Body":{"RequestHeader":{},"ProfileUris":
+        ["http://opcfoundation.org/UA-Profile/Transport/https-uajson"]}}"#
+            .into(),
+    );
+    assert_eq!(v["TypeId"], "i=429", "{v}"); // GetEndpointsResponse
+    let e = &v["Body"]["Endpoints"];
+    assert_eq!(e.as_array().unwrap().len(), 1, "{v}");
+    assert_eq!(e[0]["EndpointUrl"], format!("opc.https://{https_addr}"));
+    assert_eq!(e[0]["SecurityMode"], 1);
+    assert!(e[0]["ServerCertificate"].as_str().unwrap().len() > 100);
+
+    let v = call(
+        &mut c,
+        format!(
+            r#"{{"TypeId":"i=459","Body":{{"RequestHeader":{{"Timestamp":"2026-01-01T00:00:00Z","RequestHandle":7}},
+        "ClientDescription":{{"ApplicationUri":"urn:json","ApplicationName":{{"Text":"json"}},"ApplicationType":1}},
+        "EndpointUrl":"opc.https://{https_addr}","SessionName":"json","RequestedSessionTimeout":60000,"MaxResponseMessageSize":0}}}}"#
+        ),
+    );
+    assert_eq!(v["TypeId"], "i=462", "{v}"); // CreateSessionResponse
+    let h = &v["Body"]["ResponseHeader"];
+    assert_eq!(h["RequestHandle"], 7);
+    assert!(h.get("ServiceResult").is_none(), "Good is omitted: {v}");
+    let token = v["Body"]["AuthenticationToken"].as_str().unwrap().to_string();
+    assert_eq!(v["Body"]["RevisedSessionTimeout"], 60000.0);
+
+    let v = call(
+        &mut c,
+        format!(
+            r#"{{"TypeId":"i=465","Body":{{"RequestHeader":{{"AuthenticationToken":"{token}"}},
+        "UserIdentityToken":{{"TypeId":"i=319","Body":{{"PolicyId":"anonymous"}}}}}}}}"#
+        ),
+    );
+    assert_eq!(v["TypeId"], "i=468", "{v}"); // ActivateSessionResponse
+
+    // Write then Read the Double, by namespace URI.
+    let v = call(
+        &mut c,
+        format!(
+            r#"{{"TypeId":"i=673","Body":{{"RequestHeader":{{"AuthenticationToken":"{token}"}},
+        "NodesToWrite":[{{"NodeId":"nsu=urn:press;i=1","AttributeId":13,"Value":{{"UaType":11,"Value":2.5}}}}]}}}}"#
+        ),
+    );
+    assert_eq!(v["TypeId"], "i=674", "{v}");
+    let w = v["Body"]["Results"].as_array().unwrap();
+    assert!(w.len() == 1 && w[0].get("Code").is_none_or(|c| c == 0), "{v}");
+    let v = call(
+        &mut c,
+        format!(
+            r#"{{"TypeId":"i=629","Body":{{"RequestHeader":{{"AuthenticationToken":"{token}"}},
+        "TimestampsToReturn":2,"NodesToRead":[{{"NodeId":"nsu=urn:press;i=1","AttributeId":13}},
+        {{"NodeId":"i=2256","AttributeId":13}},{{"NodeId":"i=2255","AttributeId":13}}]}}}}"#
+        ),
+    );
+    assert_eq!(v["TypeId"], "i=632", "{v}"); // ReadResponse
+    let r = &v["Body"]["Results"];
+    // A DataValue carries its Variant's fields inline.
+    assert_eq!((&r[0]["UaType"], &r[0]["Value"]), (&serde_json::json!(11), &serde_json::json!(2.5)), "{v}");
+    assert!(r[0]["ServerTimestamp"].as_str().unwrap().ends_with('Z'), "{v}");
+    // ServerStatus: an ExtensionObject with its JSON body.
+    assert_eq!(r[1]["UaType"], 22, "{v}");
+    assert_eq!(r[1]["Value"]["TypeId"], "i=862", "{v}");
+    assert!(r[1]["Value"]["Body"]["StartTime"].is_string(), "{v}");
+    // NamespaceArray: a String array.
+    let ns = r[2]["Value"].as_array().unwrap();
+    assert_eq!(ns[0], "http://opcfoundation.org/UA/");
+    assert!(ns.iter().any(|n| n == "urn:press"), "{v}");
+
+    // The binary client sees what JSON wrote.
+    let mut b = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
+    b.create_session("tcp").unwrap();
+    assert_eq!(b.read(&[(FORCE, 13)]).unwrap()[0].value, Some(Variant::Double(2.5)));
+
+    // A service error: a ServiceFault in JSON.
+    let v = call(
+        &mut c,
+        r#"{"TypeId":"i=629","Body":{"RequestHeader":{"AuthenticationToken":"i=1"},
+        "NodesToRead":[{"NodeId":"i=2256","AttributeId":13}]}}"#
+            .into(),
+    );
+    assert_eq!(v["TypeId"], "i=395", "{v}"); // ServiceFault
+    assert!(v["Body"]["ResponseHeader"]["ServiceResult"]["Code"].as_u64().unwrap() != 0, "{v}");
+
+    // Not JSON, or an unknown type: 400.
+    let err = c.call_json("{").unwrap_err();
+    assert!(err.to_string().contains("400"), "{err}");
     let _ = std::fs::remove_dir_all(dir);
 }
 

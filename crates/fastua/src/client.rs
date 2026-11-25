@@ -90,8 +90,12 @@ impl rustls::client::danger::ServerCertVerifier for Pinned {
 
 impl Https {
     fn post(&mut self, body: &[u8]) -> io::Result<()> {
+        self.post_as("application/octet-stream", body)
+    }
+
+    fn post_as(&mut self, content_type: &str, body: &[u8]) -> io::Result<()> {
         let head = format!(
-            "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+            "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
             self.host,
             body.len()
         );
@@ -320,6 +324,16 @@ impl Client {
                 cert: client.map(|(c, _)| c.to_vec()),
             })),
         })
+    }
+
+    /// HTTPS only: POSTs a message in the JSON encoding (https-uajson) and
+    /// returns the JSON response body.
+    pub fn call_json(&mut self, json: &str) -> io::Result<String> {
+        let h = self.https.as_mut().ok_or_else(|| invalid("not an HTTPS connection"))?;
+        h.post_as(crate::json::CONTENT_TYPE, json.as_bytes())?;
+        let mut rx = Vec::new();
+        h.read(&mut rx)?;
+        String::from_utf8(rx.split_off(16)).map_err(|_| invalid("response is not UTF-8"))
     }
 
     /// Sends MSG chunks: as they are over opc.tcp, one POST of each body

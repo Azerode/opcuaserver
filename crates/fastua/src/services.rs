@@ -404,9 +404,15 @@ fn get_endpoints(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Write
     r.skip_string_array().map_err(decode_err)?;
     let profiles = r.array(4, |r| r.str()).map_err(decode_err)?;
     begin(w, ids::GET_ENDPOINTS_RESPONSE, h);
-    let tcp = profiles.is_empty() || profiles.contains(&Some(TRANSPORT_PROFILE_BINARY));
-    let https = profiles.is_empty() || profiles.contains(&Some(crate::https::TRANSPORT_PROFILE_HTTPS));
-    ctx.server.write_endpoints(w, tcp, https);
+    let any = profiles.is_empty();
+    ctx.server.write_endpoints(
+        w,
+        [
+            any || profiles.contains(&Some(TRANSPORT_PROFILE_BINARY)),
+            any || profiles.contains(&Some(crate::https::TRANSPORT_PROFILE_HTTPS)),
+            any || profiles.contains(&Some(crate::https::TRANSPORT_PROFILE_HTTPS_JSON)),
+        ],
+    );
     Ok(())
 }
 

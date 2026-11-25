@@ -14,6 +14,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Token renewal and lifetime, sequence checks.
   - A PKI with chain, CRL and ApplicationUri validation.
   - HTTPS transport (`--https-listen`, `opc.https`, https-uabinary): each request is a POST of its binary encoding over TLS (rustls), with the application certificate; sessions, subscriptions and every service work as over opc.tcp (Read round trip +7 µs on loopback). TLS client certificates (`--https-client-certs`, optional by default) are checked against the trust list and bind the session's application certificate.
+  - JSON encoding (https-uajson, Part 6 §5.4 compact form): the same HTTPS endpoint takes `Content-Type: application/json` bodies. They are transcoded to and from UA binary around the service layer from a table of every namespace 0 DataType (`data/types.bin`, generated from the official nodeset), so every service works in JSON and the binary path pays nothing.
   - Cryptography: aws-lc-rs.
 - **Users:** anonymous, user name / password (PBKDF2 hashes) and X.509 certificates, with read or read/write rights per user.
 - **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession / Cancel, Read and Write (with index ranges), Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, Call, HistoryRead, HistoryUpdate.
@@ -50,8 +51,6 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Branches: an alarm active again while its previous occurrence is not acknowledged and confirmed keeps that occurrence as a branch, with its own BranchId and EventId, acknowledged and confirmed on its own and reported by ConditionRefresh.
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
-
-Not yet: the JSON encoding.
 
 ## Build and run
 
