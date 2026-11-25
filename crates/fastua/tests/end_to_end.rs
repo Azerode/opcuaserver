@@ -224,3 +224,47 @@ fn secure_channels_end_to_end() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Every ECC AEAD policy and mode: channel-bound session signatures, read,
+/// write, multi-chunk responses, pipelining and a token renewal (IKM chaining).
+#[test]
+fn ecc_channels_end_to_end() {
+    use fastua::crypto::{Mode, Policy};
+    use fastua::ecc::{Curve, Suite};
+    let dir = temp_config("ecc", MACHINE);
+    let addr = start(&dir, Limits::default());
+    let trusted = dir.join("pki/trusted/certs");
+    std::fs::create_dir_all(&trusted).unwrap();
+    let url = format!("opc.tcp://{addr}");
+    for curve in [Curve::NistP256, Curve::NistP384, Curve::Curve25519] {
+        let (cert, key) = fastua::pki::generate_self_signed_ecc(curve, "urn:fastua:test-client", "localhost").unwrap();
+        std::fs::write(trusted.join(format!("client-{curve:?}.der")), &cert).unwrap();
+        let name = match curve {
+            Curve::NistP256 => "nistP256",
+            Curve::NistP384 => "nistP384",
+            Curve::Curve25519 => "curve25519",
+        };
+        let server_cert = std::fs::read(dir.join(format!("pki/own/certs/fastua_{name}.der"))).unwrap();
+        for suite in Suite::ALL.into_iter().filter(|s| s.curve == curve) {
+            let policy = Policy::Ecc(suite);
+            for mode in [Mode::Sign, Mode::SignAndEncrypt] {
+                let mut c = Client::connect_secure(&addr, &url, policy, mode, &cert, &key, &server_cert)
+                    .unwrap_or_else(|e| panic!("{suite:?} {mode:?}: {e}"));
+                c.create_session("ecc").unwrap_or_else(|e| panic!("{suite:?} {mode:?}: {e}"));
+                let id = NodeId::Numeric(2, 2);
+                assert_eq!(
+                    c.write(&[(id.clone(), Variant::Int32(9))]).unwrap(),
+                    vec![status::GOOD],
+                    "{suite:?} {mode:?}"
+                );
+                assert_eq!(c.read(&[(id.clone(), 13)]).unwrap()[0].value, Some(Variant::Int32(9)));
+                let many = vec![(id.clone(), 13); 3000];
+                assert_eq!(c.read(&many).unwrap().len(), 3000, "multi-chunk {suite:?} {mode:?}");
+                c.open(1).unwrap_or_else(|e| panic!("renew {suite:?} {mode:?}: {e}"));
+                let all = c.read_pipelined(&[(id, 13)], 20).unwrap();
+                assert_eq!(all.len(), 20);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

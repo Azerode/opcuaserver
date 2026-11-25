@@ -305,7 +305,7 @@ events).
 
 ### Endpoints
 
-By default the server offers seven endpoints. Use `--endpoints` to choose a subset (comma-separated):
+By default the server offers nineteen endpoints. Use `--endpoints` to choose a subset (comma-separated):
 
 | Name | SecurityPolicy | Mode |
 |---|---|---|
@@ -313,14 +313,30 @@ By default the server offers seven endpoints. Use `--endpoints` to choose a subs
 | `basic256sha256-sign`, `basic256sha256-encrypt` | Basic256Sha256 | Sign / SignAndEncrypt |
 | `aes128-sign`, `aes128-encrypt` | Aes128_Sha256_RsaOaep | Sign / SignAndEncrypt |
 | `aes256-sign`, `aes256-encrypt` | Aes256_Sha256_RsaPss | Sign / SignAndEncrypt |
+| `ecc-nistp256-aesgcm-sign`, `ecc-nistp256-aesgcm-encrypt` | ECC_nistP256_AesGcm | Sign / SignAndEncrypt |
+| `ecc-nistp256-chachapoly-sign`, `…-encrypt` | ECC_nistP256_ChaChaPoly | Sign / SignAndEncrypt |
+| `ecc-nistp384-aesgcm-sign`, `…-encrypt` | ECC_nistP384_AesGcm | Sign / SignAndEncrypt |
+| `ecc-nistp384-chachapoly-sign`, `…-encrypt` | ECC_nistP384_ChaChaPoly | Sign / SignAndEncrypt |
+| `ecc-curve25519-aesgcm-sign`, `…-encrypt` | ECC_curve25519_AesGcm | Sign / SignAndEncrypt |
+| `ecc-curve25519-chachapoly-sign`, `…-encrypt` | ECC_curve25519_ChaChaPoly | Sign / SignAndEncrypt |
 
 Cryptography is provided by aws-lc-rs: RSA-OAEP, PKCS#1 v1.5 and PSS signatures, AES-CBC, HMAC-SHA256 and P_SHA256. Client keys of 2048 to 4096 bits are accepted.
+
+The ECC policies follow OPC UA 1.05.04 and later with the SecureChannelEnhancements, as implemented by open62541:
+
+- **OpenSecureChannel:** signed (ECDSA with raw r‖s, or Ed25519), not encrypted. The nonces are ephemeral public keys (P-256: 64 bytes x‖y, P-384: 96, X25519: 32). The client certificate must be on the policy's curve.
+- **Keys:** HKDF (SHA-256, SHA-384 for P-384) over the shared secret, with salt = info = length ‖ `opcua-server`/`opcua-client` ‖ sender nonce ‖ receiver nonce. The input keying material is chained across renewals (XOR of the successive secrets).
+- **Messages:** AES-GCM (128-bit for P-256 and curve25519, 256-bit for P-384) or ChaCha20-Poly1305, with a 16-byte tag and no padding. The IV is the derived IV masked with the TokenId and the previous sequence number. Sign mode authenticates the whole chunk. Sequence numbers start at 0 and wrap from 2³²−1 to 0.
+- **Channel binding:** the server signs its first OpenSecureChannel response together with the client's request signature; that signature is the ChannelThumbprint, prepended to the CreateSession and ActivateSession signatures, which cover certificate hashes instead of certificates. The SignatureData algorithm is left empty.
+- **Users:** anonymous and X.509 (a user certificate on the policy's curve). User names would need EccEncryptedSecret, not implemented yet, so ECC endpoints do not offer them.
 
 ### Certificates (`--pki DIR`, default `pki`)
 
 ```
 pki/own/certs/fastua.der        server certificate (created self-signed, RSA 2048, if missing)
 pki/own/private/fastua.pk8      private key (mode 0600)
+pki/own/certs/fastua_<curve>.der, pki/own/private/fastua_<curve>.pk8
+                                ECC certificates and keys (nistP256, nistP384, curve25519), created if missing
 pki/trusted/certs/   pki/trusted/crl/     trusted client certificates / CAs and their CRLs
 pki/issuers/certs/   pki/issuers/crl/     intermediate CAs (not trusted by themselves)
 pki/rejected/certs/                       rejected client certificates, named by thumbprint
@@ -357,11 +373,19 @@ pip install asyncua cryptography
 python3 crates/fastua/tests/interop/asyncua_interop.py target/release/fastua config/machines
 ```
 
+`crates/fastua/tests/interop/open62541_ecc.c` checks the ECC policies against the open62541 client (master, built with `UA_ENABLE_ENCRYPTION=OPENSSL`; CI pins the commit). For each of the six policies and both modes: an anonymous session, reads, a browse and a multi-chunk response. Per policy, an X.509 user on the same curve. Per curve, a token renewal: 15 s of reads on a 10 s token.
+
+```bash
+cc crates/fastua/tests/interop/open62541_ecc.c -lopen62541 -lssl -lcrypto -o open62541_ecc
+crates/fastua/tests/interop/open62541_ecc.sh target/release/fastua config/machines ./open62541_ecc
+```
+
 ## Scope
 
 Implemented: UA TCP (HEL/ACK/ERR, chunking both ways), SecureChannel with
-SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep and
-Aes256_Sha256_RsaPss in Sign and SignAndEncrypt modes (issue/renew, token
+SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep,
+Aes256_Sha256_RsaPss and the six ECC AEAD policies in Sign and SignAndEncrypt
+modes (issue/renew, token
 lifetime, sequence checks), PKI with CRLs, sessions with anonymous, user name
 and X.509 identities, per-user read/write rights, GetEndpoints, FindServers,
 Read (with index ranges on arrays, Strings and ByteStrings), Write (with
@@ -377,5 +401,5 @@ those elements are compared and reported, through the Variant path) and events w
 [Alarms and conditions](#alarms-and-conditions)).
 
 Not yet: the full namespace 0 nodeset, condition branches and shelving, event history,
-history persistence across restarts, aggregates,
-ECC policies.
+history persistence across restarts, user names on ECC endpoints
+(EccEncryptedSecret), the deprecated non-AEAD ECC policies.

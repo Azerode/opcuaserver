@@ -9,6 +9,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  # open62541 master with the ECC AEAD policies and SecureChannelEnhancements.
+  OPEN62541_SHA: 59f556e9920d76e8ecc6567b890003b54561d447
 
 jobs:
   lint:
@@ -52,6 +54,27 @@ jobs:
         run: |
           pip install asyncua cryptography
           python3 crates/fastua/tests/interop/asyncua_interop.py target/release/fastua config/machines
+      - name: Cache open62541
+        id: o6
+        uses: actions/cache@v4
+        with:
+          path: ~/open62541
+          key: open62541-${{ env.OPEN62541_SHA }}-${{ matrix.arch }}
+      - name: Build open62541 (reference ECC client)
+        if: steps.o6.outputs.cache-hit != 'true'
+        run: |
+          git init -q /tmp/o6 && cd /tmp/o6
+          git fetch -q --depth 1 https://github.com/open62541/open62541.git "$OPEN62541_SHA"
+          git checkout -q FETCH_HEAD
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DUA_ENABLE_ENCRYPTION=OPENSSL \
+            -DBUILD_SHARED_LIBS=OFF -DUA_BUILD_EXAMPLES=OFF -DCMAKE_INSTALL_PREFIX=$HOME/open62541 \
+            -DCMAKE_INSTALL_LIBDIR=lib
+          cmake --build build -j"$(nproc)" --target install
+      - name: Interoperability (open62541, ECC policies)
+        run: |
+          cc -O2 crates/fastua/tests/interop/open62541_ecc.c -I$HOME/open62541/include \
+            -L$HOME/open62541/lib -lopen62541 -lssl -lcrypto -lpthread -lm -o open62541_ecc
+          crates/fastua/tests/interop/open62541_ecc.sh target/release/fastua config/machines ./open62541_ecc
       - uses: actions/upload-artifact@v4
         with:
           name: fastua-linux-${{ matrix.arch }}

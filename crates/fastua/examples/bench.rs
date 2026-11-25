@@ -76,7 +76,7 @@ fn main() {
     }
 
     // ---- 1. service layer
-    let session = server.create_session("bench".into(), 1, 60_000.0, Security::NONE, vec![]).unwrap();
+    let session = server.create_session("bench".into(), 1, 60_000.0, Security::NONE, vec![], vec![]).unwrap();
     session.activated.store(true, Ordering::Release);
     for batch in [1usize, 10, 100] {
         let mut req = Vec::new();
@@ -159,16 +159,33 @@ fn main() {
     let trusted = dir.join("pki/trusted/certs");
     std::fs::create_dir_all(&trusted).unwrap();
     std::fs::write(trusted.join("bench-client.der"), &client_cert).unwrap();
-    let server_cert = pki.cert_der.clone();
     let mut combos = vec![(Policy::None, Mode::None)];
-    for p in Policy::SECURE {
+    let ecc = fastua::ecc::Suite::ALL.into_iter().map(Policy::Ecc);
+    for p in Policy::SECURE.into_iter().chain(ecc) {
         combos.push((p, Mode::Sign));
         combos.push((p, Mode::SignAndEncrypt));
     }
+    let mut ecc_clients = Vec::new();
+    for curve in [fastua::ecc::Curve::NistP256, fastua::ecc::Curve::NistP384, fastua::ecc::Curve::Curve25519] {
+        let (cert, key) = fastua::pki::generate_self_signed_ecc(curve, "urn:fastua:test-client", "localhost").unwrap();
+        std::fs::write(trusted.join(format!("bench-client-{curve:?}.der")), &cert).unwrap();
+        ecc_clients.push((curve, cert, key));
+    }
     for (policy, mode) in combos {
-        let name = format!("{policy:?}/{mode:?}");
+        let name = match policy {
+            Policy::Ecc(s) => format!("{}/{mode:?}", s.uri().rsplit_once('#').unwrap().1),
+            _ => format!("{policy:?}/{mode:?}"),
+        };
+        let server_cert = pki.certificate_for(policy).to_vec();
+        let (client_cert, client_key) = match policy.ecc() {
+            Some(s) => {
+                let (_, c, k) = ecc_clients.iter().find(|(c, _, _)| *c == s.curve).unwrap();
+                (c.clone(), k.clone())
+            }
+            None => (client_cert.clone(), client_key.clone()),
+        };
         println!(
-            "secure crypto  {name:<36} {:>6.0} ns/Read (server: verify+decrypt request, sign+encrypt response)",
+            "secure crypto  {name:<42} {:>6.0} ns/Read (server: verify+decrypt request, sign+encrypt response)",
             sym_cost(policy, mode)
         );
         for (label, a, spin) in [("blocking ", &addr, false), ("busy-poll", &spin_addr, true)] {
@@ -189,7 +206,7 @@ fn main() {
             c.spin = spin;
             c.create_session("bench").unwrap();
             let (p50, p99) = round_trips(&mut c, 30_000);
-            println!("secure loopback {name:<35} {label}  p50 {p50:>6.1} us  p99 {p99:>6.1} us");
+            println!("secure loopback {name:<41} {label}  p50 {p50:>6.1} us  p99 {p99:>6.1} us");
         }
     }
 
@@ -505,6 +522,9 @@ fn sym_cost(policy: Policy, mode: Mode) -> f64 {
     if mode == Mode::None {
         return 0.0;
     }
+    if let Policy::Ecc(suite) = policy {
+        return aead_cost(suite, mode);
+    }
     let keys = ChannelKeys::derive(policy, &[7; 32], &[9; 32]).unwrap();
     let (req_len, resp_len) = (128usize, 96usize); // encrypted part: multiples of 16
     let mut req = vec![0x5Au8; 8 + req_len + 32];
@@ -525,6 +545,49 @@ fn sym_cost(policy: Policy, mode: Mode) -> f64 {
                 keys.local.encrypt(&mut resp[8..8 + resp_len + 32]).unwrap();
             }
             black_box(&resp);
+        }
+        best = best.min(t.elapsed().as_nanos() as f64 / n as f64);
+    }
+    best
+}
+
+/// [`sym_cost`] for an ECC AEAD policy: open the request, seal the response.
+fn aead_cost(suite: fastua::ecc::Suite, mode: Mode) -> f64 {
+    let mut ikm = vec![0u8; suite.secret_len()];
+    let secret = vec![3u8; suite.secret_len()];
+    let keys = fastua::ecc::EccKeys::derive(suite, &mut ikm, &secret, &[7; 32], &[9; 32]).unwrap();
+    let (req_len, resp_len) = (128usize, 96usize);
+    let mut req = vec![0x5Au8; 16 + req_len];
+    let mut resp = vec![0xA5u8; 16 + resp_len];
+    // A valid request to open, sealed once by the "client" side.
+    let mut client = vec![0u8; suite.secret_len()];
+    let ck = fastua::ecc::EccKeys::derive(suite, &mut client, &secret, &[7; 32], &[9; 32]).unwrap();
+    let (aad, data) = req.split_at_mut(16);
+    let tag = if mode == Mode::SignAndEncrypt {
+        ck.remote.seal(1, 41, aad, data).unwrap()
+    } else {
+        ck.remote.seal(1, 41, &req, &mut []).unwrap()
+    };
+    let sealed = req.clone();
+    let n = 200_000;
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        let t = Instant::now();
+        for _ in 0..n {
+            req.copy_from_slice(&sealed);
+            if mode == Mode::SignAndEncrypt {
+                let (aad, data) = req.split_at_mut(16);
+                keys.remote.open(1, 41, aad, data, &tag).unwrap();
+            } else {
+                keys.remote.open(1, 41, &req, &mut [], &tag).unwrap();
+            }
+            let t = if mode == Mode::SignAndEncrypt {
+                let (aad, data) = resp.split_at_mut(16);
+                keys.local.seal(1, 42, aad, data).unwrap()
+            } else {
+                keys.local.seal(1, 42, &resp, &mut []).unwrap()
+            };
+            black_box((&req, &resp, t));
         }
         best = best.min(t.elapsed().as_nanos() as f64 / n as f64);
     }

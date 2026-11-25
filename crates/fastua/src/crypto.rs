@@ -3,7 +3,7 @@
 //! Supported policies are the ones the OPC Foundation currently recommends
 //! for RSA: Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss.
 //! Basic128Rsa15 and Basic256 (SHA-1) are deprecated by the specification and
-//! intentionally not offered.
+//! intentionally not offered. The ECC policies are in [`crate::ecc`].
 
 use aws_lc_rs::cipher::{
     DecryptingKey, DecryptionContext, EncryptingKey, EncryptionContext, UnboundCipherKey, AES_128, AES_256,
@@ -36,6 +36,9 @@ pub enum Policy {
     Basic256Sha256,
     Aes128Sha256RsaOaep,
     Aes256Sha256RsaPss,
+    /// ECC_* AEAD policies (ephemeral key agreement, no asymmetric
+    /// encryption).
+    Ecc(crate::ecc::Suite),
 }
 
 /// MessageSecurityMode (Part 4 §7.20).
@@ -77,8 +80,19 @@ impl Policy {
             URI_BASIC256SHA256 => Policy::Basic256Sha256,
             URI_AES128_SHA256_RSAOAEP => Policy::Aes128Sha256RsaOaep,
             URI_AES256_SHA256_RSAPSS => Policy::Aes256Sha256RsaPss,
-            _ => return None,
+            _ => return crate::ecc::Suite::from_uri(uri).map(Policy::Ecc),
         })
+    }
+
+    pub fn is_ecc(self) -> bool {
+        matches!(self, Policy::Ecc(_))
+    }
+
+    pub fn ecc(self) -> Option<crate::ecc::Suite> {
+        match self {
+            Policy::Ecc(s) => Some(s),
+            _ => None,
+        }
     }
 
     pub fn uri(self) -> &'static str {
@@ -87,6 +101,7 @@ impl Policy {
             Policy::Basic256Sha256 => URI_BASIC256SHA256,
             Policy::Aes128Sha256RsaOaep => URI_AES128_SHA256_RSAOAEP,
             Policy::Aes256Sha256RsaPss => URI_AES256_SHA256_RSAPSS,
+            Policy::Ecc(s) => s.uri(),
         }
     }
 
@@ -97,6 +112,7 @@ impl Policy {
             Policy::Basic256Sha256 => 10,
             Policy::Aes128Sha256RsaOaep => 20,
             Policy::Aes256Sha256RsaPss => 30,
+            Policy::Ecc(s) => s.security_level(),
         };
         match mode {
             Mode::None => 0,
@@ -108,6 +124,8 @@ impl Policy {
     pub fn asym_signature_uri(self) -> &'static str {
         match self {
             Policy::Aes256Sha256RsaPss => ALG_RSA_PSS_SHA256,
+            // ECC: the SecurityPolicy URI itself (as the .NET stack does).
+            Policy::Ecc(s) => s.uri(),
             _ => ALG_RSA_SHA256,
         }
     }
@@ -144,6 +162,7 @@ impl Policy {
     pub fn nonce_len(self) -> usize {
         match self {
             Policy::None => 0,
+            Policy::Ecc(s) => s.nonce_len(),
             _ => NONCE_LEN,
         }
     }
