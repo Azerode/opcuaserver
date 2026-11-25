@@ -114,10 +114,10 @@ The numbers below were measured by CI on GitHub runners. Run `cargo run --releas
 | Write → notification p50 / p99, 0.1 ms intervals, `--busy-poll` | 64 / 114 µs | 64 / 113 µs |
 | Server event → EventFieldList (where clause, 6 fields) | ~340 ns | ~490 ns |
 | Write, variable without history | 8.1 ns | 12.7 ns |
-| Write, historized variable | 24 ns | 43 ns |
+| Write, historized variable | 17 ns | 18 ns |
 | HistoryRead raw, 1000 values, per value | 9.7 ns | 15.4 ns |
-| Processed read, Average, 100 values per interval, per value | ci | ci |
-| Processed read, TimeAverage, 100 values per interval, per value | ci | ci |
+| Processed read, Average, 100 values per interval, per value | 4.8 ns | 3.7 ns |
+| Processed read, TimeAverage, 100 values per interval, per value | 8.2 ns | 6.5 ns |
 
 How it gets there:
 
