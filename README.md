@@ -13,11 +13,12 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - A PKI with chain, CRL and ApplicationUri validation.
   - Cryptography: aws-lc-rs.
 - **Users:** anonymous, user name / password (PBKDF2 hashes) and X.509 certificates, with read or read/write rights per user.
-- **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession / Cancel, Read (with index ranges), Write, Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, Call.
+- **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession / Cancel, Read and Write (with index ranges), Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, Call.
 - **Server object:** ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities with OperationLimits from the configured limits, ServerDiagnostics, ServerRedundancy, Auditing, and the GetMonitoredItems and ResendData methods.
 - **Subscriptions:** every Subscription and MonitoredItem service.
   - Create / Modify / Delete, SetPublishingMode, Publish, Republish, TransferSubscriptions.
   - SetMonitoringMode and SetTriggering.
+  - Index ranges: only the selected elements are compared and reported.
   - DataChangeFilter with triggers, an absolute deadband, and a percent deadband on items that declare an EURange (AnalogItemType).
   - Queues with both overflow policies.
   - Keep-alive, lifetime and retransmission handling.
@@ -28,7 +29,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Server events: session audit (create, activate, close, timeout), configuration reloaded (BaseModelChangeEventType) and configuration rejected (SystemEventType).
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: the full namespace 0 nodeset, conditions and alarms, index ranges on MonitoredItems and in writes, history, aggregates, ECC policies, the HTTPS transport (`opc.https`).
+Not yet: the full namespace 0 nodeset, conditions and alarms, history, aggregates, ECC policies, the HTTPS transport (`opc.https`).
 
 ## Build and run
 

@@ -504,7 +504,7 @@ impl Client {
             for it in items {
                 w.node_id(&it.node);
                 w.u32(it.attribute);
-                w.str(None);
+                w.str(it.index_range.as_deref());
                 w.u16(0);
                 w.str(None);
                 w.u32(it.mode);
@@ -588,12 +588,18 @@ impl Client {
     }
 
     pub fn write(&mut self, items: &[(NodeId, Variant)]) -> io::Result<Vec<u32>> {
+        let items: Vec<_> = items.iter().map(|(id, v)| (id.clone(), None, v.clone())).collect();
+        self.write_ranges(&items)
+    }
+
+    /// Write of Value attributes, each with an optional NumericRange.
+    pub fn write_ranges(&mut self, items: &[(NodeId, Option<&str>, Variant)]) -> io::Result<Vec<u32>> {
         let (ty, body) = self.call(ids::WRITE_REQUEST, |w| {
             w.i32(items.len() as i32);
-            for (id, v) in items {
+            for (id, range, v) in items {
                 w.node_id(id);
                 w.u32(13);
-                w.str(None);
+                w.str(*range);
                 w.data_value(&DataValue::value(v.clone()));
             }
         })?;
@@ -705,6 +711,8 @@ pub struct MonitorSpec {
     pub event_select: Option<Vec<String>>,
     /// EventFilter where clause: (operator, operands) elements.
     pub event_where: Vec<(u32, Vec<FilterOperand>)>,
+    /// NumericRange of the monitored value (`None` = whole value).
+    pub index_range: Option<String>,
 }
 
 /// Operand of a where clause element.
@@ -737,6 +745,7 @@ impl MonitorSpec {
             filter: None,
             event_select: None,
             event_where: Vec::new(),
+            index_range: None,
         }
     }
 
