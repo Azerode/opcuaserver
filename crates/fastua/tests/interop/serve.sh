@@ -22,8 +22,8 @@ hash=$(printf s3cret | "$server" hash-password)
 printf '{ "users": [ { "name": "operator", "password": "%s", "write": true }, { "name": "viewer", "password": "%s" } ] }' \
     "$hash" "$hash" >"$work/users.json"
 "$server" --config "$work/config" --pki "$work/pki" --listen "127.0.0.1:$port" \
-    --endpoint "opc.tcp://localhost:$port" --application-uri "urn:fastua:interop:server" \
-    --https-listen "127.0.0.1:$https_port" --https-endpoint "opc.https://localhost:$https_port" \
+    --endpoint "opc.tcp://127.0.0.1:$port" --application-uri "urn:fastua:interop:server" \
+    --https-listen "127.0.0.1:$https_port" --https-endpoint "opc.https://127.0.0.1:$https_port" \
     --users "$work/users.json" --trust-all-clients --event-history 1000 >"$work/server.log" 2>&1 &
 pid=$!
 for _ in $(seq 100); do
@@ -31,7 +31,7 @@ for _ in $(seq 100); do
     sleep 0.1
 done
 status=0
-FASTUA_URL="opc.tcp://localhost:$port" FASTUA_HTTPS_URL="opc.https://localhost:$https_port" FASTUA_WORK="$work" \
+FASTUA_URL="opc.tcp://127.0.0.1:$port" FASTUA_HTTPS_URL="opc.https://127.0.0.1:$https_port" FASTUA_WORK="$work" \
     "$@" || status=$?
 if [ "$status" -ne 0 ]; then
     echo "--- server log (tail)"
