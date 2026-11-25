@@ -92,7 +92,7 @@ The numbers below were measured by CI on GitHub runners. Run `cargo run --releas
 | Server crypto per Read, Sign | ~290 ns | ~280 ns |
 | Server crypto per Read, SignAndEncrypt | ~410 ns | ~410 ns |
 | Round trip p50, SignAndEncrypt, `--busy-poll` | 8.8 µs | 9.7 µs |
-| Subscription sampling pass, unchanged value | 0.9 ns/item | 2.6 ns/item |
+| Subscription sampling pass, unchanged value | pending CI | pending CI |
 | Subscription changed value (sample + queue + encode) | 21 ns/item | 24 ns/item |
 | Write → notification p50 / p99, 1 ms intervals | 0.53 / 1.03 ms | 0.52 / 1.05 ms |
 | Write → notification p50 / p99, 0.1 ms intervals, `--busy-poll` | 64 / 114 µs | 64 / 113 µs |
@@ -108,8 +108,9 @@ How it gets there:
   - One coarse clock read per request.
 - **Security:** HMAC-SHA256 uses states precomputed per channel key and hardware SHA instructions.
 - **Subscriptions:** sampling and publishing are driven by the connection thread, which waits for the next deadline with `ppoll`.
-  - An unchanged value costs one load.
-  - Samples go into fixed 32-byte entries, encoded straight from the value cell.
+  - Value cells share a change stamp per block of 64: a write stores a value unique to (cell, write) into it, and a sampling pass skips a block of unchanged values with one load.
+  - Samples go into fixed 32-byte entries, encoded straight from the value cell into the response.
+  - The NotificationMessage is kept for Republish without a copy: the sent response buffer itself is kept and swapped for a recycled one (a copy only with SignAndEncrypt, which encrypts in place).
   - Buffers are recycled, so the steady state allocates nothing (`tests/no_alloc.rs`).
   - A notification leaves at the end of the publishing interval, as the specification requires, so the publishing interval sets the latency.
 - **Events:** event items pull from a shared ring only when their subscription is serviced. Subscriptions without event items never look at it, and raising an event costs one atomic load while nobody subscribes.

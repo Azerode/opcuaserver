@@ -543,6 +543,51 @@ struct Group {
     interval_ns: u64,
     next: u64,
     items: Vec<Hot>,
+    /// `items` sorted by change stamp, cut into runs of one stamp each.
+    blocks: Vec<Block>,
+    /// `items[always..]` have no cell: sampled on every pass.
+    always: usize,
+    /// `items` changed since `blocks` was built.
+    stale: bool,
+}
+
+/// Items of a group whose cells share one change stamp.
+struct Block {
+    stamp: &'static std::sync::atomic::AtomicU32,
+    /// Stamp seen at the last pass; `u64::MAX` = scan unconditionally.
+    seen: u64,
+    start: u32,
+    end: u32,
+}
+
+impl Group {
+    fn new(interval_ns: u64, next: u64, items: Vec<Hot>) -> Group {
+        Group { interval_ns, next, items, blocks: Vec::new(), always: 0, stale: true }
+    }
+
+    /// Sorts the items by stamp and rebuilds the block runs (after items
+    /// were added, moved or rebound; never in the steady state).
+    #[cold]
+    fn reindex(&mut self) {
+        let key = |h: &Hot| h.cell.as_ref().map_or(usize::MAX, |c| c.stamp() as *const _ as usize);
+        self.items.sort_unstable_by_key(key);
+        self.blocks.clear();
+        self.always = self.items.len();
+        let mut i = 0;
+        while i < self.items.len() {
+            let Some(c) = &self.items[i].cell else {
+                self.always = i;
+                break;
+            };
+            let stamp = c.stamp();
+            let start = i;
+            while i < self.items.len() && self.items[i].cell.as_ref().is_some_and(|c| std::ptr::eq(c.stamp(), stamp)) {
+                i += 1;
+            }
+            self.blocks.push(Block { stamp, seen: u64::MAX, start: start as u32, end: i as u32 });
+        }
+        self.stale = false;
+    }
 }
 
 /// What a sampling pass touches for one item: 16 contiguous bytes, so a pass
@@ -623,7 +668,7 @@ pub struct Subscription {
     links: usize,
     /// Event monitored items (EventNotifier attribute + EventFilter).
     events: Vec<EventItem>,
-    retransmit: VecDeque<(u32, Vec<u8>)>,
+    retransmit: VecDeque<Sent>,
     pool: Vec<Vec<u8>>,
     generation: u64,
 }
@@ -760,7 +805,7 @@ impl Subscription {
     }
 
     pub fn available(&self) -> impl Iterator<Item = u32> + '_ {
-        self.retransmit.iter().map(|(s, _)| *s)
+        self.retransmit.iter().map(|m| m.seq)
     }
 
     fn slot(&self, id: u32) -> Option<u32> {
@@ -781,10 +826,10 @@ impl Subscription {
         // is taken in the same tick, so a change waits at most one interval.
         let next = if ns > 0 && self.next_publish > now { now + (self.next_publish - now) % ns } else { now + ns };
         if let Some(i) = self.groups.iter().position(|g| g.items.is_empty()) {
-            self.groups[i] = Group { interval_ns: ns, next, items: std::mem::take(&mut self.groups[i].items) };
+            self.groups[i] = Group::new(ns, next, std::mem::take(&mut self.groups[i].items));
             return i;
         }
-        self.groups.push(Group { interval_ns: ns, next, items: Vec::new() });
+        self.groups.push(Group::new(ns, next, Vec::new()));
         self.groups.len() - 1
     }
 
@@ -906,6 +951,7 @@ impl Subscription {
         self.by_id.insert(id, slot);
         let hot = Hot::new(slot, &self.items[slot as usize].as_ref().unwrap().source);
         self.groups[group].items.push(hot);
+        self.groups[group].stale = true;
         self.generation = space.generation;
         // The initial value is sampled right away (Part 4 §5.12.1.2).
         if mode != MODE_DISABLED {
@@ -935,6 +981,8 @@ impl Subscription {
             if let Some(i) = g.iter().position(|h| h.slot == slot) {
                 let hot = g.swap_remove(i);
                 self.groups[new_group].items.push(hot);
+                self.groups[old_group].stale = true;
+                self.groups[new_group].stale = true;
             }
         }
         let it = self.items[slot as usize].as_mut().unwrap();
@@ -964,9 +1012,10 @@ impl Subscription {
             return Ok(());
         };
         let it = self.items[slot as usize].take().unwrap();
-        let g = &mut self.groups[it.group].items;
-        if let Some(i) = g.iter().position(|h| h.slot == slot) {
-            g.swap_remove(i);
+        let g = &mut self.groups[it.group];
+        if let Some(i) = g.items.iter().position(|h| h.slot == slot) {
+            g.items.swap_remove(i);
+            g.stale = true;
         }
         if it.dirty {
             self.dirty.retain(|&s| s != slot);
@@ -1119,6 +1168,7 @@ impl Subscription {
             for h in &mut g.items {
                 *h = Hot::new(h.slot, &self.items[h.slot as usize].as_ref().unwrap().source);
             }
+            g.stale = true;
         }
     }
 
@@ -1141,19 +1191,34 @@ impl Subscription {
                 // Fell behind (or the thread was descheduled): no catch-up burst.
                 grp.next = now + grp.interval_ns;
             }
+            if self.groups[g].stale {
+                self.groups[g].reindex();
+            }
             // Indexing (not iterating) keeps the borrow checker happy while
             // `sample_slot` updates the dirty list.
-            for i in 0..self.groups[g].items.len() {
-                let h = &mut self.groups[g].items[i];
-                if let Some(c) = &h.cell {
-                    // Unchanged since the last pass: one load, nothing else.
-                    let v = c.version();
+            for b in 0..self.groups[g].blocks.len() {
+                let blk = &mut self.groups[g].blocks[b];
+                // A block of unchanged cells: one load for up to 64 items.
+                let stamp = blk.stamp.load(std::sync::atomic::Ordering::Acquire) as u64;
+                if stamp == blk.seen {
+                    continue;
+                }
+                blk.seen = stamp;
+                let (start, end) = (blk.start as usize, blk.end as usize);
+                for i in start..end {
+                    let h = &mut self.groups[g].items[i];
+                    // Ordered by the stamp load above.
+                    let v = h.cell.as_ref().unwrap().version_relaxed();
                     if v == h.seen {
                         continue;
                     }
                     h.seen = v;
+                    let slot = h.slot;
+                    self.sample_slot(slot, Some(space));
                 }
-                let slot = h.slot;
+            }
+            for i in self.groups[g].always..self.groups[g].items.len() {
+                let slot = self.groups[g].items[i].slot;
                 self.sample_slot(slot, Some(space));
             }
         }
@@ -1199,11 +1264,9 @@ impl Subscription {
         true
     }
 
-    /// Encodes the next NotificationMessage into `out` (cleared first).
-    /// Returns (notifications written, more queued).
-    fn build_message(&mut self, now_ticks: i64, max_bytes: usize, out: &mut Vec<u8>) -> (u32, bool) {
-        out.clear();
-        let mut w = Writer::new(out);
+    /// Encodes the next NotificationMessage at the end of `w`, stopping
+    /// once `w` reaches `limit` bytes. Returns (notifications, more queued).
+    fn build_message(&mut self, now_ticks: i64, limit: usize, w: &mut Writer) -> (u32, bool) {
         w.u32(self.seq);
         w.i64(now_ticks);
         let parts_at = w.len();
@@ -1225,12 +1288,12 @@ impl Subscription {
                     continue;
                 };
                 while let Some(&e) = it.queue.front() {
-                    if n >= max || w.len() >= max_bytes {
+                    if n >= max || w.len() >= limit {
                         full = true;
                         break;
                     }
                     let var = if e.tag == TAG_VAR { it.queue.front_var() } else { None };
-                    it.write_entry(&mut w, &e, var);
+                    it.write_entry(w, &e, var);
                     it.queue.pop_front();
                     n += 1;
                 }
@@ -1245,9 +1308,9 @@ impl Subscription {
             w.i32(0); // diagnosticInfos
             w.end_extension_object(at);
         }
-        if !self.events.is_empty() && n < max && w.len() < max_bytes && self.events_ready() {
+        if !self.events.is_empty() && n < max && w.len() < limit && self.events_ready() {
             parts += 1;
-            n += self.write_events(&mut w, max - n, max_bytes);
+            n += self.write_events(w, max - n, limit);
         }
         if parts != 1 {
             w.patch_u32(parts_at, parts);
@@ -1273,19 +1336,26 @@ impl Subscription {
         n
     }
 
-    fn take_buffer(&mut self, max_retransmit: usize) -> Vec<u8> {
-        if self.retransmit.len() >= max_retransmit.max(1) {
-            // The oldest unacknowledged message is no longer available.
-            return self.retransmit.pop_front().unwrap().1;
-        }
-        self.pool.pop().unwrap_or_default()
+    /// Keeps a sent message for Republish: copied out of `buf`, or, with
+    /// `take`, `buf` itself is kept and replaced by a recycled buffer (no copy).
+    fn keep(&mut self, seq: u32, buf: &mut Vec<u8>, start: usize, end: usize, take: bool) {
+        let mut spare = self.pool.pop().unwrap_or_default();
+        spare.clear();
+        let (start, end) = if take {
+            std::mem::swap(buf, &mut spare);
+            (start, end)
+        } else {
+            spare.extend_from_slice(&buf[start..end]);
+            (0, end - start)
+        };
+        self.retransmit.push_back(Sent { seq, buf: spare, start: start as u32, end: end as u32 });
     }
 
     pub fn acknowledge(&mut self, seq: u32) -> u32 {
-        match self.retransmit.iter().position(|(s, _)| *s == seq) {
+        match self.retransmit.iter().position(|m| m.seq == seq) {
             Some(i) => {
-                let (_, buf) = self.retransmit.remove(i).unwrap();
-                self.pool.push(buf);
+                let m = self.retransmit.remove(i).unwrap();
+                self.pool.push(m.buf);
                 status::GOOD
             }
             None => BAD_SEQUENCE_NUMBER_UNKNOWN,
@@ -1293,7 +1363,7 @@ impl Subscription {
     }
 
     pub fn republish(&self, seq: u32) -> Option<&[u8]> {
-        self.retransmit.iter().find(|(s, _)| *s == seq).map(|(_, b)| &b[..])
+        self.retransmit.iter().find(|m| m.seq == seq).map(|m| &m.buf[m.start as usize..m.end as usize])
     }
 
     /// After TransferSubscriptions with sendInitialValues.
@@ -1306,6 +1376,7 @@ impl Subscription {
             for h in &mut g.items {
                 h.seen = 1;
             }
+            g.stale = true;
         }
     }
 
@@ -1317,6 +1388,24 @@ impl Subscription {
 }
 
 // ---------------------------------------------------------------- per session
+
+/// A NotificationMessage kept for Republish: `buf[start..end]`. `buf` may
+/// be the whole response it was sent in (see [`SessionSubs::keep_sent`]).
+struct Sent {
+    seq: u32,
+    buf: Vec<u8>,
+    start: u32,
+    end: u32,
+}
+
+/// A message `write_next` encoded straight into the response, to be kept
+/// for Republish once the response is sent.
+struct Unkept {
+    sub_id: u32,
+    seq: u32,
+    start: usize,
+    end: usize,
+}
 
 pub struct PublishRequest {
     pub request_id: u32,
@@ -1345,6 +1434,7 @@ pub struct SessionSubs {
     requests: VecDeque<PublishRequest>,
     status_msgs: VecDeque<StatusMsg>,
     ack_pool: Vec<Vec<u32>>,
+    unkept: Option<Unkept>,
 }
 
 /// What [`SessionSubs::write_next`] produced.
@@ -1466,6 +1556,10 @@ impl SessionSubs {
     /// Answers one queued Publish request if anything is ready: a timeout,
     /// a status change, or a subscription with a pending message. Writes the
     /// whole response body (type id onwards) into `w`.
+    ///
+    /// With `keep_later`, a NotificationMessage is not copied for Republish
+    /// here: the caller sends the response, then hands its buffer to
+    /// [`SessionSubs::keep_sent`].
     pub fn write_next(
         &mut self,
         l: &Limits,
@@ -1473,7 +1567,10 @@ impl SessionSubs {
         channel_id: u32,
         max_bytes: usize,
         w: &mut Writer,
+        keep_later: bool,
     ) -> Option<Ready> {
+        // A message nobody kept (the caller did not send it) is dropped.
+        self.unkept = None;
         // Requests from a channel the session left can no longer be answered.
         while self.requests.front().is_some_and(|r| r.channel_id != channel_id) {
             let r = self.requests.pop_front().unwrap();
@@ -1522,23 +1619,36 @@ impl SessionSubs {
         crate::services::begin_raw(w, ids::PUBLISH_RESPONSE, ticks, r.handle);
         w.u32(s.id);
         if s.publishing_enabled && s.has_notifications() {
-            let mut buf = s.take_buffer(l.max_retransmission_queue);
-            let (_, more) = s.build_message(ticks, max_bytes, &mut buf);
-            let seq = s.seq;
-            s.seq = next_seq(seq);
-            s.retransmit.push_back((seq, buf));
-            w.i32(s.retransmit.len() as i32);
-            for (q, _) in &s.retransmit {
-                w.u32(*q);
+            if s.retransmit.len() >= l.max_retransmission_queue.max(1) {
+                // The oldest unacknowledged message is no longer available.
+                let m = s.retransmit.pop_front().unwrap();
+                s.pool.push(m.buf);
             }
-            w.bool(more);
-            w.raw(&s.retransmit.back().unwrap().1);
+            let seq = s.seq;
+            w.i32(s.retransmit.len() as i32 + 1);
+            for m in &s.retransmit {
+                w.u32(m.seq);
+            }
+            w.u32(seq);
+            let more_at = w.len();
+            w.bool(false);
+            // Encoded in place: no copy into the response.
+            let start = w.len();
+            let (_, more) = s.build_message(ticks, start + max_bytes, w);
+            let end = w.len();
+            w.buf[more_at] = more as u8;
+            s.seq = next_seq(seq);
             s.pending = more;
+            if keep_later {
+                self.unkept = Some(Unkept { sub_id: s.id, seq, start, end });
+            } else {
+                s.keep(seq, w.buf, start, end, false);
+            }
         } else {
             // Keep-alive: the next sequence number, no notifications.
             w.i32(s.retransmit.len() as i32);
-            for (q, _) in &s.retransmit {
-                w.u32(*q);
+            for m in &s.retransmit {
+                w.u32(m.seq);
             }
             w.bool(false);
             w.u32(s.seq);
@@ -1551,6 +1661,22 @@ impl SessionSubs {
         s.message_sent = true;
         write_acks(w, &r.acks);
         Some(self.done(r))
+    }
+
+    /// Keeps the NotificationMessage of the response in `buf`, sent by the
+    /// last `write_next(.., keep_later = true)`. With `take`, `buf` itself
+    /// is kept and replaced by a recycled buffer; otherwise (the response was
+    /// encrypted in place) the message is copied out first, before sending.
+    /// Returns whether there was a message to keep.
+    pub fn keep_sent(&mut self, buf: &mut Vec<u8>, take: bool) -> bool {
+        let Some(u) = self.unkept.take() else { return false };
+        match self.subs.iter_mut().find(|s| s.id == u.sub_id) {
+            Some(s) => {
+                s.keep(u.seq, buf, u.start, u.end, take);
+                true
+            }
+            None => false,
+        }
     }
 
     fn done(&mut self, r: PublishRequest) -> Ready {

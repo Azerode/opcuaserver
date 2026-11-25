@@ -266,11 +266,20 @@ impl<'a> Connection<'a> {
             loop {
                 tx.clear();
                 tx.resize(MSG_HEADER_LEN, 0);
-                let ready = st.write_next(limits, now, ch_id, max, &mut Writer::new(&mut tx));
+                let ready = st.write_next(limits, now, ch_id, max, &mut Writer::new(&mut tx), true);
                 let Some(ready) = ready else { break };
+                // The NotificationMessage stays in `tx` for Republish unless
+                // sending changes `tx` (encryption in place, a fault instead).
+                let intact = self.sent_intact(&tx);
+                if !intact {
+                    st.keep_sent(&mut tx, false);
+                }
                 if let Err(e) = self.send_response(ready.request_id, &mut tx, ready.handle) {
                     result = Err(e);
                     return true;
+                }
+                if intact {
+                    st.keep_sent(&mut tx, true);
                 }
             }
             deadline = deadline.min(st.next_deadline());
@@ -783,9 +792,7 @@ impl<'a> Connection<'a> {
         };
         let body_len = tx.len() - MSG_HEADER_LEN;
         let chunks = body_len.div_ceil(max_body).max(1);
-        let too_big = (self.client_max_message != 0 && body_len > self.client_max_message as usize)
-            || (self.client_max_chunks != 0 && chunks > self.client_max_chunks as usize);
-        if too_big {
+        if self.too_big(body_len, chunks) {
             tx.truncate(MSG_HEADER_LEN);
             let mut w = Writer::new(tx);
             services::write_fault(&mut w, handle, status::BAD_RESPONSE_TOO_LARGE);
@@ -813,6 +820,25 @@ impl<'a> Connection<'a> {
         self.out = out;
         r?;
         Ok(())
+    }
+
+    fn too_big(&self, body_len: usize, chunks: usize) -> bool {
+        (self.client_max_message != 0 && body_len > self.client_max_message as usize)
+            || (self.client_max_chunks != 0 && chunks > self.client_max_chunks as usize)
+    }
+
+    /// `send_response(tx)` leaves the body of `tx` as it is: no encryption in
+    /// place and no BadResponseTooLarge fault instead of it.
+    fn sent_intact(&self, tx: &[u8]) -> bool {
+        match self.channel.as_ref().map(|c| c.security.mode).unwrap_or(Mode::None) {
+            Mode::SignAndEncrypt => false,
+            mode => {
+                let sig = if mode == Mode::Sign { SYM_SIGNATURE_LEN } else { 0 };
+                let max_body = self.send_buffer as usize - MSG_HEADER_LEN - sig;
+                let body_len = tx.len() - MSG_HEADER_LEN;
+                !self.too_big(body_len, body_len.div_ceil(max_body).max(1))
+            }
+        }
     }
 
     /// `buf[start..]` holds a reserved 24-byte header followed by the chunk

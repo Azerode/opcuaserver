@@ -818,6 +818,8 @@ pub fn build(
     let analog_type = b.idx(ids::ANALOG_ITEM_TYPE);
     let property_type = b.idx(ids::PROPERTY_TYPE);
     let created = now_ticks();
+    let mut fresh = 0usize;
+    let mut stamp = None;
 
     for (c, &ns) in configs.iter().zip(&assigned) {
         let folder_id = |path: &str| NodeId::String(ns, format!("__folder/{path}").into());
@@ -841,11 +843,18 @@ pub fn build(
 
             for it in &g.items {
                 let id = it.node_id.clone().with_namespace(ns);
-                let cell = previous
-                    .and_then(|p| p.cell(&id))
-                    .filter(|c| c.kind() == it.data_type)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(ValueCell::new(it.data_type, created)));
+                let cell =
+                    previous.and_then(|p| p.cell(&id)).filter(|c| c.kind() == it.data_type).cloned().unwrap_or_else(
+                        || {
+                            // New cells share change stamps in blocks of 64.
+                            let lane = (fresh % crate::value::BLOCK) as u32;
+                            if lane == 0 {
+                                stamp = Some(crate::value::new_stamp());
+                            }
+                            fresh += 1;
+                            Arc::new(ValueCell::with_stamp(it.data_type, created, stamp.unwrap(), lane))
+                        },
+                    );
                 let access = if it.writable { ACCESS_READ | ACCESS_WRITE } else { ACCESS_READ };
                 let var = b
                     .add(Node {

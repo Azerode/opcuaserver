@@ -246,9 +246,10 @@ fn subscription_engine(store: &Store) {
     let mut out = Vec::with_capacity(1 << 20);
     let mut now = 0u64;
     let mut seq = None;
-    let mut cycle = |st: &mut SessionSubs, change: bool, round: u64| -> u64 {
-        if change {
-            for c in &cells {
+    // `every`: write one value in `every` (0 = none).
+    let mut cycle = |st: &mut SessionSubs, every: usize, round: u64| -> u64 {
+        if every > 0 {
+            for c in cells.iter().skip(round as usize % every).step_by(every) {
                 c.write(&Variant::Double(round as f64), status::GOOD, 1, 2);
             }
         }
@@ -261,20 +262,21 @@ fn subscription_engine(store: &Store) {
         let t = Instant::now();
         st.tick(now, &space);
         out.clear();
-        st.write_next(&l, now, 1, 64 << 20, &mut Writer::new(&mut out));
+        st.write_next(&l, now, 1, 64 << 20, &mut Writer::new(&mut out), true);
+        // Kept for Republish as the connection thread does after sending.
+        let kept = st.keep_sent(&mut out, true);
         let ns = t.elapsed().as_nanos() as u64;
-        if out.is_empty() {
-            return ns; // nothing to publish: a sampling pass only
+        if kept {
+            seq = Some(st.subs[0].sequence().wrapping_sub(1));
         }
-        let k = u32::from_le_bytes(out[36..40].try_into().unwrap()) as usize;
-        let at = 40 + 4 * k + 1;
-        seq = Some(u32::from_le_bytes(out[at..at + 4].try_into().unwrap()));
         ns
     };
-    for (label, change) in [("unchanged values (sampling pass)", false), ("changed values (notification)", true)] {
+    for (label, every) in
+        [("unchanged values (sampling pass)", 0), ("1 % changed (per item)", 100), ("changed values (notification)", 1)]
+    {
         let mut best = u64::MAX;
         for round in 0..200 {
-            best = best.min(cycle(&mut st, change, round + 1));
+            best = best.min(cycle(&mut st, every, round + 1));
         }
         println!("subscription   {label:<34} {:>6.2} ns/item", best as f64 / n as f64);
     }
@@ -341,9 +343,10 @@ fn event_engine(store: &Store) {
         now += 1_000_000;
         st.tick(now, &space);
         out.clear();
-        st.write_next(&l, now, 1, 64 << 20, &mut Writer::new(&mut out));
-        best = best.min(t.elapsed().as_nanos() as u64);
+        st.write_next(&l, now, 1, 64 << 20, &mut Writer::new(&mut out), true);
         assert!(out.len() > n * 50);
+        st.keep_sent(&mut out, true);
+        best = best.min(t.elapsed().as_nanos() as u64);
         let seq = st.subs[0].sequence().wrapping_sub(1);
         st.acknowledge(1, seq);
     }
