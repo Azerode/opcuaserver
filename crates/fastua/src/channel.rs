@@ -13,7 +13,7 @@ use crate::pki::CertInfo;
 use crate::server::{random_bytes, Server, Session};
 use crate::services;
 use crate::types::*;
-use std::io::{self, Read, Write};
+use std::io;
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Instant;
@@ -81,6 +81,7 @@ pub struct Connection<'a> {
     in_end: usize,
     /// Busy-poll period before sleeping in `recv` (zero = off).
     spin: std::time::Duration,
+    io: crate::net::Transport,
     rx: Vec<u8>,
     tx: Vec<u8>,
     out: Vec<u8>,
@@ -135,6 +136,7 @@ pub fn run(server: &Arc<Server>, stream: TcpStream) -> io::Result<()> {
         in_start: 0,
         in_end: 0,
         spin: server.config.busy_poll,
+        io: crate::net::Transport::default(),
         rx: Vec::with_capacity(limits.buffer_size as usize),
         tx: Vec::with_capacity(limits.buffer_size as usize + 64),
         out: Vec::new(),
@@ -166,7 +168,7 @@ impl<'a> Connection<'a> {
             self.in_end -= self.in_start;
             self.in_start = 0;
         }
-        let n = crate::net::recv(&mut self.stream, &mut self.inbuf[self.in_end..], self.spin)?;
+        let n = self.io.recv(&mut self.stream, &mut self.inbuf[self.in_end..], self.spin)?;
         if n == 0 {
             return Err(Fatal::Io(io::ErrorKind::UnexpectedEof.into()));
         }
@@ -196,7 +198,7 @@ impl<'a> Connection<'a> {
         if have < body {
             // The rest of a large chunk goes straight into `rx`.
             self.rx.resize(body, 0);
-            self.stream.read_exact(&mut self.rx[have..])?;
+            self.io.recv_exact(&mut self.stream, &mut self.rx[have..], self.spin)?;
         }
         let h = self.hdr;
         Ok(([h[0], h[1], h[2]], h[3]))
@@ -210,6 +212,8 @@ impl<'a> Connection<'a> {
         }
         self.hello()?;
         self.stream.set_read_timeout(None)?;
+        // After HEL (which keeps the plain socket and its timeout).
+        self.io.upgrade(self.server, &self.stream);
 
         loop {
             let (ty, chunk) = self.read_chunk(self.recv_buffer)?;
@@ -255,7 +259,7 @@ impl<'a> Connection<'a> {
         w.u32(self.send_buffer);
         w.u32(limits.max_message_size);
         w.u32(limits.max_chunk_count);
-        self.stream.write_all(&self.tx)?;
+        self.io.send_all(&mut self.stream, &self.tx, self.spin)?;
         Ok(())
     }
 
@@ -268,7 +272,7 @@ impl<'a> Connection<'a> {
         w.string(reason);
         let len = w.len() as u32;
         w.patch_u32(4, len);
-        self.stream.write_all(&buf)
+        self.io.send_all(&mut self.stream, &buf, self.spin)
     }
 
     fn check_sequence(&mut self, seq: u32) -> Result<(), Fatal> {
@@ -512,7 +516,7 @@ impl<'a> Connection<'a> {
         if self.tx.len() > self.send_buffer as usize {
             return Err(Fatal::Protocol(status::BAD_TCP_MESSAGE_TOO_LARGE, "OPN response larger than client buffer"));
         }
-        self.stream.write_all(&self.tx)?;
+        self.io.send_all(&mut self.stream, &self.tx, self.spin)?;
         Ok(())
     }
 
@@ -670,7 +674,7 @@ impl<'a> Connection<'a> {
         if chunks == 1 {
             let seq = self.next_sequence();
             self.finish_chunk(tx, 0, b'F', seq, request_id, mode)?;
-            self.stream.write_all(tx)?;
+            self.io.send_all(&mut self.stream, tx, self.spin)?;
             return Ok(());
         }
         let mut out = std::mem::take(&mut self.out);
@@ -684,7 +688,7 @@ impl<'a> Connection<'a> {
             out.extend_from_slice(part);
             self.finish_chunk(&mut out, at, kind, seq, request_id, mode)?;
         }
-        let r = self.stream.write_all(&out);
+        let r = self.io.send_all(&mut self.stream, &out, self.spin);
         self.out = out;
         r?;
         Ok(())

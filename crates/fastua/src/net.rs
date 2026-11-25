@@ -72,3 +72,55 @@ pub fn set_kernel_busy_poll(stream: &TcpStream, spin: Duration) {
         );
     }
 }
+
+/// Socket I/O of one connection: plain blocking calls, or the io_uring
+/// transport once [`Transport::upgrade`] succeeded.
+#[derive(Default)]
+pub struct Transport {
+    #[cfg(target_os = "linux")]
+    uring: Option<crate::uring::Conn>,
+}
+
+impl Transport {
+    /// Switches to io_uring when the server has it; keeps plain sockets on any error.
+    pub fn upgrade(&mut self, server: &crate::server::Server, stream: &TcpStream) {
+        #[cfg(target_os = "linux")]
+        if let Some(shared) = server.uring() {
+            match crate::uring::Conn::new(shared, stream.as_raw_fd()) {
+                Ok(c) => self.uring = Some(c),
+                Err(e) => crate::log!("io_uring ring setup failed ({e}): plain sockets for this connection"),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (server, stream);
+    }
+
+    #[inline]
+    pub fn recv(&mut self, stream: &mut TcpStream, buf: &mut [u8], spin: Duration) -> io::Result<usize> {
+        #[cfg(target_os = "linux")]
+        if let Some(u) = &mut self.uring {
+            return u.recv(buf, spin);
+        }
+        recv(stream, buf, spin)
+    }
+
+    pub fn recv_exact(&mut self, stream: &mut TcpStream, mut buf: &mut [u8], spin: Duration) -> io::Result<()> {
+        while !buf.is_empty() {
+            match self.recv(stream, buf, spin)? {
+                0 => return Err(io::ErrorKind::UnexpectedEof.into()),
+                n => buf = &mut buf[n..],
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn send_all(&mut self, stream: &mut TcpStream, buf: &[u8], spin: Duration) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Some(u) = &mut self.uring {
+            return u.send_all(buf, spin);
+        }
+        let _ = spin;
+        std::io::Write::write_all(stream, buf)
+    }
+}

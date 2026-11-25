@@ -12,6 +12,8 @@ pub mod reload;
 pub mod server;
 pub mod services;
 pub mod types;
+#[cfg(target_os = "linux")]
+pub mod uring;
 pub mod users;
 pub mod value;
 

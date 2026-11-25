@@ -56,6 +56,16 @@ fn main() {
         c.busy_poll = std::time::Duration::from_micros(200);
         c
     };
+    let uring_config = {
+        let mut c = config.clone();
+        c.io_uring = true;
+        c
+    };
+    let uring_spin_config = {
+        let mut c = spin_config.clone();
+        c.io_uring = true;
+        c
+    };
     let server = Server::new(store.clone(), config, pki.clone(), Users::default());
 
     // ---- 0. clock costs (one precise read per request is unavoidable)
@@ -141,12 +151,29 @@ fn main() {
     let spin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let spin_addr = spin_listener.local_addr().unwrap().to_string();
     {
-        let server = Server::new(store, spin_config, pki, Users::default());
+        let server = Server::new(store.clone(), spin_config, pki.clone(), Users::default());
         std::thread::spawn(move || server.serve(spin_listener));
     }
-    loopback("server blocking, client blocking ", &addr, false);
-    loopback("server busy-poll, client blocking", &spin_addr, false);
-    loopback("server busy-poll, client busy-poll", &spin_addr, true);
+    let start = |config: ServerConfig| {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = l.local_addr().unwrap().to_string();
+        let server = Server::new(store.clone(), config, pki.clone(), Users::default());
+        let on = server.uses_io_uring();
+        std::thread::spawn(move || server.serve(l));
+        (a, on)
+    };
+    let (uring_addr, uring_on) = start(uring_config);
+    let (uring_spin_addr, _) = start(uring_spin_config);
+    loopback("server blocking,           client blocking ", &addr, false);
+    loopback("server busy-poll,          client blocking ", &spin_addr, false);
+    loopback("server busy-poll,          client busy-poll", &spin_addr, true);
+    if uring_on {
+        loopback("server io_uring,           client blocking ", &uring_addr, false);
+        loopback("server io_uring+busy-poll, client blocking ", &uring_spin_addr, false);
+        loopback("server io_uring+busy-poll, client busy-poll", &uring_spin_addr, true);
+    } else {
+        println!("loopback TCP   io_uring unavailable on this machine (fallback to plain sockets)");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

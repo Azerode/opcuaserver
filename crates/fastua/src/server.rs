@@ -72,6 +72,9 @@ pub struct ServerConfig {
     /// never). Removes the wake-up latency at the cost of a busy core per
     /// connection while its client is idle.
     pub busy_poll: Duration,
+    /// Use the io_uring transport with a shared kernel submission-polling
+    /// thread (Linux). Falls back to plain sockets when unavailable.
+    pub io_uring: bool,
 }
 
 impl ServerConfig {
@@ -90,6 +93,7 @@ impl ServerConfig {
             anonymous: Some(Access::ReadOnly),
             x509_users: Access::ReadWrite,
             busy_poll: Duration::ZERO,
+            io_uring: false,
         }
     }
 }
@@ -144,6 +148,9 @@ pub struct Server {
     endpoints_encoded: Vec<u8>,
     /// FindServers answer, encoded once (array of one ApplicationDescription).
     application_encoded: Vec<u8>,
+    /// Shared io_uring polling thread, when enabled and supported.
+    #[cfg(target_os = "linux")]
+    uring: Option<crate::uring::Shared>,
 }
 
 /// Cryptographically secure random bytes from the OS.
@@ -219,6 +226,22 @@ impl Server {
             w.i32(1);
             write_application_description(&mut w, &info, &config.endpoint_url);
         }
+        #[cfg(target_os = "linux")]
+        let uring = if config.io_uring {
+            match crate::uring::Shared::new() {
+                Ok(u) => Some(u),
+                Err(e) => {
+                    crate::log!("io_uring unavailable ({e}): using plain sockets");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        if config.io_uring {
+            crate::log!("io_uring is Linux only: using plain sockets");
+        }
         Arc::new(Server {
             store,
             pki,
@@ -230,7 +253,22 @@ impl Server {
             next_channel: AtomicU32::new(1),
             endpoints_encoded,
             application_encoded,
+            #[cfg(target_os = "linux")]
+            uring,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn uring(&self) -> Option<&crate::uring::Shared> {
+        self.uring.as_ref()
+    }
+
+    /// Whether connections use the io_uring transport.
+    pub fn uses_io_uring(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        return self.uring.is_some();
+        #[cfg(not(target_os = "linux"))]
+        false
     }
 
     #[inline]

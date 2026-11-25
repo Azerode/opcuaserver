@@ -23,7 +23,9 @@ const USAGE: &str = "usage: fastua [options]
   --x509-users read|write      rights of users with a trusted certificate (default: write)
   --trust-all-clients     accept any client certificate (development only)
   --busy-poll US          poll each connection for US microseconds before sleeping
-                          (lower latency, one busy core per active connection; default: off)";
+                          (lower latency, one busy core per active connection; default: off)
+  --io-uring              io_uring transport with a shared kernel polling thread (Linux;
+                          falls back to plain sockets when the kernel refuses it)";
 
 fn fail(msg: String) -> ! {
     eprintln!("{msg}");
@@ -66,6 +68,7 @@ fn main() {
     let mut x509_users = Access::ReadWrite;
     let mut trust_all = false;
     let mut busy_poll = std::time::Duration::ZERO;
+    let mut io_uring = false;
 
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("hash-password") {
@@ -88,6 +91,7 @@ fn main() {
             "--anonymous" => anonymous = parse_access(&value("--anonymous"), true),
             "--x509-users" => x509_users = parse_access(&value("--x509-users"), false).unwrap(),
             "--trust-all-clients" => trust_all = true,
+            "--io-uring" => io_uring = true,
             "--busy-poll" => {
                 let v = value("--busy-poll");
                 let us: u64 = v.parse().unwrap_or_else(|_| fail(format!("invalid --busy-poll '{v}'\n\n{USAGE}")));
@@ -142,6 +146,7 @@ fn main() {
     config.anonymous = anonymous;
     config.x509_users = x509_users;
     config.busy_poll = busy_poll;
+    config.io_uring = io_uring;
     if !busy_poll.is_zero() {
         fastua::log!("busy-polling connections for {} us before sleeping", busy_poll.as_micros());
     }
@@ -150,6 +155,9 @@ fn main() {
     }
     fastua::log!("listening on {listen}");
     let server = Server::new(store, config, pki, users);
+    if server.uses_io_uring() {
+        fastua::log!("io_uring transport with a shared kernel polling thread");
+    }
     if let Err(e) = server.serve(listener) {
         fail(format!("server stopped: {e}"));
     }

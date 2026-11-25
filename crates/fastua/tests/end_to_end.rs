@@ -16,6 +16,10 @@ fn start(dir: &std::path::Path, limits: Limits) -> String {
 }
 
 fn start_with(dir: &std::path::Path, limits: Limits, busy_poll: std::time::Duration) -> String {
+    start_full(dir, limits, busy_poll, false)
+}
+
+fn start_full(dir: &std::path::Path, limits: Limits, busy_poll: std::time::Duration, io_uring: bool) -> String {
     let store = Store::open(dir, ServerInfo::default()).unwrap();
     store.watch().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -24,6 +28,7 @@ fn start_with(dir: &std::path::Path, limits: Limits, busy_poll: std::time::Durat
     config.limits = limits;
     config.anonymous = Some(Access::ReadWrite);
     config.busy_poll = busy_poll;
+    config.io_uring = io_uring;
     let pki = Pki::open(&dir.join("pki"), "urn:test:fastua", "localhost", false).unwrap();
     let server = Server::new(store, config, pki, Users::default());
     std::thread::spawn(move || server.serve(listener));
@@ -175,15 +180,20 @@ fn hot_reload_is_visible_to_connected_clients() {
 /// Runs with and without busy polling.
 #[test]
 fn pipelined_requests_and_busy_poll() {
-    for (name, spin) in [("pipe", 0u64), ("spin", 200)] {
+    // io_uring falls back to plain sockets where the kernel refuses it, so
+    // these cases pass on every machine.
+    for (name, spin, uring) in
+        [("pipe", 0u64, false), ("spin", 200, false), ("uring", 0, true), ("uring-spin", 200, true)]
+    {
         let dir = temp_config(name, MACHINE);
-        let addr = start_with(&dir, Limits::default(), std::time::Duration::from_micros(spin));
+        let addr = start_full(&dir, Limits::default(), std::time::Duration::from_micros(spin), uring);
         let mut c = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
         c.create_session("pipe").unwrap();
         let ns = 2;
         assert_eq!(c.write(&[(NodeId::Numeric(ns, 2), Variant::Int32(41))]).unwrap(), vec![status::GOOD]);
         for n in [1usize, 2, 50, 700] {
             let all = c.read_pipelined(&[(NodeId::Numeric(ns, 2), 13)], n).unwrap();
+            // (Large responses also exercise partial sends on the io_uring path.)
             assert_eq!(all.len(), n);
             for dv in all {
                 assert_eq!(dv[0].value, Some(Variant::Int32(41)), "{name} x{n}");
