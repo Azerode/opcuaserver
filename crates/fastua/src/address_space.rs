@@ -144,6 +144,8 @@ pub struct AddressSpace {
     pub namespaces: Vec<Arc<str>>,
     pub generation: u64,
     pub info: Arc<ServerInfo>,
+    /// Shared by every snapshot: events outlive reloads.
+    pub events: Arc<crate::events::EventBus>,
 }
 
 impl AddressSpace {
@@ -361,6 +363,7 @@ const DATA_TYPES: &[(u32, &str, u32, bool)] = &[
     (12, "String", ids::BASE_DATA_TYPE, false),
     (13, "DateTime", ids::BASE_DATA_TYPE, false),
     (ids::UTC_TIME, "UtcTime", 13, false),
+    (crate::events::types::DURATION, "Duration", 11, false),
     (14, "Guid", ids::BASE_DATA_TYPE, false),
     (15, "ByteString", ids::BASE_DATA_TYPE, false),
     (16, "XmlElement", ids::BASE_DATA_TYPE, false),
@@ -468,8 +471,29 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     let (rtf, refs) = (b.idx(ids::REFERENCE_TYPES_FOLDER), b.idx(ids::REFERENCES));
     b.link(rtf, ids::ORGANIZES, refs);
 
-    // Server object
-    let server = b.ns0(ids::SERVER, "Server", NodeKind::Object { event_notifier: 0 });
+    // Modelling rules (instance declarations of the event types use them).
+    b.ns0(ids::MODELLING_RULE_TYPE, "ModellingRuleType", NodeKind::ObjectType { is_abstract: false });
+    b.subtype(ids::BASE_OBJECT_TYPE, ids::MODELLING_RULE_TYPE);
+    let mrt = b.idx(ids::MODELLING_RULE_TYPE);
+    for (id, name) in [(ids::MODELLING_RULE_MANDATORY, "Mandatory"), (ids::MODELLING_RULE_OPTIONAL, "Optional")] {
+        let n = b.ns0(id, name, NodeKind::Object { event_notifier: 0 });
+        b.link(n, ids::HAS_TYPE_DEFINITION, mrt);
+    }
+    let mandatory = b.idx(ids::MODELLING_RULE_MANDATORY);
+
+    // Event types and their fields.
+    for t in crate::events::EVENT_TYPES {
+        b.ns0(t.id, t.name, NodeKind::ObjectType { is_abstract: t.is_abstract });
+        b.subtype(t.parent, t.id);
+        for &(decl, name, data_type, rank) in t.fields {
+            b.property(decl, name, t.id, data_type, rank, ValueSource::Static(Variant::Empty));
+            let d = b.idx(decl);
+            b.link(d, ids::HAS_MODELLING_RULE, mandatory);
+        }
+    }
+
+    // Server object: the root notifier of every event.
+    let server = b.ns0(ids::SERVER, "Server", NodeKind::Object { event_notifier: 1 });
     let (objects, st) = (b.idx(ids::OBJECTS_FOLDER), b.idx(ids::SERVER_TYPE));
     b.link(objects, ids::ORGANIZES, server);
     b.link(server, ids::HAS_TYPE_DEFINITION, st);
@@ -652,7 +676,8 @@ pub fn build(
     }
 
     let dense = dense_tables(&b.nodes, namespaces.len());
-    Ok(AddressSpace { nodes: b.nodes, index: b.index, dense, namespaces, generation, info })
+    let events = previous.map(|p| p.events.clone()).unwrap_or_default();
+    Ok(AddressSpace { nodes: b.nodes, index: b.index, dense, namespaces, generation, info, events })
 }
 
 /// Builds the direct lookup tables of [`AddressSpace::dense`]. A namespace

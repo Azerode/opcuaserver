@@ -333,6 +333,21 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
     let mut nonce = vec![0u8; crypto::NONCE_LEN];
     random_bytes(&mut nonce);
     let session = ctx.server.create_session(name, ctx.channel_id, timeout, security.clone(), nonce.clone())?;
+    let thumbprint = client_cert.as_deref().map(|c| crate::pki::hex(&crypto::thumbprint(c)));
+    let channel = ctx.channel_id;
+    ctx.server.session_event(
+        crate::events::types::AUDIT_CREATE_SESSION_EVENT_TYPE,
+        &session,
+        "Session/CreateSession",
+        true,
+        |e| {
+            use crate::events::types::*;
+            e.with(CREATE_SECURE_CHANNEL_ID, Variant::string(&channel.to_string()))
+                .with(CLIENT_CERTIFICATE, Variant::ByteString(client_cert.as_deref().map(Into::into)))
+                .with(CLIENT_CERTIFICATE_THUMBPRINT, Variant::String(thumbprint.map(Into::into)))
+                .with(REVISED_SESSION_TIMEOUT, Variant::Double(timeout))
+        },
+    );
 
     begin(w, ids::CREATE_SESSION_RESPONSE, h);
     w.node_id(&session.id);
@@ -401,7 +416,23 @@ fn decrypt_secret(ctx: &Ctx, data: &[u8], algorithm: Option<&str>, nonce: &[u8])
     Ok(secret.to_vec())
 }
 
+/// ActivateSession, audited (AuditActivateSessionEventType).
 fn activate_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
+    let result = activate_session_inner(ctx, h, r, w);
+    if let Ok(s) = session(ctx, h, false) {
+        let channel = ctx.channel_id.to_string();
+        ctx.server.session_event(
+            crate::events::types::AUDIT_ACTIVATE_SESSION_EVENT_TYPE,
+            &s,
+            "Session/ActivateSession",
+            result.is_ok(),
+            |e| e.with(crate::events::types::ACTIVATE_SECURE_CHANNEL_ID, Variant::string(&channel)),
+        );
+    }
+    result
+}
+
+fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
     let s = session(ctx, h, false)?;
     #[allow(clippy::type_complexity)]
     let mut parse = || -> DResult<(Option<String>, Vec<u8>, NodeId, Vec<u8>, Option<String>, Vec<u8>)> {
@@ -533,6 +564,7 @@ fn close_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Write
     }
     *ctx.session = None;
     crate::log!("session '{}' ({}) closed", s.name, s.id);
+    ctx.server.session_event(crate::events::types::AUDIT_SESSION_EVENT_TYPE, &s, "Session/CloseSession", true, |e| e);
     begin(w, ids::CLOSE_SESSION_RESPONSE, h);
     Ok(())
 }

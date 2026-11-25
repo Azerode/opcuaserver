@@ -86,6 +86,15 @@ impl Store {
         Ok(generation)
     }
 
+    /// Raises a server event (source: the Server object).
+    pub fn raise(&self, type_id: u32, message: &str, severity: u16) {
+        let s = self.load();
+        if s.events.active() {
+            let server = crate::types::NodeId::ns0(crate::types::ids::SERVER);
+            s.events.emit(crate::events::Event::new(type_id, server, "Server", message, severity));
+        }
+    }
+
     /// Spawns the watcher thread.
     pub fn watch(self: &Arc<Self>) -> std::io::Result<std::thread::JoinHandle<()>> {
         let store = self.clone();
@@ -96,13 +105,19 @@ impl Store {
             match store.reload() {
                 Ok(g) => {
                     let s = store.load();
-                    crate::log!(
+                    let msg = format!(
                         "configuration reloaded (generation {g}, {} nodes, {} namespaces)",
                         s.len(),
                         s.namespaces.len()
                     );
+                    crate::log!("{msg}");
+                    store.raise(crate::events::types::BASE_MODEL_CHANGE_EVENT_TYPE, &msg, 100);
                 }
-                Err(e) => crate::log!("configuration rejected, keeping previous one: {e}"),
+                Err(e) => {
+                    let msg = format!("configuration rejected, keeping previous one: {e}");
+                    crate::log!("{msg}");
+                    store.raise(crate::events::types::SYSTEM_EVENT_TYPE, &msg, 700);
+                }
             }
         })
     }

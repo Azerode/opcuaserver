@@ -15,6 +15,7 @@
 
 use crate::address_space::{encode_server_status, AddressSpace, NodeKind, ValueSource, ACCESS_READ};
 use crate::codec::Writer;
+use crate::events::{EventFilter, EventItem};
 use crate::server::Limits;
 use crate::types::*;
 use crate::value::{self, ValueCell, ENCODED_MAX, NO_SOURCE_TS};
@@ -488,6 +489,26 @@ impl Item {
 }
 
 /// Resolves what an item samples. `Err` is the per-item status code.
+/// Event items need an Object whose EventNotifier has SubscribeToEvents.
+fn check_notifier(space: &AddressSpace, node: &NodeId) -> Result<(), u32> {
+    let n = space.get(node).ok_or(status::BAD_NODE_ID_UNKNOWN)?;
+    match n.kind {
+        NodeKind::Object { event_notifier } if event_notifier & 1 != 0 => Ok(()),
+        NodeKind::Object { .. } => Err(BAD_FILTER_NOT_ALLOWED),
+        _ => Err(status::BAD_ATTRIBUTE_ID_INVALID),
+    }
+}
+
+/// Event queues hold at least two entries (an overflow event and the
+/// newest event); 0 asks for the server default.
+fn event_queue_size(l: &Limits, requested: u32) -> usize {
+    let max = l.max_queue_size.max(2) as usize;
+    match requested {
+        0 => 1000.min(max),
+        q => (q as usize).clamp(2, max),
+    }
+}
+
 /// Percent deadband (Part 8, §5.3.2.2): a share of the EURange span.
 fn percent_to_absolute(percent: f64, (low, high): (f64, f64)) -> f64 {
     percent / 100.0 * (high - low)
@@ -600,6 +621,8 @@ pub struct Subscription {
     /// Slots with queued samples to report, in order.
     dirty: Vec<u32>,
     links: usize,
+    /// Event monitored items (EventNotifier attribute + EventFilter).
+    events: Vec<EventItem>,
     retransmit: VecDeque<(u32, Vec<u8>)>,
     pool: Vec<Vec<u8>>,
     generation: u64,
@@ -626,6 +649,7 @@ impl Subscription {
             groups: Vec::new(),
             dirty: Vec::new(),
             links: 0,
+            events: Vec::new(),
             retransmit: VecDeque::new(),
             pool: Vec::new(),
             generation: 0,
@@ -650,7 +674,82 @@ impl Subscription {
     }
 
     pub fn item_count(&self) -> usize {
-        self.by_id.len()
+        self.by_id.len() + self.events.len()
+    }
+
+    fn event_index(&self, id: u32) -> Option<usize> {
+        self.events.iter().position(|e| e.id == id)
+    }
+
+    /// Event items have something to report.
+    #[inline]
+    fn events_ready(&self) -> bool {
+        !self.events.is_empty() && self.events.iter().any(|e| e.reportable())
+    }
+
+    /// Something to put in the next NotificationMessage.
+    #[inline]
+    fn has_notifications(&self) -> bool {
+        !self.dirty.is_empty() || self.events_ready()
+    }
+
+    /// CreateMonitoredItems for an event item. Returns (id, revised queue size).
+    pub fn create_event_item(
+        &mut self,
+        l: &Limits,
+        space: &AddressSpace,
+        node: NodeId,
+        mode: u32,
+        p: &ItemParams,
+        filter: EventFilter,
+    ) -> Result<(u32, u32), u32> {
+        if mode > MODE_REPORTING {
+            return Err(BAD_MONITORING_MODE_INVALID);
+        }
+        if self.item_count() >= l.max_monitored_items_per_subscription {
+            return Err(BAD_TOO_MANY_MONITORED_ITEMS);
+        }
+        check_notifier(space, &node)?;
+        let queue_size = event_queue_size(l, p.queue_size);
+        let id = self.next_item_id;
+        self.next_item_id = self.next_item_id.checked_add(1).unwrap_or(1);
+        let bus = space.events.clone();
+        self.events.push(EventItem::new(id, p.client_handle, mode, node, filter, queue_size, p.discard_oldest, bus));
+        Ok((id, queue_size as u32))
+    }
+
+    /// ModifyMonitoredItems for an event item; `filter` replaces the old one.
+    pub fn modify_event_item(
+        &mut self,
+        l: &Limits,
+        id: u32,
+        p: &ItemParams,
+        filter: Option<EventFilter>,
+    ) -> Result<u32, u32> {
+        let i = self.event_index(id).ok_or(BAD_MONITORED_ITEM_ID_INVALID)?;
+        let e = &mut self.events[i];
+        let Some(filter) = filter else {
+            return Err(BAD_MONITORED_ITEM_FILTER_INVALID);
+        };
+        let queue_size = event_queue_size(l, p.queue_size);
+        e.client_handle = p.client_handle;
+        e.filter = filter;
+        e.resize(queue_size, p.discard_oldest);
+        Ok(queue_size as u32)
+    }
+
+    /// The item is an event item.
+    pub fn is_event_item(&self, id: u32) -> bool {
+        self.event_index(id).is_some()
+    }
+
+    /// Pulls new events into the event items' queues.
+    #[cold]
+    #[inline(never)]
+    fn poll_events(&mut self) {
+        for e in &mut self.events {
+            e.poll();
+        }
     }
 
     pub fn available(&self) -> impl Iterator<Item = u32> + '_ {
@@ -753,7 +852,7 @@ impl Subscription {
         if mode > MODE_REPORTING {
             return Err(BAD_MONITORING_MODE_INVALID);
         }
-        if self.by_id.len() >= l.max_monitored_items_per_subscription {
+        if self.item_count() >= l.max_monitored_items_per_subscription {
             return Err(BAD_TOO_MANY_MONITORED_ITEMS);
         }
         let (source, kind, size) = resolve(space, &node, attribute, can_write)?;
@@ -852,7 +951,11 @@ impl Subscription {
     }
 
     pub fn delete_item(&mut self, id: u32) -> Result<(), u32> {
-        let slot = self.by_id.remove(&id).ok_or(BAD_MONITORED_ITEM_ID_INVALID)?;
+        let Some(slot) = self.by_id.remove(&id) else {
+            let i = self.event_index(id).ok_or(BAD_MONITORED_ITEM_ID_INVALID)?;
+            self.events.swap_remove(i);
+            return Ok(());
+        };
         let it = self.items[slot as usize].take().unwrap();
         let g = &mut self.groups[it.group].items;
         if let Some(i) = g.iter().position(|h| h.slot == slot) {
@@ -881,7 +984,15 @@ impl Subscription {
         if mode > MODE_REPORTING {
             return Err(BAD_MONITORING_MODE_INVALID);
         }
-        let slot = self.slot(id).ok_or(BAD_MONITORED_ITEM_ID_INVALID)?;
+        let Some(slot) = self.slot(id) else {
+            let i = self.event_index(id).ok_or(BAD_MONITORED_ITEM_ID_INVALID)?;
+            let e = &mut self.events[i];
+            e.mode = mode;
+            if mode == MODE_DISABLED {
+                e.clear();
+            }
+            return Ok(());
+        };
         let it = self.items[slot as usize].as_mut().unwrap();
         let old = it.mode;
         it.mode = mode;
@@ -929,7 +1040,7 @@ impl Subscription {
     }
 
     pub fn has_item(&self, id: u32) -> bool {
-        self.by_id.contains_key(&id)
+        self.by_id.contains_key(&id) || self.event_index(id).is_some()
     }
 
     /// Samples one item and does the reporting / triggering bookkeeping.
@@ -1010,6 +1121,9 @@ impl Subscription {
         if self.generation != space.generation {
             self.rebind(space);
         }
+        if !self.events.is_empty() {
+            self.poll_events();
+        }
         for g in 0..self.groups.len() {
             let grp = &mut self.groups[g];
             if grp.next > now || grp.items.is_empty() {
@@ -1067,7 +1181,7 @@ impl Subscription {
         if self.pending {
             return true;
         }
-        if (self.publishing_enabled && !self.dirty.is_empty()) || !self.message_sent {
+        if (self.publishing_enabled && self.has_notifications()) || !self.message_sent {
             self.pending = true;
         } else {
             self.keepalive_counter += 1;
@@ -1085,41 +1199,71 @@ impl Subscription {
         let mut w = Writer::new(out);
         w.u32(self.seq);
         w.i64(now_ticks);
+        let parts_at = w.len();
         w.i32(1);
-        let at = w.begin_extension_object(ids::DATA_CHANGE_NOTIFICATION_ENCODING);
-        let count_at = w.len();
-        w.i32(0);
         let max = self.params.max_notifications;
         let mut n = 0u32;
-        let mut done = 0;
-        let mut full = false;
-        for k in 0..self.dirty.len() {
-            let slot = self.dirty[k];
-            let Some(it) = self.items[slot as usize].as_mut() else {
-                done = k + 1;
-                continue;
-            };
-            while let Some(&e) = it.queue.front() {
-                if n >= max || w.len() >= max_bytes {
-                    full = true;
+        let mut parts = 0;
+        if !self.dirty.is_empty() {
+            parts += 1;
+            let at = w.begin_extension_object(ids::DATA_CHANGE_NOTIFICATION_ENCODING);
+            let count_at = w.len();
+            w.i32(0);
+            let mut done = 0;
+            let mut full = false;
+            for k in 0..self.dirty.len() {
+                let slot = self.dirty[k];
+                let Some(it) = self.items[slot as usize].as_mut() else {
+                    done = k + 1;
+                    continue;
+                };
+                while let Some(&e) = it.queue.front() {
+                    if n >= max || w.len() >= max_bytes {
+                        full = true;
+                        break;
+                    }
+                    let var = if e.tag == TAG_VAR { it.queue.front_var() } else { None };
+                    it.write_entry(&mut w, &e, var);
+                    it.queue.pop_front();
+                    n += 1;
+                }
+                if full {
                     break;
                 }
-                let var = if e.tag == TAG_VAR { it.queue.front_var() } else { None };
-                it.write_entry(&mut w, &e, var);
-                it.queue.pop_front();
-                n += 1;
+                it.dirty = false;
+                done = k + 1;
             }
-            if full {
-                break;
-            }
-            it.dirty = false;
-            done = k + 1;
+            self.dirty.drain(..done);
+            w.patch_u32(count_at, n);
+            w.i32(0); // diagnosticInfos
+            w.end_extension_object(at);
         }
-        self.dirty.drain(..done);
+        if !self.events.is_empty() && n < max && w.len() < max_bytes && self.events_ready() {
+            parts += 1;
+            n += self.write_events(&mut w, max - n, max_bytes);
+        }
+        if parts != 1 {
+            w.patch_u32(parts_at, parts);
+        }
+        (n, self.has_notifications())
+    }
+
+    /// EventNotificationList with the reportable event items' queues.
+    #[cold]
+    #[inline(never)]
+    fn write_events(&mut self, w: &mut Writer, max: u32, max_bytes: usize) -> u32 {
+        let at = w.begin_extension_object(crate::events::EVENT_NOTIFICATION_LIST_ENCODING);
+        let count_at = w.len();
+        w.i32(0);
+        let mut n = 0;
+        for e in &mut self.events {
+            if e.mode == MODE_REPORTING {
+                n += e.write(w, max - n, max_bytes);
+            }
+        }
         w.patch_u32(count_at, n);
-        w.i32(0); // diagnosticInfos
         w.end_extension_object(at);
-        (n, !self.dirty.is_empty())
+        n
     }
 
     fn take_buffer(&mut self, max_retransmit: usize) -> Vec<u8> {
@@ -1350,7 +1494,7 @@ impl SessionSubs {
         let ticks = now_ticks();
         crate::services::begin_raw(w, ids::PUBLISH_RESPONSE, ticks, r.handle);
         w.u32(s.id);
-        if s.publishing_enabled && !s.dirty.is_empty() {
+        if s.publishing_enabled && s.has_notifications() {
             let mut buf = s.take_buffer(l.max_retransmission_queue);
             let (_, more) = s.build_message(ticks, max_bytes, &mut buf);
             let seq = s.seq;

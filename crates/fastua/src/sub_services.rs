@@ -2,6 +2,7 @@
 //! The state machines live in [`crate::subscription`].
 
 use super::*;
+use crate::events::{codes::BAD_EVENT_FILTER_INVALID, EventFilter, FilterResult};
 use crate::subscription::{codes::*, mono_ns, Filter, ItemParams, PublishRequest, SubParams, Subscription};
 use std::sync::MutexGuard;
 
@@ -242,8 +243,11 @@ pub(super) fn republish(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mu
 
 // ---------------------------------------------------------------- MonitoredItem set
 
+/// A parsed EventFilter and its per clause results.
+type Events = Option<(EventFilter, FilterResult)>;
+
 /// MonitoringParameters; `Err` is a per-item status for an unusable filter.
-fn read_parameters(r: &mut Reader) -> DResult<Result<ItemParams, u32>> {
+fn read_parameters(r: &mut Reader) -> DResult<Result<(ItemParams, Events), u32>> {
     let client_handle = r.u32()?;
     let sampling_ms = r.f64()?;
     let (type_id, enc, body) = r.extension_object_raw()?;
@@ -283,13 +287,17 @@ fn read_parameters(r: &mut Reader) -> DResult<Result<ItemParams, u32>> {
                 return Ok(Err(BAD_DEADBAND_FILTER_INVALID));
             }
         }
-        // Events and aggregates are not supported yet.
-        Some(ids::EVENT_FILTER_ENCODING) | Some(ids::AGGREGATE_FILTER_ENCODING) => {
-            return Ok(Err(BAD_MONITORED_ITEM_FILTER_UNSUPPORTED))
+        Some(ids::EVENT_FILTER_ENCODING) if enc == 1 => {
+            let Ok(ef) = crate::events::parse_filter(body) else {
+                return Ok(Err(BAD_EVENT_FILTER_INVALID));
+            };
+            p.filter_present = true;
+            return Ok(Ok((p, Some(ef))));
         }
+        Some(ids::AGGREGATE_FILTER_ENCODING) => return Ok(Err(BAD_MONITORED_ITEM_FILTER_UNSUPPORTED)),
         _ => return Ok(Err(BAD_MONITORED_ITEM_FILTER_INVALID)),
     }
-    Ok(Ok(p))
+    Ok(Ok((p, None)))
 }
 
 pub(super) fn create_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
@@ -314,7 +322,19 @@ pub(super) fn create_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
         let (_, enc_name) = r.qualified_name_ref().map_err(decode_err)?;
         let mode = r.u32().map_err(decode_err)?;
         let params = read_parameters(r).map_err(decode_err)?;
-        let result = params.and_then(|p| {
+        let mut filter_result = None;
+        let result = params.and_then(|(p, events)| {
+            if let Some((filter, fr)) = events {
+                if attribute != attr::EVENT_NOTIFIER {
+                    return Err(BAD_FILTER_NOT_ALLOWED);
+                }
+                let good = fr.is_good() && filter.select_len() > 0;
+                filter_result = Some(fr);
+                if !good {
+                    return Err(BAD_EVENT_FILTER_INVALID);
+                }
+                return sub.create_event_item(l, space, node, mode, &p, filter).map(|(id, q)| (id, 0.0, q));
+            }
             if range.is_some_and(|x| !x.is_empty()) {
                 return Err(status::BAD_INDEX_RANGE_INVALID);
             }
@@ -341,7 +361,10 @@ pub(super) fn create_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
                 w.u32(0);
             }
         }
-        w.null_extension_object(); // filterResult
+        match filter_result {
+            Some(fr) => fr.write(w),
+            None => w.null_extension_object(),
+        }
     }
     w.empty_array(); // diagnosticInfos
     drop(st);
@@ -365,7 +388,28 @@ pub(super) fn modify_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
     for _ in 0..n {
         let id = r.u32().map_err(decode_err)?;
         let params = read_parameters(r).map_err(decode_err)?;
-        match params.and_then(|p| sub.modify_item(l, space, id, ts, &p, now)) {
+        let mut filter_result = None;
+        let result = params.and_then(|(p, events)| {
+            if sub.is_event_item(id) {
+                let filter = match events {
+                    Some((f, fr)) => {
+                        let good = fr.is_good() && f.select_len() > 0;
+                        filter_result = Some(fr);
+                        if !good {
+                            return Err(BAD_EVENT_FILTER_INVALID);
+                        }
+                        Some(f)
+                    }
+                    None => None,
+                };
+                return sub.modify_event_item(l, id, &p, filter).map(|q| (0.0, q));
+            }
+            if events.is_some() {
+                return Err(BAD_FILTER_NOT_ALLOWED);
+            }
+            sub.modify_item(l, space, id, ts, &p, now)
+        });
+        match result {
             Ok((sampling, queue)) => {
                 w.u32(status::GOOD);
                 w.f64(sampling);
@@ -377,7 +421,10 @@ pub(super) fn modify_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
                 w.u32(0);
             }
         }
-        w.null_extension_object();
+        match filter_result {
+            Some(fr) => fr.write(w),
+            None => w.null_extension_object(),
+        }
     }
     w.empty_array();
     drop(st);

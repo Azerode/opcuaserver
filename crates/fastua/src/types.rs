@@ -479,6 +479,9 @@ pub mod ids {
     pub const BASE_VARIABLE_TYPE: u32 = 62;
     pub const BASE_DATA_VARIABLE_TYPE: u32 = 63;
     pub const PROPERTY_TYPE: u32 = 68;
+    pub const MODELLING_RULE_TYPE: u32 = 77;
+    pub const MODELLING_RULE_MANDATORY: u32 = 78;
+    pub const MODELLING_RULE_OPTIONAL: u32 = 80;
     pub const SERVER_TYPE: u32 = 2004;
     pub const SERVER_STATUS_TYPE: u32 = 2138;
     pub const DATA_ITEM_TYPE: u32 = 2365;

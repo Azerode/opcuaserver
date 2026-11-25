@@ -6,6 +6,7 @@ pub mod client;
 pub mod codec;
 pub mod config;
 pub mod crypto;
+pub mod events;
 pub mod net;
 pub mod pki;
 pub mod reload;
