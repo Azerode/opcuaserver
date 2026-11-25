@@ -3,7 +3,7 @@
 use std::io;
 use std::net::TcpStream;
 use std::os::fd::AsRawFd;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Non-blocking receive into `buf`: `Ok(None)` when no data is waiting.
 #[inline]
@@ -32,28 +32,6 @@ fn recv_flags(stream: &TcpStream, buf: &mut [u8], flags: libc::c_int) -> io::Res
             _ => return Err(e),
         }
     }
-}
-
-/// Receives at least one byte into `buf`. With a non-zero `spin`, polls the
-/// socket without sleeping for up to that long first: the thread is already
-/// running when the request lands, which saves the scheduler wake-up (several
-/// microseconds) at the price of a busy core while the client is idle.
-#[inline]
-pub fn recv(stream: &mut TcpStream, buf: &mut [u8], spin: Duration) -> io::Result<usize> {
-    use std::io::Read;
-    if !spin.is_zero() {
-        let deadline = Instant::now() + spin;
-        loop {
-            if let Some(n) = try_recv(stream, buf)? {
-                return Ok(n);
-            }
-            std::hint::spin_loop();
-            if Instant::now() >= deadline {
-                break;
-            }
-        }
-    }
-    stream.read(buf)
 }
 
 /// Asks the kernel to busy-poll the NIC queue of this socket (SO_BUSY_POLL).

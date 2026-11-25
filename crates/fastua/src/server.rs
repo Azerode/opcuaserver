@@ -11,7 +11,7 @@ use crate::subscription::{SessionSubs, Subscription};
 use crate::types::*;
 use crate::users::{Access, Users};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -100,6 +100,10 @@ pub struct ServerConfig {
     /// never). Removes the wake-up latency at the cost of a busy core per
     /// connection while its client is idle.
     pub busy_poll: Duration,
+    /// At most this many connections busy-poll at once (0 = automatic:
+    /// half the cores). The others sleep in `recv`: spinning on more threads
+    /// than free cores steals CPU from the threads doing the work.
+    pub busy_poll_threads: usize,
 }
 
 impl ServerConfig {
@@ -119,6 +123,7 @@ impl ServerConfig {
             anonymous: Some(Access::ReadOnly),
             x509_users: Access::ReadWrite,
             busy_poll: Duration::ZERO,
+            busy_poll_threads: 0,
         }
     }
 }
@@ -177,6 +182,11 @@ pub struct Server {
     pub config: ServerConfig,
     started: u64,
     sessions: Mutex<FxHashMap<NodeId, Arc<Session>>>,
+    /// Connections currently busy-polling; how many may (adjusted to the
+    /// free cores by the load sampler) and the configured ceiling.
+    spinners: AtomicUsize,
+    spin_limit: AtomicUsize,
+    spin_cap: usize,
     next_session: AtomicU32,
     next_channel: AtomicU32,
     /// GetEndpoints / CreateSession answer, encoded once (array included).
@@ -228,7 +238,56 @@ fn write_application_description(w: &mut Writer, info: &ServerInfo, discovery_ur
 }
 
 impl Server {
+    /// Takes a busy-poll permit if fewer than the limit are held. A
+    /// connection keeps its permit while requests keep arriving and gives it
+    /// back when it goes to sleep, so the steady state costs no atomic.
+    #[inline]
+    pub(crate) fn acquire_spin(&self) -> bool {
+        let limit = self.spin_limit.load(Ordering::Relaxed);
+        self.spinners.fetch_update(Ordering::Acquire, Ordering::Relaxed, |n| (n < limit).then_some(n + 1)).is_ok()
+    }
+
+    /// True when more connections spin than the sampler allows now: the
+    /// caller should give its permit back. Two loads of rarely written lines.
+    #[inline]
+    pub(crate) fn spin_oversubscribed(&self) -> bool {
+        self.spinners.load(Ordering::Relaxed) > self.spin_limit.load(Ordering::Relaxed)
+    }
+
+    /// Load sampler: busy-polling only pays when a core is free. Every 2 ms
+    /// it reads the number of runnable threads (/proc/loadavg), smooths it,
+    /// and sets how many connections may spin: the current spinners plus the
+    /// idle cores (fewer when threads wait for a CPU), within the ceiling.
+    fn sample_load(&self) {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+        let mut running = 0.0f64;
+        let mut buf = [0u8; 128];
+        let Ok(file) = std::fs::File::open("/proc/loadavg") else {
+            return; // no /proc: keep the static ceiling
+        };
+        loop {
+            std::thread::sleep(Duration::from_millis(2));
+            let Some(now) = runnable_threads(&file, &mut buf) else {
+                return; // no /proc: keep the static ceiling
+            };
+            // Without the sampler itself.
+            running = 0.75 * running + 0.25 * (now.saturating_sub(1) as f64);
+            let spinners = self.spinners.load(Ordering::Relaxed) as f64;
+            let limit = (spinners + (cores - running).floor()).clamp(0.0, self.spin_cap as f64);
+            self.spin_limit.store(limit as usize, Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn release_spin(&self) {
+        self.spinners.fetch_sub(1, Ordering::Release);
+    }
+
     pub fn new(store: Arc<Store>, mut config: ServerConfig, pki: Arc<Pki>, users: Users) -> Arc<Server> {
+        let spin_cap = match config.busy_poll_threads {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1)),
+            n => n,
+        };
         let info = store.info().clone();
         // An ECC endpoint needs our certificate on its curve.
         config.endpoints.retain(|(p, _)| match p.ecc() {
@@ -287,6 +346,9 @@ impl Server {
             sessions: Mutex::new(FxHashMap::default()),
             next_session: AtomicU32::new(1),
             next_channel: AtomicU32::new(1),
+            spinners: AtomicUsize::new(0),
+            spin_limit: AtomicUsize::new(spin_cap),
+            spin_cap,
             endpoints_encoded,
             application_encoded,
             next_subscription: AtomicU32::new(1),
@@ -487,6 +549,10 @@ impl Server {
                 server.expire_sessions();
             })?;
         }
+        if !self.config.busy_poll.is_zero() {
+            let server = self.clone();
+            std::thread::Builder::new().name("fastua-load".into()).spawn(move || server.sample_load())?;
+        }
         for stream in listener.incoming() {
             match stream {
                 Ok(s) => self.spawn_connection(s),
@@ -512,6 +578,14 @@ impl Server {
             crate::log!("cannot spawn connection thread: {e}");
         }
     }
+}
+
+/// Runnable threads system-wide: 4th field of /proc/loadavg ("1/123").
+fn runnable_threads(file: &std::fs::File, buf: &mut [u8; 128]) -> Option<usize> {
+    use std::os::unix::fs::FileExt;
+    let n = file.read_at(buf, 0).ok()?;
+    let text = std::str::from_utf8(&buf[..n]).ok()?;
+    text.split(' ').nth(3)?.split('/').next()?.parse().ok()
 }
 
 /// CLOCK_MONOTONIC_COARSE in milliseconds: read from the vDSO without touching
