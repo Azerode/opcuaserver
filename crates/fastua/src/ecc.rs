@@ -91,12 +91,12 @@ impl Suite {
         }
     }
 
-    /// Advertised in EndpointDescription.securityLevel (above the RSA ones,
-    /// 384-bit curves above 256-bit ones).
+    /// Base of EndpointDescription.securityLevel (Part 7: the 384-bit tier
+    /// rates like Aes256_Sha256_RsaPss).
     pub fn security_level(self) -> u8 {
         match self.curve {
-            Curve::NistP384 => 50,
-            _ => 40,
+            Curve::NistP384 => 30,
+            _ => 10,
         }
     }
 
