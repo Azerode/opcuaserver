@@ -99,6 +99,9 @@ Server object).
 - `tools/gen_ns0.py` compiles the nodeset into `data/ns0.bin` (attributes,
   static values in UA binary, references) and `src/ns0_ref_types.rs` (the
   reference type hierarchy). The binary embeds the table: no file to ship.
+- Every DataType carries its DataTypeDefinition attribute (StructureDefinition
+  or EnumDefinition, 1.04+), so generic clients can decode the structures
+  without the deprecated type dictionaries.
 - On each build of the address space, fastua first creates the nodes it serves
   live values for (ServerStatus, capabilities, history, alarms...), then merges
   the table: missing nodes and references are added, a node keeps one type

@@ -789,6 +789,7 @@ pub mod attr {
     pub const HISTORIZING: u32 = 20;
     pub const EXECUTABLE: u32 = 21;
     pub const USER_EXECUTABLE: u32 = 22;
+    pub const DATA_TYPE_DEFINITION: u32 = 23;
     pub const ACCESS_LEVEL_EX: u32 = 27;
 }
 
@@ -1037,7 +1038,7 @@ pub fn attribute_value(node: &Node, attribute: u32, can_write: bool) -> Option<V
         (WRITE_MASK | USER_WRITE_MASK, _) => Variant::UInt32(0),
         (IS_ABSTRACT, NodeKind::ObjectType { is_abstract })
         | (IS_ABSTRACT, NodeKind::VariableType { is_abstract, .. })
-        | (IS_ABSTRACT, NodeKind::DataType { is_abstract })
+        | (IS_ABSTRACT, NodeKind::DataType { is_abstract, .. })
         | (IS_ABSTRACT, NodeKind::ReferenceType { is_abstract, .. }) => Variant::Boolean(*is_abstract),
         (SYMMETRIC, NodeKind::ReferenceType { symmetric, .. }) => Variant::Boolean(*symmetric),
         (INVERSE_NAME, NodeKind::ReferenceType { inverse_name: Some(n), .. }) => {
@@ -1069,6 +1070,7 @@ pub fn attribute_value(node: &Node, attribute: u32, can_write: bool) -> Option<V
         (EXECUTABLE, NodeKind::Method { executable }) | (USER_EXECUTABLE, NodeKind::Method { executable }) => {
             Variant::Boolean(*executable)
         }
+        (DATA_TYPE_DEFINITION, NodeKind::DataType { definition: Some(d), .. }) => (**d).clone(),
         _ => return None,
     })
 }

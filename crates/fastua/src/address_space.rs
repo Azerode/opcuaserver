@@ -46,13 +46,37 @@ pub const ACCESS_READ: u8 = 0x01;
 pub const ACCESS_WRITE: u8 = 0x02;
 
 pub enum NodeKind {
-    Object { event_notifier: u8 },
-    Variable { data_type: NodeId, value_rank: i32, access: u8, value: ValueSource },
-    ObjectType { is_abstract: bool },
-    VariableType { is_abstract: bool, data_type: NodeId, value_rank: i32 },
-    ReferenceType { is_abstract: bool, symmetric: bool, inverse_name: Option<LocalizedText> },
-    DataType { is_abstract: bool },
-    Method { executable: bool },
+    Object {
+        event_notifier: u8,
+    },
+    Variable {
+        data_type: NodeId,
+        value_rank: i32,
+        access: u8,
+        value: ValueSource,
+    },
+    ObjectType {
+        is_abstract: bool,
+    },
+    VariableType {
+        is_abstract: bool,
+        data_type: NodeId,
+        value_rank: i32,
+    },
+    ReferenceType {
+        is_abstract: bool,
+        symmetric: bool,
+        inverse_name: Option<LocalizedText>,
+    },
+    /// `definition`: the DataTypeDefinition attribute (a StructureDefinition
+    /// or EnumDefinition), from the nodeset.
+    DataType {
+        is_abstract: bool,
+        definition: Option<Box<Variant>>,
+    },
+    Method {
+        executable: bool,
+    },
 }
 
 pub struct Node {
@@ -525,7 +549,7 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
 
     // Data types
     for &(id, name, parent, abs) in DATA_TYPES {
-        b.ns0(id, name, NodeKind::DataType { is_abstract: abs });
+        b.ns0(id, name, NodeKind::DataType { is_abstract: abs, definition: None });
         if parent != 0 {
             b.subtype(parent, id);
         }
@@ -738,6 +762,11 @@ fn merge_nodeset(b: &mut Builder) {
             let node = &mut b.nodes[i as usize];
             if node.description.is_none() {
                 node.description = n.description;
+            }
+            if let (NodeKind::DataType { definition, .. }, NodeKind::DataType { definition: d, .. }) =
+                (&mut node.kind, n.kind)
+            {
+                *definition = d;
             }
             continue;
         }
