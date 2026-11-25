@@ -331,7 +331,7 @@ fn history_engine() {
     // every second; here every 100 000 writes, outside the timing.
     let persisted = ValueCell::new(builtin::DOUBLE, 0);
     persisted.set_history(Some(10_000));
-    persisted.history().unwrap().start_persisting(Vec::new(), false);
+    persisted.history().unwrap().start_persisting(Vec::new(), Vec::new(), false);
     let mut best = f64::MAX;
     for _ in 0..7 {
         let mut ns = 0;
@@ -343,7 +343,7 @@ fn history_engine() {
                 persisted.write(black_box(&Variant::Double(i as f64)), status::GOOD, ts, 2);
             }
             ns += t.elapsed().as_nanos();
-            persisted.history().unwrap().take_for_disk(|s| {
+            persisted.history().unwrap().take_for_disk(|s, _| {
                 black_box(s);
             });
         }

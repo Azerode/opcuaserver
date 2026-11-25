@@ -10,13 +10,15 @@
 //!
 //! One file per historized variable, named by a hash of its namespace URI
 //! and identifier (`<hex>.fh`): "FUAH", version, value kind, the key, then
-//! records of (source timestamp, server timestamp, status, Variant). A
-//! crash loses at most the last interval; a torn last record is dropped.
-//! The modification log of HistoryUpdate is not kept.
+//! records: tag 0 and a value (source timestamp, server timestamp, status,
+//! Variant), or tag 1, a modification of HistoryUpdate (time, update type,
+//! user) and its value. Appends hold values only; modifications are written
+//! by the rewrite every HistoryUpdate causes. A crash loses at most the
+//! last interval; a torn last record is dropped.
 
 use crate::address_space::{AddressSpace, ValueSource};
 use crate::codec::{Reader, Writer};
-use crate::history::History;
+use crate::history::{History, Modified};
 use crate::reload::Store;
 use crate::types::NodeId;
 use crate::value::Sample;
@@ -27,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const MAGIC: &[u8; 4] = b"FUAH";
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
 
 /// Writes the histories of a store to a directory.
 pub struct Persistence {
@@ -55,9 +57,9 @@ impl Persistence {
             let key = key(space, &node.id);
             let path = self.dir.join(format!("{:016x}.fh", fnv1a(key.as_bytes())));
             if !h.persisting() {
-                let (restored, rewrite) = read_file(&path, h.kind(), &key);
-                self.records.insert(key.clone().into(), restored.len());
-                h.start_persisting(restored, rewrite);
+                let (restored, modified, rewrite) = read_file(&path, h.kind(), &key);
+                self.records.insert(key.clone().into(), restored.len() + modified.len());
+                h.start_persisting(restored, modified, rewrite);
             }
             if let Err(e) = self.write(h, &path, &key) {
                 crate::log!("history persistence: {}: {e}", path.display());
@@ -71,8 +73,17 @@ impl Persistence {
         self.buf.clear();
         let mut w = Writer::new(&mut self.buf);
         let mut n = 0usize;
-        let rewrite = h.take_for_disk(|s| {
+        let rewrite = h.take_for_disk(|s, m| {
             n += 1;
+            match m {
+                None => w.u8(0),
+                Some(m) => {
+                    w.u8(1);
+                    w.i64(m.time);
+                    w.u32(m.kind);
+                    w.str(Some(&m.user));
+                }
+            }
             w.i64(s.source_ts);
             w.i64(s.server_ts);
             w.u32(s.status);
@@ -149,37 +160,40 @@ fn header(kind: u8, key: &str) -> Vec<u8> {
     v
 }
 
-/// The values of a file, and whether it must be rewritten (missing, of
-/// another kind or key, or with a torn record).
-fn read_file(path: &Path, kind: u8, key: &str) -> (Vec<Sample>, bool) {
-    let Ok(data) = std::fs::read(path) else { return (Vec::new(), true) };
+/// The values and modifications of a file, and whether it must be
+/// rewritten (missing, of another kind or key, or with a torn record).
+fn read_file(path: &Path, kind: u8, key: &str) -> (Vec<Sample>, Vec<Modified>, bool) {
+    let Ok(data) = std::fs::read(path) else { return (Vec::new(), Vec::new(), true) };
     let head = header(kind, key);
     if !data.starts_with(&head) {
         if !data.is_empty() {
             crate::log!("history persistence: {} is not the history of {key}, replaced", path.display());
         }
-        return (Vec::new(), true);
+        return (Vec::new(), Vec::new(), true);
     }
     let mut r = Reader::new(&data[head.len()..]);
-    let mut out = Vec::new();
+    let (mut out, mut mods) = (Vec::new(), Vec::new());
     while r.remaining() > 0 {
         let rec = (|| {
-            Ok::<_, crate::codec::DecodeError>(Sample {
-                source_ts: r.i64()?,
-                server_ts: r.i64()?,
-                status: r.u32()?,
-                value: r.variant()?,
-            })
+            let tag = r.u8()?;
+            let m = match tag {
+                0 => None,
+                1 => Some((r.i64()?, r.u32()?, r.str()?.unwrap_or("").into())),
+                _ => return Err(crate::codec::DecodeError),
+            };
+            let s = Sample { source_ts: r.i64()?, server_ts: r.i64()?, status: r.u32()?, value: r.variant()? };
+            Ok::<_, crate::codec::DecodeError>((s, m))
         })();
         match rec {
-            Ok(s) => out.push(s),
+            Ok((s, None)) => out.push(s),
+            Ok((sample, Some((time, kind, user)))) => mods.push(Modified { sample, time, kind, user }),
             Err(_) => {
                 crate::log!("history persistence: {} ends with a torn record, dropped", path.display());
-                return (out, true);
+                return (out, mods, true);
             }
         }
     }
-    (out, false)
+    (out, mods, false)
 }
 
 #[cfg(test)]
@@ -196,23 +210,34 @@ mod tests {
         let mut data = header(11, "urn:a;i=1");
         let mut w = Writer::new(&mut data);
         for t in 1..=3 {
+            w.u8(0);
             w.i64(t);
             w.i64(t + 1);
             w.u32(0);
             w.variant(&Variant::Double(t as f64));
         }
+        // A modification (deleted by "op").
+        w.u8(1);
+        w.i64(99);
+        w.u32(crate::history::UPDATE_DELETE);
+        w.str(Some("op"));
+        w.i64(4);
+        w.i64(4);
+        w.u32(0);
+        w.variant(&Variant::Double(4.0));
         std::fs::write(&path, &data).unwrap();
-        let (v, rewrite) = read_file(&path, 11, "urn:a;i=1");
+        let (v, m, rewrite) = read_file(&path, 11, "urn:a;i=1");
         assert_eq!(v.len(), 3);
+        assert_eq!((m.len(), m[0].time, &*m[0].user), (1, 99, "op"));
         assert!(!rewrite);
         assert_eq!(v[2].value, Variant::Double(3.0));
         // Another kind or key: ignored and rewritten.
-        assert_eq!(read_file(&path, 10, "urn:a;i=1"), (Vec::new(), true));
-        assert_eq!(read_file(&path, 11, "urn:a;i=2"), (Vec::new(), true));
+        assert_eq!(read_file(&path, 10, "urn:a;i=1"), (Vec::new(), Vec::new(), true));
+        assert_eq!(read_file(&path, 11, "urn:a;i=2"), (Vec::new(), Vec::new(), true));
         // A torn last record is dropped.
         std::fs::write(&path, &data[..data.len() - 3]).unwrap();
-        let (v, rewrite) = read_file(&path, 11, "urn:a;i=1");
-        assert_eq!((v.len(), rewrite), (2, true));
+        let (v, m, rewrite) = read_file(&path, 11, "urn:a;i=1");
+        assert_eq!((v.len(), m.len(), rewrite), (3, 0, true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

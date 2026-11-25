@@ -516,7 +516,13 @@ fn history_survives_a_restart() {
     {
         let store = Store::open(&dir.join("cfg"), ServerInfo::default()).unwrap();
         Persistence::open(&hist).unwrap().pass(&store.load_full());
-        assert_eq!(source_times(&temp_cell(&store)), (61..=110).collect::<Vec<_>>());
+        let cell = temp_cell(&store);
+        assert_eq!(source_times(&cell), (61..=110).collect::<Vec<_>>());
+        // The deletions are in the modified history again.
+        let q = fastua::history::RawQuery { modified: true, start: 1, end: 200, max: 0, bounds: false };
+        let (mods, _) = cell.history().unwrap().read_raw(&q, None).unwrap();
+        assert_eq!(mods.len(), 50);
+        assert_eq!(mods[0].modification.as_ref().map(|m| (m.1, &*m.2)), Some((fastua::history::UPDATE_DELETE, "op")));
     }
     let _ = std::fs::remove_dir_all(&dir);
 }

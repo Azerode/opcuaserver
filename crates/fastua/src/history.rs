@@ -296,12 +296,19 @@ impl History {
         self.store.lock().unwrap_or_else(|e| e.into_inner()).journal.is_some()
     }
 
-    /// Starts persistence with the values read back from disk (`rewrite`:
-    /// the file must be rewritten, it was damaged or of another kind).
-    pub fn start_persisting(&self, restored: Vec<Sample>, rewrite: bool) {
+    /// Starts persistence with the values and modifications read back from
+    /// disk (`rewrite`: the file must be rewritten, it was damaged or of
+    /// another kind).
+    pub fn start_persisting(&self, restored: Vec<Sample>, modified: Vec<Modified>, rewrite: bool) {
         let mut st = self.lock();
         for s in restored {
             st.insert(s);
+        }
+        for m in modified {
+            if st.modified.len() >= st.cap.max(1) {
+                st.modified.pop_front();
+            }
+            st.modified.push_back(m);
         }
         st.journal = Some(Vec::new());
         st.rewrite = rewrite;
@@ -317,17 +324,18 @@ impl History {
     }
 
     /// Encodes what reaches the disk next with `f`, under the lock: every
-    /// value when the file is rewritten (returns true), else the values
-    /// recorded since the last call.
-    pub fn take_for_disk(&self, mut f: impl FnMut(&Sample)) -> bool {
+    /// value and modification when the file is rewritten (returns true),
+    /// else the values recorded since the last call.
+    pub fn take_for_disk(&self, mut f: impl FnMut(&Sample, Option<&Modified>)) -> bool {
         let mut st = self.lock();
         let st = &mut *st;
         let Some(j) = &mut st.journal else { return false };
         let rewrite = std::mem::take(&mut st.rewrite);
         if rewrite {
-            st.raw.iter().for_each(&mut f);
+            st.raw.iter().for_each(|s| f(s, None));
+            st.modified.iter().for_each(|m| f(&m.sample, Some(m)));
         } else {
-            j.iter().for_each(&mut f);
+            j.iter().for_each(|s| f(s, None));
         }
         j.clear();
         rewrite

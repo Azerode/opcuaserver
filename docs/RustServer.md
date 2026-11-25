@@ -280,7 +280,8 @@ HistoryRead (and, when writable, HistoryWrite) AccessLevel bits.
   temporary file and a rename. At startup the files are read back before the
   server listens; variables added by a reload are restored on the next pass.
   A crash loses at most the last second. The modification log
-  (HistoryModifiedData) is not persisted. Cost: 12.8 -> 17.3 ns per
+  (HistoryModifiedData, with time, type and user) is persisted too: every
+  HistoryUpdate rewrites the file with the values and the log. Cost: 12.8 -> 17.3 ns per
   historized write (dev VM).
 - **Cost:** a write of a variable without history checks one flag stored in
   the padding of the cell's first cache line (no measurable change). A
