@@ -308,6 +308,9 @@ pub fn dispatch(ctx: &mut Ctx, r: &mut Reader, w: &mut Writer) -> u32 {
         _ => Err(status::BAD_SERVICE_UNSUPPORTED),
     };
     if let Err(code) = result {
+        let session_service =
+            matches!(type_id.as_ns0(), Some(ids::CREATE_SESSION_REQUEST | ids::ACTIVATE_SESSION_REQUEST));
+        ctx.server.store.info().diagnostics.rejected(session_service, code);
         w.buf.truncate(start);
         write_fault(w, handle, code);
     }
@@ -853,6 +856,7 @@ fn write_value(w: &mut Writer, space: &AddressSpace, src: &ValueSource, ts: Time
             write_dynamic(w, &Variant::DateTime(now), ts, now)
         }
         ValueSource::ServerStatus => write_dynamic(w, &encode_server_status(&space.info), ts, now_ticks()),
+        ValueSource::Diagnostics(i) => write_dynamic(w, &space.info.diagnostics.value(*i), ts, now_ticks()),
     }
 }
 
@@ -997,6 +1001,7 @@ fn read_range(
                 ValueSource::Static(v) => DataValue::value(v.clone()),
                 ValueSource::CurrentTime => DataValue::value(Variant::DateTime(now_ticks())),
                 ValueSource::ServerStatus => DataValue::value(encode_server_status(&space.info)),
+                ValueSource::Diagnostics(i) => DataValue::value(space.info.diagnostics.value(*i)),
             }
         }
         _ => match attribute_value(node, attribute, can_write) {

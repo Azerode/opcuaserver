@@ -442,6 +442,10 @@ impl Server {
             subs: Mutex::new(SessionSubs::default()),
         });
         sessions.insert(session.token.clone(), session.clone());
+        drop(sessions);
+        let d = &self.store.info().diagnostics;
+        crate::diagnostics::inc(&d.current_sessions);
+        crate::diagnostics::inc(&d.cumulated_sessions);
         Ok(session)
     }
 
@@ -452,6 +456,7 @@ impl Server {
     pub fn remove_session(&self, token: &NodeId) {
         if let Some(s) = self.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(token) {
             s.closed.store(true, Ordering::Release);
+            crate::diagnostics::dec(&self.store.info().diagnostics.current_sessions);
         }
     }
 
@@ -474,7 +479,10 @@ impl Server {
             keep
         });
         drop(sessions);
+        let d = &self.store.info().diagnostics;
         for s in expired {
+            crate::diagnostics::dec(&d.current_sessions);
+            crate::diagnostics::inc(&d.session_timeouts);
             self.session_event(crate::events::types::AUDIT_SESSION_EVENT_TYPE, &s, "Session/Timeout", true, |e| e);
         }
         let mut orphans = self.orphans.lock().unwrap_or_else(|e| e.into_inner());

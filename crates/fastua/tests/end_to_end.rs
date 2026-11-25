@@ -323,3 +323,31 @@ fn ecc_user_name_login() {
     let _ = std::fs::remove_file(&users);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn server_diagnostics_summary() {
+    let dir = temp_config("diagnostics", MACHINE);
+    let addr = start(&dir, Limits::default());
+    let read = |c: &mut Client, id: u32| c.read(&[(NodeId::ns0(id), 13)]).unwrap().remove(0).value.unwrap_or_default();
+    let mut c = Client::connect(&addr, "opc.tcp://x").unwrap();
+    c.create_session("diag").unwrap();
+    assert_eq!(read(&mut c, 2277), Variant::UInt32(1)); // CurrentSessionCount
+    assert_eq!(read(&mut c, 2278), Variant::UInt32(1)); // CumulatedSessionCount
+    let (ty, _) = c.call(999_999, |_| {}).unwrap();
+    assert_eq!(ty, ids::SERVICE_FAULT);
+    assert_eq!(read(&mut c, 2288), Variant::UInt32(1)); // RejectedRequestsCount
+    c.create_subscription(100.0, 30, 10).unwrap();
+    assert_eq!(read(&mut c, 2285), Variant::UInt32(1)); // CurrentSubscriptionCount
+    let Variant::ExtensionObject(x) = read(&mut c, 2275) else { panic!("summary is a structure") };
+    assert_eq!(x.type_id, NodeId::ns0(861));
+    let field = |i: usize| u32::from_le_bytes(x.body[i * 4..i * 4 + 4].try_into().unwrap());
+    assert_eq!((field(1), field(2), field(7), field(8), field(11)), (1, 1, 1, 1, 1));
+    c.close().unwrap();
+
+    let mut c = Client::connect(&addr, "opc.tcp://x").unwrap();
+    c.create_session("diag2").unwrap();
+    assert_eq!(read(&mut c, 2277), Variant::UInt32(1));
+    assert_eq!(read(&mut c, 2278), Variant::UInt32(2));
+    assert_eq!(read(&mut c, 2285), Variant::UInt32(0)); // deleted with its session
+    assert_eq!(read(&mut c, 2286), Variant::UInt32(1));
+}

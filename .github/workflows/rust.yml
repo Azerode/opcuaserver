@@ -23,6 +23,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked
+      - name: Namespace 0 tables match the official nodeset
+        run: |
+          tag=$(sed -n 's/^NODESET_TAG = "\(.*\)"/\1/p' crates/fastua/tools/gen_ns0.py)
+          curl -fsSL -o /tmp/Opc.Ua.NodeSet2.xml \
+            "https://raw.githubusercontent.com/OPCFoundation/UA-Nodeset/$tag/Schema/Opc.Ua.NodeSet2.xml"
+          python3 crates/fastua/tools/gen_ns0.py /tmp/Opc.Ua.NodeSet2.xml
+          git diff --exit-code crates/fastua/data crates/fastua/src/ns0_ref_types.rs
 
   build:
     name: build-${{ matrix.arch }}

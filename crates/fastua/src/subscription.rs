@@ -82,6 +82,8 @@ enum Source {
     Time,
     /// Server_ServerStatus.
     Status,
+    /// A server diagnostics counter.
+    Diag(u8),
     /// A value that never changes (other attributes, constant variables).
     Fixed(Variant),
     /// The node disappeared in a configuration reload.
@@ -380,6 +382,11 @@ impl Item {
                 let now = now_ticks();
                 self.offer(encode_server_status(&space.info), status::GOOD, now, now)
             }
+            Source::Diag(i) => {
+                let Some(space) = space else { return false };
+                let now = now_ticks();
+                self.offer(space.info.diagnostics.value(*i), status::GOOD, now, now)
+            }
             Source::Fixed(v) => {
                 if self.sampled {
                     return false;
@@ -603,6 +610,7 @@ fn resolve(space: &AddressSpace, node: &NodeId, attribute: u32, can_write: bool)
             ValueSource::Static(v) => (Source::Fixed(v.clone()), 0, 0),
             ValueSource::CurrentTime => (Source::Time, 0, 0),
             ValueSource::ServerStatus => (Source::Status, 0, 0),
+            ValueSource::Diagnostics(i) => (Source::Diag(*i), 0, 0),
         });
     }
     // Other attributes do not change while the node exists: read once.
@@ -745,9 +753,26 @@ pub struct Subscription {
     retransmit: VecDeque<Sent>,
     pool: Vec<Vec<u8>>,
     generation: u64,
+    /// Counts this subscription in CurrentSubscriptionCount while it lives.
+    diagnostics: Option<Arc<crate::diagnostics::Diagnostics>>,
+}
+
+impl Drop for Subscription {
+    fn drop(&mut self) {
+        if let Some(d) = &self.diagnostics {
+            crate::diagnostics::dec(&d.current_subscriptions);
+        }
+    }
 }
 
 impl Subscription {
+    /// Counts the subscription in the server diagnostics until it is dropped.
+    pub fn track(&mut self, d: &Arc<crate::diagnostics::Diagnostics>) {
+        crate::diagnostics::inc(&d.current_subscriptions);
+        crate::diagnostics::inc(&d.cumulated_subscriptions);
+        self.diagnostics = Some(d.clone());
+    }
+
     pub fn new(id: u32, params: SubParams, enabled: bool, now: u64) -> Subscription {
         let interval_ns = ms_to_ns(params.interval_ms);
         Subscription {
@@ -772,6 +797,7 @@ impl Subscription {
             retransmit: VecDeque::new(),
             pool: Vec::new(),
             generation: 0,
+            diagnostics: None,
         }
     }
 
@@ -1370,6 +1396,7 @@ impl Subscription {
                         (Source::Cell(a), Source::Cell(b)) => Arc::ptr_eq(a, b),
                         (Source::Fixed(a), Source::Fixed(b)) => a == b,
                         (Source::Time, Source::Time) | (Source::Status, Source::Status) => true,
+                        (Source::Diag(a), Source::Diag(b)) => a == b,
                         _ => false,
                     };
                     if !same {

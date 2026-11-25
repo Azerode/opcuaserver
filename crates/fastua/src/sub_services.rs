@@ -49,7 +49,9 @@ pub(super) fn create_subscription(ctx: &mut Ctx, h: &RequestHeader, r: &mut Read
         return Err(BAD_TOO_MANY_SUBSCRIPTIONS);
     }
     let id = ctx.server.next_subscription_id();
-    st.subs.push(Subscription::new(id, params, enabled, mono_ns()));
+    let mut sub = Subscription::new(id, params, enabled, mono_ns());
+    sub.track(&ctx.server.store.info().diagnostics);
+    st.subs.push(sub);
     drop(st);
     ctx.conn.drive(&s);
     begin(w, ids::CREATE_SUBSCRIPTION_RESPONSE, h);
