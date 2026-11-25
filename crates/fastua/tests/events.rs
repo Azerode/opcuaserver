@@ -159,3 +159,29 @@ fn invalid_event_items() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn write_audit_events() {
+    let (addr, dir) = start("write-audit");
+    let mut c = client(&addr, "auditor");
+    let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
+    let mut writes = MonitorSpec::events(SERVER, 1, &["SourceName", "AttributeId", "OldValue", "NewValue", "Status"]);
+    writes.event_where = vec![(
+        14, // OfType
+        vec![FilterOperand::Literal(Variant::NodeId(Box::new(NodeId::ns0(AUDIT_UPDATE_EVENT_TYPE))))],
+    )];
+    assert_eq!(c.monitor(sub, &[writes]).unwrap()[0].0, status::GOOD);
+    let speed = NodeId::Numeric(2, 1);
+    assert_eq!(c.write(&[(speed.clone(), Variant::Double(1.5))]).unwrap(), vec![status::GOOD]);
+    assert_eq!(c.write(&[(speed.clone(), Variant::Double(2.5))]).unwrap(), vec![status::GOOD]);
+    assert_eq!(c.write(&[(NodeId::Numeric(2, 99), Variant::Double(0.0))]).unwrap(), vec![status::BAD_NODE_ID_UNKNOWN]);
+    let events = of(&collect(&mut c, 1, 3), 1);
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(text(&events[0][0]), "Speed");
+    assert_eq!(events[0][1], Variant::UInt32(13));
+    assert_eq!(events[1][2], Variant::Double(1.5)); // old value
+    assert_eq!(events[1][3], Variant::Double(2.5)); // new value
+    assert_eq!(events[1][4], Variant::Boolean(true));
+    assert_eq!(events[2][4], Variant::Boolean(false));
+    let _ = std::fs::remove_dir_all(&dir);
+}

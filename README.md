@@ -9,14 +9,16 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
 - **Transport:** UA TCP binary (HEL/ACK/ERR, chunking both ways, pipelined requests).
 - **Security:** SecureChannel with SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, in Sign and SignAndEncrypt modes.
   - ECC policies (OPC UA 1.05.04+): ECC_nistP256, ECC_nistP384 and ECC_curve25519, each with AesGcm and ChaChaPoly. They use ephemeral ECDH / X25519 key agreement, HKDF, ECDSA / Ed25519 signatures and AEAD messages, with the SecureChannelEnhancements (channel-bound session signatures, IKM chaining on renewal). A certificate per curve is created in the PKI. Anonymous, X.509 and user name logins work on ECC endpoints; the password travels as an EccEncryptedSecret for an ephemeral key the server sends in CreateSession / ActivateSession.
+  - Deprecated ECC_nistP256 and ECC_nistP384 (1.05.00 to 1.05.03, AES-CBC + HMAC-SHA256 / SHA384, no SecureChannelEnhancements) for older clients, offered only when listed in `--endpoints`.
   - Mutual certificate authentication.
   - Token renewal and lifetime, sequence checks.
   - A PKI with chain, CRL and ApplicationUri validation.
+  - HTTPS transport (`--https-listen`, `opc.https`, https-uabinary): each request is a POST of its binary encoding over TLS (rustls), with the application certificate; sessions, subscriptions and every service work as over opc.tcp (Read round trip +7 µs on loopback). TLS client certificates (`--https-client-certs`, optional by default) are checked against the trust list and bind the session's application certificate.
   - Cryptography: aws-lc-rs.
 - **Users:** anonymous, user name / password (PBKDF2 hashes) and X.509 certificates, with read or read/write rights per user.
 - **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession / Cancel, Read and Write (with index ranges), Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, Call, HistoryRead, HistoryUpdate.
 - **Profile:** ServerProfileArray announces the Standard 2017 UA Server profile (self-assessed against OPC 10000-7; not certified with the OPC Foundation CTT).
-- **Namespace 0:** the complete standard nodeset (5 477 nodes of `Opc.Ua.NodeSet2.xml` 1.05.07), compiled into the binary and merged with the live nodes. No cost per request.
+- **Namespace 0:** the complete standard nodeset (5 477 nodes of `Opc.Ua.NodeSet2.xml` 1.05.07), compiled into the binary and merged with the live nodes, with the DataTypeDefinition attribute of every data type. No cost per request.
 - **Server object:** ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities with OperationLimits and the 1.05 limits (MaxSessions, MaxSubscriptions, ...) from the configured limits, ServerDiagnostics with a live ServerDiagnosticsSummary (session, subscription and rejected request counters), ServerRedundancy, Auditing, and the GetMonitoredItems and ResendData methods.
 - **Subscriptions:** every Subscription and MonitoredItem service.
   - Create / Modify / Delete, SetPublishingMode, Publish, Republish, TransferSubscriptions.
@@ -29,10 +31,12 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
 - **Events:** the Server object is an event notifier.
   - EventFilter select clauses and where clauses (comparisons, Like, Between, InList, And / Or / Not, OfType, bitwise operators), with per clause results.
   - Event queues with both overflow policies and EventQueueOverflow events.
-  - Server events: session audit (create, activate, close, timeout), configuration reloaded (BaseModelChangeEventType) and configuration rejected (SystemEventType).
+  - Server events: session audit (create, activate, close, timeout), write audit (AuditWriteUpdateEventType with old and new values, for every Write operation), history update audit (AuditHistoryValueUpdate / RawModifyDelete / AtTimeDelete), configuration reloaded (BaseModelChangeEventType) and configuration rejected (SystemEventType).
 - **Historical access:** variables marked `Historizing` keep their last values (10 000 by default) in memory.
   - HistoryRead: raw values (with bounds, forward and reverse), modified values, values at given times (interpolated), with continuation points.
   - HistoryUpdate: insert, replace, update, delete a range, delete at times; every change goes to the modified history with its user.
+  - Persistence (`--history-dir DIR`): histories survive restarts. A background thread appends each second's new values to one file per variable; writers never touch the disk (+4.5 ns per historized write).
+  - Event history (`--event-history N`): the Server object keeps the last N events; HistoryRead with ReadEventDetails returns them through an EventFilter (select and where clauses), forward or reverse, with continuation points.
   - HistoryServerCapabilities describes what is supported.
 - **Aggregates:** 37 aggregate functions of Part 13 (averages, time averages, totals, minimum / maximum and their variants, range, count, start / end and bounds, durations in state, transitions, quality durations and percentages, worst quality, standard deviation and variance).
   - HistoryRead with ReadProcessedDetails, any processing interval, forward or reverse, with an AggregateConfiguration.
@@ -40,10 +44,14 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
 - **Alarms and conditions (Part 9):** an item with an `Alarm` gets a condition: an ExclusiveLimitAlarm (HighHigh / High / Low / LowLow limits with a deadband) or an OffNormalAlarm (a normal value).
   - Every write of the variable evaluates its condition; state changes raise condition events with the Active, Acked, Confirmed, Enabled and LimitState fields.
   - Methods Acknowledge, Confirm, AddComment, Enable, Disable, ConditionRefresh and ConditionRefresh2, through Call.
+  - Shelving: TimedShelve, OneShotShelve and Unshelve (and their 1.05 variants with a comment) on the condition's ShelvingState; a timed shelve ends on its own, a one-shot shelve when the alarm returns to normal. Events carry ShelvingState and SuppressedOrShelved.
+  - Suppress / Unsuppress, RemoveFromService / PlaceInService (write rights), Silence and Reset (with `"Latching": true` an alarm stays active until reset), each with its 1.05 variant taking a comment. SuppressedOrShelved covers shelving, suppression and out of service.
+  - Dialogs: an item with a `Dialog` (`Prompt`, `Options`, `Default`, `Ok`, `Cancel`, signed numeric Type) gets a DialogConditionType. Writing a negative value raises the question; Respond / Respond2 write the chosen option index into the variable and close it.
+  - Branches: an alarm active again while its previous occurrence is not acknowledged and confirmed keeps that occurrence as a branch, with its own BranchId and EventId, acknowledged and confirmed on its own and reported by ConditionRefresh.
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: per-session diagnostics arrays, condition branches and shelving, dialog conditions, event history, history persistence across restarts, the deprecated non-AEAD ECC policies, the HTTPS transport (`opc.https`).
+Not yet: the JSON encoding.
 
 ## Build and run
 
@@ -65,7 +73,7 @@ Main options (`fastua --help` lists them all):
 | `--config DIR` | Namespace files, watched for changes (default `config/machines`). |
 | `--listen ADDR:PORT` | Address to bind (default `0.0.0.0:4840`). |
 | `--endpoint URL`, `--application-uri URI` | Advertised endpoint URL and ApplicationUri. |
-| `--endpoints LIST` | Endpoints to offer: `none`, `basic256sha256-sign`, `basic256sha256-encrypt`, `aes128-sign`, `aes128-encrypt`, `aes256-sign`, `aes256-encrypt`, `ecc-<curve>-<cipher>-sign\|encrypt` with curve `nistp256`, `nistp384` or `curve25519` and cipher `aesgcm` or `chachapoly` (default: all). |
+| `--endpoints LIST` | Endpoints to offer: `none`, `basic256sha256-sign`, `basic256sha256-encrypt`, `aes128-sign`, `aes128-encrypt`, `aes256-sign`, `aes256-encrypt`, `ecc-<curve>-<cipher>-sign\|encrypt` with curve `nistp256`, `nistp384` or `curve25519` and cipher `aesgcm` or `chachapoly`, the deprecated `ecc-nistp256-sign\|encrypt` and `ecc-nistp384-sign\|encrypt`, and `default` (default: all but the deprecated ones). |
 | `--pki DIR` | Certificate store (default `pki`). A self-signed certificate is created if missing. |
 | `--users FILE` | Enables user name / password login. |
 | `--anonymous off\|read\|write`, `--x509-users read\|write` | Rights of anonymous users and of certificate users. |
@@ -73,6 +81,11 @@ Main options (`fastua --help` lists them all):
 | `--busy-poll US` | Polls each connection for `US` µs before sleeping. Lowest latency, at the cost of busy cores. Only as many connections spin as there are free cores, so throughput under many clients does not collapse. |
 | `--busy-poll-threads N` | Ceiling on the connections that busy-poll at once (default: cores - 1). |
 | `--min-publishing-interval MS`, `--min-sampling-interval MS` | Fastest subscription intervals (default 1 ms, at least 0.05 ms). |
+| `--https-listen ADDR:PORT`, `--https-endpoint URL` | Also serve the HTTPS transport (`opc.https`); the endpoint URL defaults to `opc.https://<hostname>:<port>`. |
+| `--https-client-certs off\|optional\|required` | TLS client certificates on the HTTPS transport, checked against the application trust list (default: optional). |
+| `--history-dir DIR` | Keep the history of historized variables across restarts (written every second). |
+| `--event-history N` | Keep the last N events for HistoryRead on the Server object (default 0, off). |
+| `--session-diagnostics` | Count requests per session and service for SessionDiagnosticsArray (`EnabledFlag` true). The diagnostics arrays are always readable. |
 
 `echo -n 's3cret' | ./target/release/fastua hash-password` prints a password hash for the users file.
 
@@ -97,7 +110,7 @@ Every `*.json` file in the directory, searched recursively, is one namespace:
 }
 ```
 
-Variables appear under `Objects/<Name>/<group>/<item>`. Supported types are Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float, Double, String, DateTime, Guid and ByteString. A numeric item with an `EURange` (`{"Low": .., "High": ..}` or `[low, high]`) becomes an AnalogItemType variable with an EURange property, which percent deadbands use. `Historizing: true` records every write of the item for HistoryRead; `HistoryCapacity` (default 10 000) bounds the values kept. `Alarm` adds a limit alarm (any of `LowLow`, `Low`, `High`, `HighHigh`, ordered, with an optional `Deadband`) or an off-normal alarm (`Normal`), with a `Severity` (default 500) and a `Message`. Adding, removing or editing a file takes effect about 50 ms later, without a restart.
+Variables appear under `Objects/<Name>/<group>/<item>`. Supported types are Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float, Double, String, DateTime, Guid and ByteString. A numeric item with an `EURange` (`{"Low": .., "High": ..}` or `[low, high]`) becomes an AnalogItemType variable with an EURange property, which percent deadbands use. `Historizing: true` records every write of the item for HistoryRead; `HistoryCapacity` (default 10 000) bounds the values kept. `Alarm` adds a limit alarm (any of `LowLow`, `Low`, `High`, `HighHigh`, ordered, with an optional `Deadband`) or an off-normal alarm (`Normal`), with a `Severity` (default 500), a `Message`, an optional `MaxTimeShelved` (ms) bounding TimedShelve and `Latching`. Adding, removing or editing a file takes effect about 50 ms later, without a restart.
 
 ## Performance
 

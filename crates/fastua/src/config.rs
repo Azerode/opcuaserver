@@ -58,6 +58,8 @@ struct RawItem {
     history_capacity: Option<u32>,
     #[serde(rename = "Alarm", default)]
     alarm: Option<RawAlarm>,
+    #[serde(rename = "Dialog", default)]
+    dialog: Option<RawDialog>,
 }
 
 /// `{"HighHigh": 95, "High": 80, "Low": 10, "LowLow": 5, "Severity": 700}`
@@ -80,6 +82,33 @@ struct RawAlarm {
     message: Option<String>,
     #[serde(rename = "Deadband", default)]
     deadband: f64,
+    /// Longest TimedShelve, in milliseconds.
+    #[serde(rename = "MaxTimeShelved")]
+    max_time_shelved: Option<f64>,
+    #[serde(rename = "Latching", default)]
+    latching: bool,
+}
+
+/// `{"Prompt": "Restart?", "Options": ["Yes", "No"], "Default": 1,
+/// "Ok": 0, "Cancel": 1}`: a DialogConditionType on a signed numeric item.
+#[derive(Deserialize, Debug)]
+struct RawDialog {
+    #[serde(rename = "Prompt")]
+    prompt: String,
+    #[serde(rename = "Options")]
+    options: Vec<String>,
+    #[serde(rename = "Default", default)]
+    default: i32,
+    #[serde(rename = "Ok", default = "minus_one")]
+    ok: i32,
+    #[serde(rename = "Cancel", default = "minus_one")]
+    cancel: i32,
+    #[serde(rename = "Severity")]
+    severity: Option<u16>,
+}
+
+fn minus_one() -> i32 {
+    -1
 }
 
 /// `{"Low": 0, "High": 100}` or `[0, 100]`.
@@ -187,11 +216,18 @@ pub fn parse_file(path: &Path, text: &str) -> Result<NamespaceConfig, String> {
                 }
                 (true, cap) => Some(cap.map_or(crate::history::DEFAULT_CAPACITY, |c| c as usize)),
             };
-            let alarm = match it.alarm {
-                None => None,
-                Some(a) => Some(
+            let alarm = match (it.alarm, it.dialog) {
+                (None, None) => None,
+                (Some(_), Some(_)) => {
+                    return Err(format!("{}: item '{}': Alarm and Dialog are exclusive", path.display(), it.name))
+                }
+                (Some(a), None) => Some(
                     parse_alarm(a, data_type)
                         .map_err(|e| format!("{}: item '{}': Alarm: {e}", path.display(), it.name))?,
+                ),
+                (None, Some(d)) => Some(
+                    parse_dialog(d, data_type)
+                        .map_err(|e| format!("{}: item '{}': Dialog: {e}", path.display(), it.name))?,
                 ),
             };
             items.push(ItemConfig {
@@ -243,7 +279,60 @@ fn parse_alarm(a: RawAlarm, data_type: u8) -> Result<crate::alarms::AlarmConfig,
     if !(1..=1000).contains(&severity) {
         return Err("Severity must be 1..1000".into());
     }
-    Ok(AlarmConfig { kind, severity, message: a.message, deadband: a.deadband })
+    if a.max_time_shelved.is_some_and(|m| !(m > 0.0 && m.is_finite())) {
+        return Err("MaxTimeShelved must be > 0 (milliseconds)".into());
+    }
+    Ok(AlarmConfig {
+        kind,
+        severity,
+        message: a.message,
+        deadband: a.deadband,
+        max_time_shelved_ms: a.max_time_shelved,
+        latching: a.latching,
+    })
+}
+
+fn parse_dialog(d: RawDialog, data_type: u8) -> Result<crate::alarms::AlarmConfig, String> {
+    use crate::alarms::{AlarmConfig, AlarmKind};
+    let signed = matches!(
+        data_type,
+        builtin::SBYTE | builtin::INT16 | builtin::INT32 | builtin::INT64 | builtin::FLOAT | builtin::DOUBLE
+    );
+    if !signed {
+        return Err("a dialog needs a signed numeric Type (negative = question pending)".into());
+    }
+    if d.options.is_empty() {
+        return Err("Options must not be empty".into());
+    }
+    let n = d.options.len() as i32;
+    let check = |v: i32, name: &str, allow_none: bool| {
+        if (0..n).contains(&v) || (allow_none && v == -1) {
+            Ok(())
+        } else {
+            Err(format!("{name} must index Options"))
+        }
+    };
+    check(d.default, "Default", false)?;
+    check(d.ok, "Ok", true)?;
+    check(d.cancel, "Cancel", true)?;
+    let severity = d.severity.unwrap_or(500);
+    if !(1..=1000).contains(&severity) {
+        return Err("Severity must be 1..1000".into());
+    }
+    Ok(AlarmConfig {
+        kind: AlarmKind::Dialog {
+            prompt: d.prompt,
+            options: d.options,
+            default: d.default,
+            ok: d.ok,
+            cancel: d.cancel,
+        },
+        severity,
+        message: None,
+        deadband: 0.0,
+        max_time_shelved_ms: None,
+        latching: false,
+    })
 }
 
 /// Lists config files in a stable order (so namespace indexes assigned on

@@ -15,12 +15,19 @@ const USAGE: &str = "usage: fastua [options]
   --endpoint URL          endpoint URL advertised to clients (default: opc.tcp://<hostname>:<port>)
   --application-uri URI   ApplicationUri of this server (default: urn:<hostname>:fastua)
   --pki DIR               certificate store (default: pki); a self-signed certificate is created if missing
-  --endpoints LIST        comma-separated endpoints to offer (default: all):
+  --https-listen ADDR:PORT   also serve the HTTPS transport (opc.https, https-uabinary)
+                          with the application certificate as TLS certificate
+  --https-endpoint URL    HTTPS endpoint URL advertised (default: opc.https://<hostname>:<port>)
+  --https-client-certs off|optional|required
+                          TLS client certificates, checked against the trust list (default: optional)
+  --endpoints LIST        comma-separated endpoints to offer (default: all but the deprecated ones):
                             none, basic256sha256-sign, basic256sha256-encrypt,
                             aes128-sign, aes128-encrypt, aes256-sign, aes256-encrypt,
                             ecc-<curve>-<cipher>-sign|encrypt with curve nistp256,
                             nistp384 or curve25519 and cipher aesgcm or chachapoly
-                            (e.g. ecc-nistp256-aesgcm-encrypt)
+                            (e.g. ecc-nistp256-aesgcm-encrypt), the deprecated
+                            ecc-nistp256-sign|encrypt, ecc-nistp384-sign|encrypt,
+                            and default (the default list)
   --users FILE            users file enabling user name / password login
   --anonymous off|read|write   rights of anonymous users (default: read)
   --x509-users read|write      rights of users with a trusted certificate (default: write)
@@ -30,7 +37,11 @@ const USAGE: &str = "usage: fastua [options]
   --busy-poll-threads N   at most N connections busy-poll at once, the others sleep
                           (default: cores - 1); fewer when the CPUs are busy
   --min-publishing-interval MS   fastest subscription publishing interval (default: 1, minimum 0.05)
-  --min-sampling-interval MS     fastest monitored item sampling interval (default: 1, minimum 0.05)";
+  --min-sampling-interval MS     fastest monitored item sampling interval (default: 1, minimum 0.05)
+  --history-dir DIR       keep the history of historized variables in DIR across restarts
+                          (written every second by a background thread)
+  --event-history N       keep the last N events for HistoryRead on the Server object (default: 0, off)
+  --session-diagnostics   count requests per session for SessionDiagnosticsArray (EnabledFlag true)";
 
 fn fail(msg: String) -> ! {
     eprintln!("{msg}");
@@ -39,22 +50,28 @@ fn fail(msg: String) -> ! {
 
 fn parse_endpoints(list: &str) -> Vec<(Policy, Mode)> {
     list.split(',')
-        .map(|e| match e.trim().to_ascii_lowercase().as_str() {
-            "none" => (Policy::None, Mode::None),
-            "basic256sha256-sign" => (Policy::Basic256Sha256, Mode::Sign),
-            "basic256sha256-encrypt" => (Policy::Basic256Sha256, Mode::SignAndEncrypt),
-            "aes128-sign" => (Policy::Aes128Sha256RsaOaep, Mode::Sign),
-            "aes128-encrypt" => (Policy::Aes128Sha256RsaOaep, Mode::SignAndEncrypt),
-            "aes256-sign" => (Policy::Aes256Sha256RsaPss, Mode::Sign),
-            "aes256-encrypt" => (Policy::Aes256Sha256RsaPss, Mode::SignAndEncrypt),
-            other => {
-                parse_ecc_endpoint(other).unwrap_or_else(|| fail(format!("unknown endpoint '{other}'\n\n{USAGE}")))
-            }
+        .flat_map(|e| match e.trim().to_ascii_lowercase().as_str() {
+            "default" => ServerConfig::all_endpoints(String::new(), String::new()).endpoints,
+            other => vec![parse_endpoint(other)],
         })
         .collect()
 }
 
-/// `ecc-<curve>-<cipher>-sign|encrypt`.
+fn parse_endpoint(name: &str) -> (Policy, Mode) {
+    match name {
+        "none" => (Policy::None, Mode::None),
+        "basic256sha256-sign" => (Policy::Basic256Sha256, Mode::Sign),
+        "basic256sha256-encrypt" => (Policy::Basic256Sha256, Mode::SignAndEncrypt),
+        "aes128-sign" => (Policy::Aes128Sha256RsaOaep, Mode::Sign),
+        "aes128-encrypt" => (Policy::Aes128Sha256RsaOaep, Mode::SignAndEncrypt),
+        "aes256-sign" => (Policy::Aes256Sha256RsaPss, Mode::Sign),
+        "aes256-encrypt" => (Policy::Aes256Sha256RsaPss, Mode::SignAndEncrypt),
+        other => parse_ecc_endpoint(other).unwrap_or_else(|| fail(format!("unknown endpoint '{other}'\n\n{USAGE}"))),
+    }
+}
+
+/// `ecc-<curve>-<cipher>-sign|encrypt`, or `ecc-<curve>-sign|encrypt` for
+/// the deprecated ECC_nistP256 / ECC_nistP384.
 fn parse_ecc_endpoint(name: &str) -> Option<(Policy, Mode)> {
     let rest = name.strip_prefix("ecc-")?;
     let (suite, mode) = rest.rsplit_once('-')?;
@@ -63,7 +80,7 @@ fn parse_ecc_endpoint(name: &str) -> Option<(Policy, Mode)> {
         "encrypt" => Mode::SignAndEncrypt,
         _ => return None,
     };
-    let suite = fastua::ecc::Suite::ALL.into_iter().find(|s| {
+    let suite = fastua::ecc::Suite::every().find(|s| {
         let uri = s.uri().rsplit_once("#ECC_").map(|(_, n)| n.to_ascii_lowercase().replace('_', "-"));
         uri.as_deref() == Some(suite)
     })?;
@@ -94,6 +111,12 @@ fn main() {
     let mut busy_poll_threads = 0;
     let mut min_publishing: Option<f64> = None;
     let mut min_sampling: Option<f64> = None;
+    let mut event_history = 0usize;
+    let mut session_diagnostics = false;
+    let mut history_dir: Option<PathBuf> = None;
+    let mut https_listen: Option<String> = None;
+    let mut https_endpoint: Option<String> = None;
+    let mut https_clients = fastua::https::ClientAuth::Optional;
 
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("hash-password") {
@@ -142,6 +165,23 @@ fn main() {
                     min_sampling = Some(ms);
                 }
             }
+            "--https-listen" => https_listen = Some(value("--https-listen")),
+            "--https-endpoint" => https_endpoint = Some(value("--https-endpoint")),
+            "--https-client-certs" => {
+                use fastua::https::ClientAuth;
+                https_clients = match value("--https-client-certs").as_str() {
+                    "off" => ClientAuth::Off,
+                    "optional" => ClientAuth::Optional,
+                    "required" => ClientAuth::Required,
+                    v => fail(format!("invalid --https-client-certs '{v}'\n\n{USAGE}")),
+                }
+            }
+            "--history-dir" => history_dir = Some(PathBuf::from(value("--history-dir"))),
+            "--event-history" => {
+                let v = value("--event-history");
+                event_history = v.parse().unwrap_or_else(|_| fail(format!("invalid --event-history '{v}'\n\n{USAGE}")));
+            }
+            "--session-diagnostics" => session_diagnostics = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -163,6 +203,7 @@ fn main() {
     if let Some(ms) = min_sampling {
         limits.min_sampling_interval_ms = ms;
     }
+    limits.event_history = event_history;
     let info = ServerInfo {
         application_uri: app_uri.unwrap_or_else(|| format!("urn:{hostname}:fastua")),
         limits: limits.clone(),
@@ -187,6 +228,13 @@ fn main() {
             fastua::log!("  ns={i} {ns}");
         }
     }
+    if let Some(dir) = &history_dir {
+        let mut p = fastua::persist::Persistence::open(dir)
+            .unwrap_or_else(|e| fail(format!("cannot open history directory {}: {e}", dir.display())));
+        p.pass(&store.load_full());
+        fastua::log!("history persisted in {}", dir.display());
+        p.spawn(store.clone(), std::time::Duration::from_secs(1));
+    }
     if let Err(e) = store.watch() {
         fail(format!("cannot watch {}: {e}", config_dir.display()));
     }
@@ -199,8 +247,21 @@ fn main() {
     config.anonymous = anonymous;
     config.x509_users = x509_users;
     config.busy_poll = busy_poll;
+    config.session_diagnostics = session_diagnostics;
     config.busy_poll_threads = busy_poll_threads;
     config.limits = limits;
+    let https = https_listen.as_ref().map(|addr| {
+        let listener =
+            TcpListener::bind(addr).unwrap_or_else(|e| fail(format!("cannot listen on {addr} (HTTPS): {e}")));
+        let port = addr.rsplit(':').next().unwrap_or("443");
+        let url = https_endpoint.clone().unwrap_or_else(|| format!("opc.https://{hostname}:{port}"));
+        let key = std::fs::read(pki_dir.join("own/private/fastua.pk8"))
+            .unwrap_or_else(|e| fail(format!("cannot read the private key for HTTPS: {e}")));
+        let tls = fastua::https::tls_config(pki.certificate_for(Policy::None), &key, https_clients)
+            .unwrap_or_else(|e| fail(format!("cannot set up TLS: {e}")));
+        config.https_url = Some(url.clone());
+        (listener, tls, url, addr.clone())
+    });
     if !busy_poll.is_zero() {
         fastua::log!("busy-polling connections for {} us before sleeping", busy_poll.as_micros());
     }
@@ -209,6 +270,12 @@ fn main() {
     }
     fastua::log!("listening on {listen}");
     let server = Server::new(store, config, pki, users);
+    if let Some((listener, tls, url, addr)) = https {
+        fastua::log!("endpoint {url} None None (HTTPS)");
+        fastua::log!("listening on {addr} (HTTPS)");
+        let server = server.clone();
+        std::thread::spawn(move || fastua::https::serve(server, listener, tls));
+    }
     if let Err(e) = server.serve(listener) {
         fail(format!("server stopped: {e}"));
     }

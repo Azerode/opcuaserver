@@ -4,12 +4,13 @@
 
 use crate::codec::{Reader, Writer};
 use crate::crypto::{self, ChannelKeys, Mode, Policy, PrivateKey, AES_BLOCK, SYM_SIGNATURE_LEN};
-use crate::ecc::{self, EccKeys, SigningKey, TAG_LEN};
+use crate::ecc::{self, EccKeys, LegacyKeys, SigningKey, TAG_LEN};
 use crate::pki::CertInfo;
 use crate::server::SECURITY_POLICY_NONE;
 use crate::types::*;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 
 pub struct Client {
     stream: TcpStream,
@@ -28,6 +29,111 @@ pub struct Client {
     /// Ask for an ephemeral ECDH key in the next requests (policy URI).
     ecdh: Option<&'static str>,
     sec: Option<Secure>,
+    /// HTTPS transport (`opc.https`) instead of opc.tcp.
+    https: Option<Box<Https>>,
+}
+
+/// An HTTPS connection: each request is a POST of its binary encoding.
+struct Https {
+    tls: std::io::BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>,
+    host: String,
+    line: String,
+    /// TLS client certificate, sent again in CreateSession.
+    cert: Option<Vec<u8>>,
+}
+
+/// Accepts exactly one server certificate (the tests pin the server's).
+#[derive(Debug)]
+struct Pinned {
+    cert: Vec<u8>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.cert.as_slice() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+impl Https {
+    fn post(&mut self, body: &[u8]) -> io::Result<()> {
+        let head = format!(
+            "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+            self.host,
+            body.len()
+        );
+        let s = self.tls.get_mut();
+        s.write_all(head.as_bytes())?;
+        s.write_all(body)?;
+        s.flush()
+    }
+
+    /// Reads one HTTP response into `rx`, after 16 zero bytes standing for
+    /// the security and sequence headers of a MSG chunk.
+    fn read(&mut self, rx: &mut Vec<u8>) -> io::Result<()> {
+        use std::io::BufRead;
+        let mut length = None;
+        let mut status = String::new();
+        loop {
+            self.line.clear();
+            if self.tls.read_line(&mut self.line)? == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let l = self.line.trim_end();
+            if status.is_empty() {
+                status = l.to_string();
+                continue;
+            }
+            if l.is_empty() {
+                break;
+            }
+            if let Some((n, v)) = l.split_once(':') {
+                if n.eq_ignore_ascii_case("content-length") {
+                    length = v.trim().parse::<usize>().ok();
+                }
+            }
+        }
+        if !status.contains(" 200 ") {
+            return Err(invalid(&format!("HTTP: {status}")));
+        }
+        let n = length.ok_or_else(|| invalid("no Content-Length"))?;
+        rx.clear();
+        rx.resize(16 + n, 0);
+        self.tls.read_exact(&mut rx[16..])
+    }
 }
 
 /// Client side of a secure channel.
@@ -41,6 +147,8 @@ struct Secure {
     /// ECC: channel keys (server view: we seal with `remote`, open with
     /// `local`), IKM accumulator and ChannelThumbprint.
     ecc_keys: Option<EccKeys>,
+    /// Deprecated ECC policies (server view, like `ecc_keys`).
+    legacy_keys: Option<LegacyKeys>,
     ikm: Vec<u8>,
     thumbprint: Vec<u8>,
 }
@@ -107,6 +215,7 @@ impl Client {
             server,
             keys: None,
             ecc_keys: None,
+            legacy_keys: None,
             ikm,
             thumbprint: Vec::new(),
         };
@@ -131,6 +240,7 @@ impl Client {
             spin: false,
             ecdh: None,
             sec,
+            https: None,
         };
         let mut w = Writer::new(&mut c.tx);
         w.raw(b"HELF");
@@ -152,7 +262,84 @@ impl Client {
         Ok(c)
     }
 
+    /// Connects over HTTPS (`opc.https`) to `addr`, accepting only the
+    /// server certificate `server_cert` (DER).
+    pub fn connect_https(addr: &str, host: &str, server_cert: &[u8]) -> io::Result<Client> {
+        Self::connect_https_as(addr, host, server_cert, None)
+    }
+
+    /// Like [`Client::connect_https`], presenting `client` (certificate DER,
+    /// PKCS#8 key) as TLS client certificate; CreateSession then sends it
+    /// as the client certificate.
+    pub fn connect_https_as(
+        addr: &str,
+        host: &str,
+        server_cert: &[u8],
+        client: Option<(&[u8], &[u8])>,
+    ) -> io::Result<Client> {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = Arc::new(Pinned { cert: server_cert.to_vec(), provider: provider.clone() });
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier);
+        let config = match client {
+            None => builder.with_no_client_auth(),
+            Some((cert, key)) => builder
+                .with_client_auth_cert(
+                    vec![CertificateDer::from(cert.to_vec())],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec())),
+                )
+                .map_err(io::Error::other)?,
+        };
+        let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| invalid("bad host name"))?;
+        let conn = rustls::ClientConnection::new(Arc::new(config), name).map_err(io::Error::other)?;
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        let tls = rustls::StreamOwned::new(conn, stream.try_clone()?);
+        Ok(Client {
+            stream,
+            channel_id: 0,
+            token_id: 0,
+            seq: 1,
+            last_rx_seq: 0,
+            request_id: 1,
+            handle: 1,
+            auth_token: NodeId::NULL,
+            tx: Vec::with_capacity(65536),
+            rx: Vec::with_capacity(65536),
+            spin: false,
+            ecdh: None,
+            sec: None,
+            https: Some(Box::new(Https {
+                tls: std::io::BufReader::new(tls),
+                host: host.to_string(),
+                line: String::new(),
+                cert: client.map(|(c, _)| c.to_vec()),
+            })),
+        })
+    }
+
+    /// Sends MSG chunks: as they are over opc.tcp, one POST of each body
+    /// over HTTPS.
+    fn transmit(&mut self, tx: &[u8]) -> io::Result<()> {
+        let Some(h) = &mut self.https else { return self.stream.write_all(tx) };
+        let mut at = 0;
+        while at + 24 <= tx.len() {
+            let size = u32::from_le_bytes(tx[at + 4..at + 8].try_into().unwrap()) as usize;
+            h.post(&tx[at + 24..at + size])?;
+            at += size;
+        }
+        Ok(())
+    }
+
     fn read_chunk(&mut self) -> io::Result<([u8; 3], u8)> {
+        if let Some(h) = &mut self.https {
+            h.read(&mut self.rx)?;
+            return Ok((*b"MSG", b'F'));
+        }
         let mut hdr = [0u8; 8];
         if self.spin {
             // Wait for data without sleeping; MSG_PEEK leaves it in the socket.
@@ -203,6 +390,23 @@ impl Client {
             }
             self.rx.truncate(end);
             self.last_rx_seq = u32::from_le_bytes(self.rx[8..12].try_into().unwrap());
+            return Ok(());
+        }
+        if let Some(k) = &sec.legacy_keys {
+            let k = &k.local;
+            if sec.mode == Mode::SignAndEncrypt {
+                k.decrypt(&mut self.rx[8..]).map_err(|_| bad())?;
+            }
+            let end = self.rx.len().checked_sub(k.sig_len()).filter(|&e| e >= 16).ok_or_else(bad)?;
+            if !k.verify_parts(&[hdr, &self.rx[..end]], &self.rx[end..]) {
+                return Err(invalid("response signature invalid"));
+            }
+            let end = if sec.mode == Mode::SignAndEncrypt {
+                8 + crate::channel::strip_padding(&self.rx[8..end], false).ok_or_else(bad)?
+            } else {
+                end
+            };
+            self.rx.truncate(end);
             return Ok(());
         }
         let keys = &sec.keys.as_ref().ok_or_else(|| invalid("no keys"))?.local;
@@ -352,7 +556,7 @@ impl Client {
                 let end = self.rx.len().checked_sub(suite.signature_len()).ok_or_else(p)?;
                 let mut signed = hdr.to_vec();
                 signed.extend_from_slice(&self.rx[..end]);
-                let first = sec.thumbprint.is_empty();
+                let first = sec.thumbprint.is_empty() && suite.is_aead();
                 if first {
                     signed.extend_from_slice(&request_sig);
                 }
@@ -394,6 +598,12 @@ impl Client {
         let server_nonce = r.bytes().map_err(|_| p())?.unwrap_or(&[]).to_vec();
         if let Some(sec) = &mut self.sec {
             match (policy.ecc(), eph) {
+                (Some(suite), Some(eph)) if !suite.is_aead() => {
+                    let secret = eph.agree(suite, &server_nonce).map_err(|_| p())?;
+                    let encrypt = mode == Mode::SignAndEncrypt;
+                    let keys = LegacyKeys::derive(suite, &secret, &client_nonce, &server_nonce, encrypt);
+                    sec.legacy_keys = Some(keys.map_err(|_| p())?);
+                }
                 (Some(suite), Some(eph)) => {
                     let secret = eph.agree(suite, &server_nonce).map_err(|_| p())?;
                     let keys = EccKeys::derive(suite, &mut sec.ikm, &secret, &client_nonce, &server_nonce);
@@ -412,7 +622,7 @@ impl Client {
         let mut tx = std::mem::take(&mut self.tx);
         tx.clear();
         self.push_request(&mut tx, request_type, body);
-        let r = self.stream.write_all(&tx);
+        let r = self.transmit(&tx);
         self.tx = tx;
         r?;
         self.read_response()
@@ -449,12 +659,14 @@ impl Client {
             self.handle += 1;
             return;
         }
+        let legacy = self.sec.as_ref().and_then(|s| s.legacy_keys.as_ref());
+        let sym_sig = legacy.map_or(SYM_SIGNATURE_LEN, |k| k.remote.sig_len());
         if mode == Mode::SignAndEncrypt {
             let plain = tx.len() - start - SYM_CLEAR_LEN;
-            let (pad, _) = crypto::padding(plain, SYM_SIGNATURE_LEN, AES_BLOCK, false);
+            let (pad, _) = crypto::padding(plain, sym_sig, AES_BLOCK, false);
             tx.extend(std::iter::repeat_n(pad as u8, pad + 1));
         }
-        let sig_len = if mode == Mode::None { 0 } else { SYM_SIGNATURE_LEN };
+        let sig_len = if mode == Mode::None { 0 } else { sym_sig };
         let size = (tx.len() - start + sig_len) as u32;
         let h = &mut tx[start..start + 24];
         h[0..4].copy_from_slice(b"MSGF");
@@ -466,7 +678,13 @@ impl Client {
         self.seq += 1;
         self.request_id += 1;
         self.handle += 1;
-        if mode != Mode::None {
+        if let (Some(k), true) = (legacy, mode != Mode::None) {
+            let sig = k.remote.sign_parts(&[&tx[start..]]);
+            tx.extend_from_slice(sig.as_ref());
+            if mode == Mode::SignAndEncrypt {
+                k.remote.encrypt(&mut tx[start + SYM_CLEAR_LEN..]).expect("encrypt");
+            }
+        } else if mode != Mode::None {
             let keys = &self.sec.as_ref().unwrap().keys.as_ref().expect("channel keys").remote;
             let sig = keys.sign(&tx[start..]);
             tx.extend_from_slice(&sig);
@@ -503,7 +721,7 @@ impl Client {
         for _ in 0..n {
             self.push_request(&mut tx, ids::READ_REQUEST, |w| Self::read_body(w, items));
         }
-        self.stream.write_all(&tx)?;
+        self.transmit(&tx)?;
         (0..n).map(|_| self.parse_read_response()).collect()
     }
 
@@ -543,7 +761,10 @@ impl Client {
         self.ecdh = if user.is_some() { ecc_suite.map(|s| s.uri()) } else { None };
         let mut client_nonce = [0u8; 32];
         crate::server::random_bytes(&mut client_nonce);
-        let cert = self.sec.as_ref().map(|s| s.cert.clone());
+        let cert = match &self.sec {
+            Some(s) => Some(s.cert.clone()),
+            None => self.https.as_ref().and_then(|h| h.cert.clone()),
+        };
         let (ty, body) = self.call(ids::CREATE_SESSION_REQUEST, |w| {
             w.string("urn:fastua:test-client");
             w.str(None);
@@ -589,6 +810,18 @@ impl Client {
         let username_policy = token_policy(1, crate::server::USERNAME_POLICY_ID);
 
         let signature = match &self.sec {
+            Some(sec) if sec.policy.ecc().is_some_and(|s| !s.is_aead()) => {
+                // Deprecated policies: the RSA-style data, no algorithm.
+                let suite = sec.policy.ecc().unwrap();
+                r.array(0, |r| r.bytes().map(|_| ())).map_err(|_| invalid("bad software certificates"))?;
+                r.str().map_err(|_| invalid("bad signature"))?;
+                let server_sig = r.bytes().map_err(|_| invalid("bad signature"))?.unwrap_or(&[]).to_vec();
+                suite
+                    .verify(&sec.server.rsa_public_key, &[&sec.cert[..], &client_nonce].concat(), &server_sig)
+                    .map_err(|_| invalid("server signature invalid"))?;
+                let data = [&sec.server.der[..], &server_nonce].concat();
+                Some((None, sec.ecc().sign(&data).map_err(|_| invalid("signing failed"))?))
+            }
             Some(sec) if sec.policy.is_ecc() => {
                 // Channel-bound signatures (SecureChannelEnhancements).
                 let suite = sec.policy.ecc().unwrap();
@@ -675,7 +908,7 @@ impl Client {
         let mut tx = std::mem::take(&mut self.tx);
         tx.clear();
         self.push_request(&mut tx, request_type, body);
-        let r = self.stream.write_all(&tx);
+        let r = self.transmit(&tx);
         self.tx = tx;
         r
     }
@@ -810,7 +1043,7 @@ impl Client {
         let mut tx = std::mem::take(&mut self.tx);
         tx.clear();
         self.push_request(&mut tx, ids::READ_REQUEST, |w| Self::read_body(w, items));
-        let r = self.stream.write_all(&tx);
+        let r = self.transmit(&tx);
         self.tx = tx;
         r?;
         self.parse_read_response()
@@ -880,6 +1113,17 @@ impl Client {
                 let (type_id, _, data) = r.extension_object_raw()?;
                 let mut d = Reader::new(data);
                 let ty = type_id.as_ns0().unwrap_or(0);
+                if ty == ids::HISTORY_EVENT_ENCODING {
+                    let events = d.array(4, |r| r.array(1, |r| r.variant()))?;
+                    return Ok(HistoryResult {
+                        status: code,
+                        continuation_point: cp,
+                        type_id: ty,
+                        values: Vec::new(),
+                        modifications: Vec::new(),
+                        events,
+                    });
+                }
                 let (values, mods) = match ty {
                     0 => (Vec::new(), Vec::new()),
                     _ => {
@@ -894,7 +1138,14 @@ impl Client {
                         (values, mods)
                     }
                 };
-                Ok(HistoryResult { status: code, continuation_point: cp, type_id: ty, values, modifications: mods })
+                Ok(HistoryResult {
+                    status: code,
+                    continuation_point: cp,
+                    type_id: ty,
+                    values,
+                    modifications: mods,
+                    events: Vec::new(),
+                })
             })
             .map_err(bad)?;
         Ok(Ok(results))
@@ -1007,6 +1258,8 @@ pub struct HistoryResult {
     pub values: Vec<DataValue>,
     /// (modification time, HistoryUpdateType, user name).
     pub modifications: Vec<(i64, u32, String)>,
+    /// HistoryEvent: the selected fields of each event.
+    pub events: Vec<Vec<Variant>>,
 }
 
 /// EndpointDescription: (security policy URI, security mode, user token
@@ -1073,7 +1326,6 @@ fn ecc_secret(suite: ecc::Suite, sec: &Secure, receiver: &[u8], nonce: &[u8], se
     let e = |_| invalid("EccEncryptedSecret");
     let eph = ecc::Ephemeral::generate(suite).map_err(e)?;
     let sender = eph.public.clone();
-    let keys = eph.secret_keys(suite, receiver, &sender, receiver).map_err(e)?;
     let mut plain = Vec::new();
     {
         let mut w = Writer::new(&mut plain);
@@ -1099,11 +1351,18 @@ fn ecc_secret(suite: ecc::Suite, sec: &Secure, receiver: &[u8], nonce: &[u8], se
     w.bytes(Some(&sender));
     w.bytes(Some(receiver));
     let payload_at = w.len();
-    let len = (payload_at + plain.len() + ecc::TAG_LEN + suite.signature_len() - 9) as u32;
+    let tag_len = if suite.is_aead() { ecc::TAG_LEN } else { 0 };
+    let len = (payload_at + plain.len() + tag_len + suite.signature_len() - 9) as u32;
     w.patch_u32(5, len);
-    let tag = keys.seal(0, 0, &out, &mut plain).map_err(e)?;
-    out.extend_from_slice(&plain);
-    out.extend_from_slice(&tag);
+    if suite.is_aead() {
+        let keys = eph.secret_keys(suite, receiver, &sender, receiver).map_err(e)?;
+        let tag = keys.seal(0, 0, &out, &mut plain).map_err(e)?;
+        out.extend_from_slice(&plain);
+        out.extend_from_slice(&tag);
+    } else {
+        eph.secret_cbc(suite, receiver, &sender, receiver).map_err(e)?.encrypt(&mut plain).map_err(e)?;
+        out.extend_from_slice(&plain);
+    }
     let sig = sec.ecc().sign(&out).map_err(e)?;
     out.extend_from_slice(&sig);
     Ok(out)
@@ -1210,6 +1469,18 @@ impl MonitorSpec {
             event_select: Some(fields.iter().map(|f| f.to_string()).collect()),
             ..MonitorSpec::value(node, handle)
         }
+    }
+
+    /// An encoded ReadEventDetails (for [`Client::history_read`]) selecting
+    /// the `event_select` fields of the events matching `event_where`.
+    pub fn read_event_details(&self, max: u32, start: i64, end: i64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut w = Writer::new(&mut buf);
+        w.u32(max);
+        w.i64(start);
+        w.i64(end);
+        self.write_event_filter(&mut w);
+        buf
     }
 
     fn write_event_filter(&self, w: &mut Writer) {

@@ -99,6 +99,9 @@ Server object).
 - `tools/gen_ns0.py` compiles the nodeset into `data/ns0.bin` (attributes,
   static values in UA binary, references) and `src/ns0_ref_types.rs` (the
   reference type hierarchy). The binary embeds the table: no file to ship.
+- Every DataType carries its DataTypeDefinition attribute (StructureDefinition
+  or EnumDefinition, 1.04+), so generic clients can decode the structures
+  without the deprecated type dictionaries.
 - On each build of the address space, fastua first creates the nodes it serves
   live values for (ServerStatus, capabilities, history, alarms...), then merges
   the table: missing nodes and references are added, a node keeps one type
@@ -116,8 +119,19 @@ live: current and cumulated sessions and subscriptions, rejected and
 security-rejected sessions (failed CreateSession / ActivateSession) and
 requests (any other ServiceFault), session timeouts. They are relaxed atomics
 touched only when a session or subscription starts or ends, or a request is
-rejected, never on a successful Read, Write or Publish. Per-session
-diagnostics are not collected (`EnabledFlag` is false, their arrays are empty).
+rejected, never on a successful Read, Write or Publish.
+
+`SessionDiagnosticsArray`, `SessionSecurityDiagnosticsArray` and
+`SubscriptionDiagnosticsArray` are encoded when read, from the live sessions:
+client description, endpoint, timeouts, connection and last contact times,
+subscription, monitored item and queued Publish counts, identity history,
+security policy and mode, client certificate, and for each subscription its
+parameters, keep-alive and lifetime counters, unacknowledged messages, item
+counts and next sequence number. Request counters (total, errors,
+unauthorized, and one per service) are kept only with `--session-diagnostics`,
+which sets `EnabledFlag`: each request then costs two relaxed atomic adds on
+the session's counters (a cold path, skipped by one branch otherwise).
+Counters the server does not track (republish, transfer, late publish) are 0.
 
 ## Subscriptions
 
@@ -196,6 +210,14 @@ EventNotifier attribute with an EventFilter receives every server event.
   - Session audit: `Session/CreateSession`, `Session/ActivateSession` (also on
     failure, with `Status = false`), `Session/CloseSession` and
     `Session/Timeout`, with SessionId, ClientUserId and the subtype's fields.
+  - Write audit: one AuditWriteUpdateEventType per Write operation, successful
+    or not (`Status`), with AttributeId, IndexRange, OldValue and NewValue; the
+    source is the written node. Only built while someone subscribes to events:
+    otherwise a Write pays one relaxed atomic load.
+  - History update audit: AuditHistoryValueUpdateEventType (insert / replace /
+    update, PerformInsertReplace), AuditHistoryRawModifyDeleteEventType and
+    AuditHistoryAtTimeDeleteEventType, with UpdatedNode and
+    ParameterDataTypeId. OldValues / NewValues are not filled.
   - Configuration reloaded: BaseModelChangeEventType, severity 100.
   - Configuration rejected: SystemEventType, severity 700, the parse error in
     the Message.
@@ -245,8 +267,33 @@ HistoryRead (and, when writable, HistoryWrite) AccessLevel bits.
   resume, so they use no server memory and never run out
   (MaxHistoryContinuationPoints is 0, no limit). A read returns at most
   10 000 values per node (MaxReturnDataValues).
-- **Not yet:** event history (ReadEventDetails returns
-  `BadHistoryOperationUnsupported`) and annotations.
+- **HistoryRead, ReadEventDetails:** with `--event-history N` the Server
+  object (EventNotifier SubscribeToEvents | HistoryRead) records the last N
+  events it notifies (ConditionRefresh replays excluded), even with no
+  subscription. The EventFilter select clause picks the fields and its where
+  clause the events; the time range works like raw reads (forward, reverse,
+  or the newest `NumValuesPerNode` up to an end time). Continuation points
+  carry the sequence number of the next event; events dropped from the
+  history in between are skipped. AccessHistoryEventsCapability,
+  MaxReturnEventValues (10 000) and MaxNodesPerHistoryReadEvents follow the
+  option. Recording costs one short mutex and a push per event; a read
+  encodes the selected fields straight from the stored events under that
+  lock, with no copy.
+- **Not yet:** annotations, HistoryUpdate of events.
+- **Persistence (`--history-dir DIR`):** each historized variable has a file
+  named by a hash of its namespace URI and identifier (so namespace index
+  changes do not matter). Writers never touch the disk: a recorded value is
+  also pushed into a journal under the history lock they already take (once
+  per 32 inline writes). A background thread wakes every second, encodes each
+  journal under that lock, appends it to the file and syncs it. HistoryUpdate
+  changes, a damaged file (torn last record, other type) or a file holding
+  more than twice the capacity make the next pass rewrite the file through a
+  temporary file and a rename. At startup the files are read back before the
+  server listens; variables added by a reload are restored on the next pass.
+  A crash loses at most the last second. The modification log
+  (HistoryModifiedData, with time, type and user) is persisted too: every
+  HistoryUpdate rewrites the file with the values and the log. Cost: 12.8 -> 17.3 ns per
+  historized write (dev VM).
 - **Cost:** a write of a variable without history checks one flag stored in
   the padding of the cell's first cache line (no measurable change). A
   historized write adds a short uncontended mutex and a push into the ring,
@@ -331,10 +378,48 @@ An item with an `Alarm` gets a condition object `<Name>Alarm`
   (or one event item) only. RefreshStart and RefreshEnd go through whatever
   the where clause is, so a client filtering on its alarm types still sees
   them.
+- **Shelving (Part 9 §5.8.10):** each condition has a ShelvingState object
+  (`ns=<ns>;s=__alarm/<NodeId>/ShelvingState`, ShelvedStateMachineType).
+  TimedShelve (ShelvingTime in ms), OneShotShelve and Unshelve, plus the
+  1.05 TimedShelve2 / OneShotShelve2 / Unshelve2 with a comment, are called
+  on it (or on the condition). A timed shelve ends by itself (checked every
+  second); a one-shot shelve ends when the alarm returns to normal. Errors:
+  `BadConditionAlreadyShelved`, `BadConditionNotShelved`,
+  `BadShelvingTimeOutOfRange` (not positive, or above the item's
+  `MaxTimeShelved`). Events carry ShelvingState/CurrentState (and Id),
+  LastTransition (Id, TransitionTime), UnshelveTime (ms left),
+  SuppressedOrShelved and MaxTimeShelved. A shelved alarm still raises its
+  events: clients hide it on SuppressedOrShelved.
+- **Suppression, service, silence, latch (Part 9 §5.8.2):** Suppress /
+  Unsuppress and RemoveFromService / PlaceInService (write rights) set
+  SuppressedState and OutOfServiceState; Silence sets SilenceState until the
+  next occurrence; with `"Latching": true` LatchedState is set when the
+  alarm becomes active and keeps it active until Reset, which needs the
+  value back to normal (`BadInvalidState` otherwise). The 1.05 variants
+  (Suppress2, ..., Reset2) take a comment. A call that changes nothing
+  reports nothing. SuppressedOrShelved is true when shelved, suppressed or
+  out of service; the events still go out.
+- **Dialogs (DialogConditionType, Part 9 §5.6):** an item with
+  `"Dialog": {"Prompt": "Restart?", "Options": ["Yes", "No"], "Default": 1,
+  "Ok": 0, "Cancel": 1}` (signed numeric Type) gets a condition
+  `<Name>Dialog`. The application raises the question by writing a negative
+  value; Respond (or Respond2 with a comment) checks the option index
+  (`BadDialogNotActive`, `BadDialogResponseInvalid`) and writes it into the
+  variable, which closes the dialog. Writing any value >= 0 also closes it
+  (the application answered or withdrew it). Events carry DialogState,
+  Prompt, ResponseOptionSet, Default / Ok / CancelResponse and LastResponse.
+- **Branches (Part 9 §4.4):** an alarm that becomes active again while its
+  previous occurrence is not yet acknowledged and confirmed keeps that
+  occurrence as a branch (a more severe limit is the same occurrence). The
+  branch is reported at once with its BranchId, keeps its state and its own
+  EventIds: Acknowledge, Confirm and AddComment with a branch's EventId act
+  on it only. Once acknowledged and confirmed it is reported with Retain
+  false and deleted. ConditionRefresh reports retained branches after their
+  condition; disabling a condition drops them; at most 64 per condition.
 - **Reloads:** condition states survive reloads; new limits or severity
   apply at the next evaluation; a removed alarm disappears.
 
-Not yet: branches, shelving, suppression, dialog conditions and the
+Not yet: the
 condition's state variables as browsable nodes (their values travel in the
 events).
 
@@ -342,7 +427,7 @@ events).
 
 ### Endpoints
 
-By default the server offers nineteen endpoints. Use `--endpoints` to choose a subset (comma-separated):
+By default the server offers nineteen endpoints. Use `--endpoints` to choose a subset (comma-separated; `default` stands for the default list, so `default,ecc-nistp256-encrypt` adds one deprecated endpoint):
 
 | Name | SecurityPolicy | Mode |
 |---|---|---|
@@ -356,6 +441,8 @@ By default the server offers nineteen endpoints. Use `--endpoints` to choose a s
 | `ecc-nistp384-chachapoly-sign`, `…-encrypt` | ECC_nistP384_ChaChaPoly | Sign / SignAndEncrypt |
 | `ecc-curve25519-aesgcm-sign`, `…-encrypt` | ECC_curve25519_AesGcm | Sign / SignAndEncrypt |
 | `ecc-curve25519-chachapoly-sign`, `…-encrypt` | ECC_curve25519_ChaChaPoly | Sign / SignAndEncrypt |
+| `ecc-nistp256-sign`, `ecc-nistp256-encrypt` | ECC_nistP256 (deprecated, not offered by default) | Sign / SignAndEncrypt |
+| `ecc-nistp384-sign`, `ecc-nistp384-encrypt` | ECC_nistP384 (deprecated, not offered by default) | Sign / SignAndEncrypt |
 
 Cryptography is provided by aws-lc-rs: RSA-OAEP, PKCS#1 v1.5 and PSS signatures, AES-CBC, HMAC-SHA256 and P_SHA256. Client keys of 2048 to 4096 bits are accepted.
 
@@ -366,6 +453,13 @@ The ECC policies follow OPC UA 1.05.04 and later with the SecureChannelEnhanceme
 - **Messages:** AES-GCM (128-bit for P-256 and curve25519, 256-bit for P-384) or ChaCha20-Poly1305, with a 16-byte tag and no padding. The IV is the derived IV masked with the TokenId and the previous sequence number. Sign mode authenticates the whole chunk. Sequence numbers start at 0 and wrap from 2³²−1 to 0.
 - **Channel binding:** the server signs its first OpenSecureChannel response together with the client's request signature; that signature is the ChannelThumbprint, prepended to the CreateSession and ActivateSession signatures, which cover certificate hashes instead of certificates. The SignatureData algorithm is left empty.
 - **Users:** anonymous, X.509 (a user certificate on the policy's curve) and user name. When the client asks for it (`ECDHPolicyUri` in the request's AdditionalHeader), CreateSession and ActivateSession return a fresh ephemeral key signed with our key (`ECDHKey`). The password comes back as an EccEncryptedSecret: signed by the client's application key, AEAD-encrypted with keys from ECDH with that ephemeral key and HKDF (label `opcua-secret`), and bound to the session's server nonce. Each ephemeral key decrypts one secret.
+
+The deprecated ECC_nistP256 and ECC_nistP384 (OPC UA 1.05.00 to 1.05.03) are offered only when listed in `--endpoints`, for older clients. They share the OpenSecureChannel, nonces, HKDF and ephemeral keys above, without the SecureChannelEnhancements:
+
+- **Keys:** HKDF over each exchange's shared secret (no IKM chaining): signing key ‖ encrypting key ‖ IV, the signing key alone in Sign mode (L counts only what is derived).
+- **Messages:** like the RSA policies: AES-128-CBC with HMAC-SHA256 (P-256) or AES-256-CBC with HMAC-SHA384 (P-384, 48-byte signatures), PKCS-style padding when encrypting. Sequence numbers as for the AEAD policies.
+- **Sessions:** the RSA-style signatures (client certificate ‖ client nonce, server certificate ‖ server nonce) made with ECDSA, no ChannelThumbprint; the EccEncryptedSecret payload is AES-CBC encrypted, without a tag.
+- **Interoperability:** checked in CI against the open62541 client (anonymous, X.509 and user name logins, both modes, token renewal), like the AEAD policies.
 
 ### Certificates (`--pki DIR`, default `pki`)
 
@@ -417,9 +511,44 @@ cc crates/fastua/tests/interop/open62541_ecc.c -lopen62541 -lssl -lcrypto -o ope
 crates/fastua/tests/interop/open62541_ecc.sh target/release/fastua config/machines ./open62541_ecc
 ```
 
+### HTTPS transport
+
+`--https-listen ADDR:PORT` adds an `opc.https` endpoint (transport profile
+https-uabinary, Part 6 §7.4), listed by GetEndpoints and CreateSession with
+SecurityPolicy None: TLS (rustls with aws-lc-rs, TLS 1.2 and 1.3) protects
+the messages, with the application certificate and key of the PKI as TLS
+certificate. User tokens are protected as on the unsecured opc.tcp
+endpoint. GetEndpoints filters on the transport profiles a client asks for.
+
+- Each HTTP/1.1 POST carries one binary encoded request (type NodeId and
+  body, no chunk framing) and gets the binary encoded response; keep-alive
+  connections, requests answered in order. A body larger than
+  MaxMessageSize gets 413, a request without Content-Length 411, any other
+  method 405.
+- A TLS connection is a virtual secure channel: a session belongs to the
+  connection that activated it (ActivateSession on another connection moves
+  it, as on opc.tcp).
+- Publish holds its HTTP response until a notification or a keep-alive is
+  due; the connection evaluates its subscriptions meanwhile (clients keep a
+  Publish outstanding, usually on a connection of its own).
+- Cost: a one-value Read round trip on loopback is 41 µs over HTTPS against
+  34 µs over opc.tcp (dev VM, `cargo test --release --test https latency --
+  --ignored --nocapture`). opc.tcp stays the fast path.
+- TLS client certificates (`--https-client-certs off|optional|required`,
+  default optional): the server asks for one during the handshake. A
+  certificate the client presents is checked against the application trust
+  list (`pki/trusted`, CRLs, `--trust-all-clients`) once the connection is
+  up; a rejected one gets 403 and the connection closes. An accepted one is
+  the connection's client certificate: CreateSession must send the same
+  certificate and its ApplicationUri (BadSecurityChecksFailed /
+  BadCertificateUriInvalid), ActivateSession needs no client signature (the
+  handshake proved the key), and the session diagnostics show it.
+- Not supported: chunked request bodies, the JSON encoding.
+
 ## Scope
 
-Implemented: UA TCP (HEL/ACK/ERR, chunking both ways), SecureChannel with
+Implemented: UA TCP (HEL/ACK/ERR, chunking both ways), HTTPS
+(https-uabinary, see [HTTPS transport](#https-transport)), SecureChannel with
 SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep,
 Aes256_Sha256_RsaPss and the six ECC AEAD policies in Sign and SignAndEncrypt
 modes (issue/renew, token
@@ -436,6 +565,3 @@ with OperationLimits, every Subscription and MonitoredItem service (see
 those elements are compared and reported, through the Variant path) and events with session audit (see
 [Events](#events)), alarms and conditions (see
 [Alarms and conditions](#alarms-and-conditions)).
-
-Not yet: condition branches and shelving, event history,
-history persistence across restarts, the deprecated non-AEAD ECC policies.

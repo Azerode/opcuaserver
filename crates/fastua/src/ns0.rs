@@ -58,7 +58,11 @@ fn node(r: &mut Reader) -> DResult<Ns0Node> {
             let symmetric = r.u8()? != 0;
             NodeKind::ReferenceType { is_abstract, symmetric, inverse_name: opt_text(r)? }
         }
-        64 => NodeKind::DataType { is_abstract: r.u8()? != 0 },
+        64 => {
+            let is_abstract = r.u8()? != 0;
+            let definition = if r.u8()? != 0 { Some(Box::new(r.variant()?)) } else { None };
+            NodeKind::DataType { is_abstract, definition }
+        }
         _ => return Err(DecodeError),
     };
     let n = r.u32()? as usize;
@@ -107,5 +111,16 @@ mod tests {
         assert!(REF_TYPE_PARENT.windows(2).all(|w| w[0].0 < w[1].0));
         assert_eq!(ref_type_parent(47), Some(44)); // HasComponent -> Aggregates
         assert_eq!(ref_type_parent(31), None);
+        // DataTypeDefinition: BuildInfo is a StructureDefinition (encoding
+        // 122), ServerState an EnumDefinition (123).
+        let def = |id: u32| match &nodes.iter().find(|n| n.id == id).unwrap().kind {
+            NodeKind::DataType { definition: Some(d), .. } => match &**d {
+                Variant::ExtensionObject(x) => x.type_id.clone(),
+                _ => panic!("not a structure"),
+            },
+            _ => panic!("no definition"),
+        };
+        assert_eq!(def(338), NodeId::ns0(122));
+        assert_eq!(def(852), NodeId::ns0(123));
     }
 }

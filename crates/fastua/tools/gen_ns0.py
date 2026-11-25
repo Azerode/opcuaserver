@@ -16,7 +16,8 @@ ns0.bin layout, little endian, strings and values in UA binary encoding:
       Variable      u32 data_type, i32 value_rank, u8 access_level, u8 has_value [Variant]
       VariableType  u8 is_abstract, u32 data_type, i32 value_rank
       ObjectType    u8 is_abstract
-      DataType      u8 is_abstract
+      DataType      u8 is_abstract, u8 has_definition [Variant: StructureDefinition
+                    or EnumDefinition ExtensionObject, the DataTypeDefinition attribute]
       ReferenceType u8 is_abstract, u8 symmetric, u8 has_inverse [LocalizedText]
       Method        (none)
     u32 ref_count, then per reference: u32 type, u8 forward, u32 target
@@ -140,6 +141,52 @@ def variant(v, aliases):
     return bytes([BUILTIN[kind]]) + scalar(kind, v, aliases)
 
 
+STRUCTURE, ENUMERATION = 22, 29
+
+
+def data_type_definition(e, me, aliases, supertype, encodings, names):
+    """Binary DataTypeDefinition of a UADataType, or None."""
+    d = e.find(NS + "Definition")
+    if d is None:
+        return None
+    chain, t = [], me
+    while t in supertype:
+        t = supertype[t]
+        chain.append(t)
+    fields = d.findall(NS + "Field")
+    if ENUMERATION in chain or d.get("IsOptionSet") == "true":
+        body = struct.pack("<i", len(fields))
+        for i, f in enumerate(fields):
+            desc = f.find(NS + "Description")
+            dn = f.find(NS + "DisplayName")
+            value = int(f.get("Value", 1 << i if d.get("IsOptionSet") == "true" else i))
+            body += struct.pack("<q", value)
+            body += loc_text(None, dn.text if dn is not None else f.get("Name"))
+            body += loc_text(desc.get("Locale"), desc.text or "") if desc is not None else loc_text(None, None)
+            body += string(f.get("Name"))
+        enc = 123  # EnumDefinition_Encoding_DefaultBinary
+    elif STRUCTURE in chain or me == STRUCTURE:
+        union = d.get("IsUnion") == "true"
+        optional = any(f.get("IsOptional") == "true" for f in fields)
+        structure_type = 2 if union else 1 if optional else 0
+        body = node_id(encodings.get(me, 0)) + node_id(supertype.get(me, STRUCTURE)) + struct.pack("<i", structure_type)
+        body += struct.pack("<i", len(fields))
+        for f in fields:
+            desc = f.find(NS + "Description")
+            dims = [int(x) for x in f.get("ArrayDimensions", "").split(",") if x]
+            body += string(f.get("Name"))
+            body += loc_text(desc.get("Locale"), desc.text or "") if desc is not None else loc_text(None, None)
+            body += node_id(numeric(f.get("DataType", "i=24"), aliases))
+            body += struct.pack("<i", int(f.get("ValueRank", "-1")))
+            body += (struct.pack("<i", len(dims)) + b"".join(struct.pack("<I", x) for x in dims)) if dims else struct.pack("<i", -1)
+            body += struct.pack("<I", int(f.get("MaxStringLength", "0")))
+            body += bytes([1 if f.get("IsOptional") == "true" else 0])
+        enc = 122  # StructureDefinition_Encoding_DefaultBinary
+    else:
+        return None
+    return bytes([BUILTIN["ExtensionObject"]]) + node_id(enc) + b"\x01" + struct.pack("<i", len(body)) + body
+
+
 def main():
     src = sys.argv[1]
     here = os.path.dirname(os.path.abspath(__file__))
@@ -157,6 +204,9 @@ def main():
             t, other = numeric(r.get("ReferenceType"), aliases), numeric(r.text, aliases)
             fwd = r.get("IsForward", "true") != "false"
             triples.add((me, t, other) if fwd else (other, t, me))
+    names = {numeric(e.get("NodeId"), aliases): e.get("BrowseName") for e in elems}
+    supertype = {d: s for s, t, d in triples if t == 45}
+    encodings = {s: d for s, t, d in triples if t == 38 and names.get(d) == "Default Binary"}
     refs = {}
     for s, t, d in sorted(triples):
         refs.setdefault(s, []).append((t, 1, d))
@@ -184,8 +234,11 @@ def main():
             out += b"\x01" + variant(v[0], aliases) if v is not None and len(v) else b"\x00"
         elif cls == "UAVariableType":
             out += bytes([abstract]) + struct.pack("<Ii", numeric(e.get("DataType", "i=24"), aliases), int(e.get("ValueRank", "-2")))
-        elif cls in ("UAObjectType", "UADataType"):
+        elif cls == "UAObjectType":
             out += bytes([abstract])
+        elif cls == "UADataType":
+            definition = data_type_definition(e, me, aliases, supertype, encodings, names)
+            out += bytes([abstract]) + (b"\x01" + definition if definition else b"\x00")
         elif cls == "UAReferenceType":
             inv = e.find(NS + "InverseName")
             out += bytes([abstract, 1 if e.get("Symmetric") == "true" else 0])

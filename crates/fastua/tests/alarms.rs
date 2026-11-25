@@ -5,7 +5,7 @@
 use fastua::address_space::ServerInfo;
 use fastua::alarms::codes::*;
 use fastua::alarms::types::*;
-use fastua::client::{Client, MonitorSpec};
+use fastua::client::{Client, FilterOperand, MonitorSpec};
 use fastua::events::types::*;
 use fastua::pki::Pki;
 use fastua::reload::Store;
@@ -22,7 +22,9 @@ const PLANT: &str = r#"{ "Name": "Plant", "Namespace": "urn:plant",
     { "Name": "Temp", "NodeId": "ns=3;i=1", "Type": "System.Double",
       "Alarm": { "LowLow": 0, "Low": 10, "High": 80, "HighHigh": 95, "Severity": 700, "Deadband": 2 } },
     { "Name": "Valve", "NodeId": "ns=3;i=2", "Type": "System.Boolean",
-      "Alarm": { "Normal": false, "Severity": 300, "Message": "Valve open" } } ] } ] }"#;
+      "Alarm": { "Normal": false, "Severity": 300, "Message": "Valve open" } },
+    { "Name": "Restart", "NodeId": "ns=3;i=3", "Type": "Int32",
+      "Dialog": { "Prompt": "Restart the line?", "Options": ["Yes", "No"], "Default": 1, "Ok": 0, "Cancel": 1 } } ] } ] }"#;
 
 fn start(name: &str) -> (String, PathBuf) {
     let dir = std::env::temp_dir().join(format!("fastua-al-{name}-{}", std::process::id()));
@@ -131,7 +133,13 @@ fn limit_alarm_acknowledge_and_refresh() {
     assert_eq!(name[0].value, Some(Variant::QualifiedName(Box::new(QualifiedName { ns, name: "TempAlarm".into() }))));
 
     let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
-    let r = c.monitor(sub, &[MonitorSpec::events(SERVER, 1, &FIELDS)]).unwrap();
+    // Everything but the audit events of the writes below: Not(OfType(AuditEventType)).
+    let mut spec = MonitorSpec::events(SERVER, 1, &FIELDS);
+    spec.event_where = vec![
+        (7, vec![FilterOperand::Element(1)]),
+        (14, vec![FilterOperand::Literal(Variant::NodeId(Box::new(NodeId::ns0(AUDIT_EVENT_TYPE))))]),
+    ];
+    let r = c.monitor(sub, &[spec]).unwrap();
     assert_eq!(r[0].0, status::GOOD);
     let item = r[0].1;
 
@@ -228,4 +236,125 @@ fn limit_alarm_acknowledge_and_refresh() {
     assert_eq!(last[2], Variant::UInt16(900));
     assert_eq!(text(&last[8]), "Low");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn shelving_and_branches() {
+    let (addr, dir) = start("shelve");
+    let mut c = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
+    c.create_session("operator").unwrap();
+    let temp = NodeId::Numeric(2, 1);
+    let temp_alarm = NodeId::String(2, "__alarm/i=1".into());
+    let shelving = NodeId::String(2, "__alarm/i=1/ShelvingState".into());
+    // The ShelvingState object of the condition.
+    let v = c.read(&[(shelving.clone(), 3)]).unwrap();
+    assert_eq!(
+        v[0].value,
+        Some(Variant::QualifiedName(Box::new(QualifiedName { ns: 0, name: "ShelvingState".into() })))
+    );
+
+    let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
+    let fields =
+        ["EventId", "BranchId", "Retain", "SuppressedOrShelved", "ShelvingState/CurrentState", "AckedState/Id"];
+    let mut spec = MonitorSpec::events(SERVER, 1, &fields);
+    spec.event_where =
+        vec![(14, vec![FilterOperand::Literal(Variant::NodeId(Box::new(NodeId::ns0(ALARM_CONDITION_TYPE))))])];
+    assert_eq!(c.monitor(sub, &[spec]).unwrap()[0].0, status::GOOD);
+
+    // TimedShelve2 on the ShelvingState object, with a comment.
+    let args = [Variant::Double(60_000.0), comment("maintenance")];
+    assert_eq!(call(&mut c, &shelving, TIMED_SHELVE2, &args).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!(ev[0][3], Variant::Boolean(true));
+    assert_eq!(text(&ev[0][4]), "TimedShelved");
+    assert_eq!(call(&mut c, &shelving, TIMED_SHELVE, &[Variant::Double(1.0)]).0, BAD_CONDITION_ALREADY_SHELVED);
+    assert_eq!(call(&mut c, &shelving, TIMED_SHELVE, &[]).0, BAD_ARGUMENTS_MISSING);
+    assert_eq!(call(&mut c, &shelving, UNSHELVE, &[]).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][3], text(&ev[0][4]).as_str()), (&Variant::Boolean(false), "Unshelved"));
+    assert_eq!(call(&mut c, &shelving, UNSHELVE2, &[comment("")]).0, BAD_CONDITION_NOT_SHELVED);
+
+    // Active, back to normal unacknowledged, active again: the first
+    // occurrence becomes a branch with its own BranchId and EventId.
+    for v in [85.0, 50.0, 85.0] {
+        c.write(&[(temp.clone(), Variant::Double(v))]).unwrap();
+    }
+    let ev = collect(&mut c, 4);
+    assert_eq!(ev.len(), 4, "{ev:?}");
+    let null = Variant::NodeId(Box::new(NodeId::NULL));
+    let branch = ev.iter().find(|e| e[1] != null).expect("branch event");
+    assert_eq!(branch[2], Variant::Boolean(true));
+    let main = ev.last().unwrap();
+    assert_eq!(main[1], null);
+    assert_eq!(call(&mut c, &temp_alarm, ACKNOWLEDGE, &[branch[0].clone(), comment("")]).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][1], &ev[0][5]), (&branch[1], &Variant::Boolean(true)));
+    assert_eq!(call(&mut c, &temp_alarm, CONFIRM, &[ev[0][0].clone(), comment("")]).0, status::GOOD);
+    // Acknowledged and confirmed: reported once more with Retain false.
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][1], &ev[0][2]), (&branch[1], &Variant::Boolean(false)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn suppression_and_out_of_service() {
+    let (addr, dir) = start("suppress");
+    let mut c = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
+    c.create_session("operator").unwrap();
+    let temp_alarm = NodeId::String(2, "__alarm/i=1".into());
+    let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
+    let fields = ["SuppressedOrShelved", "SuppressedState/Id", "OutOfServiceState", "SilenceState/Id"];
+    let mut spec = MonitorSpec::events(SERVER, 1, &fields);
+    spec.event_where =
+        vec![(14, vec![FilterOperand::Literal(Variant::NodeId(Box::new(NodeId::ns0(ALARM_CONDITION_TYPE))))])];
+    assert_eq!(c.monitor(sub, &[spec]).unwrap()[0].0, status::GOOD);
+
+    assert_eq!(call(&mut c, &temp_alarm, SUPPRESS2, &[comment("night shift")]).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][0], &ev[0][1]), (&Variant::Boolean(true), &Variant::Boolean(true)));
+    assert_eq!(call(&mut c, &temp_alarm, UNSUPPRESS, &[]).0, status::GOOD);
+    assert_eq!(collect(&mut c, 1)[0][0], Variant::Boolean(false));
+    assert_eq!(call(&mut c, &temp_alarm, REMOVE_FROM_SERVICE, &[]).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][0], text(&ev[0][2]).as_str()), (&Variant::Boolean(true), "Out of Service"));
+    assert_eq!(call(&mut c, &temp_alarm, SUPPRESS, &[comment("x")]).0, BAD_TOO_MANY_ARGUMENTS);
+    assert_eq!(call(&mut c, &temp_alarm, RESET, &[]).0, BAD_INVALID_STATE);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn dialog_condition() {
+    let (addr, dir) = start("dialog");
+    let mut c = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
+    c.create_session("operator").unwrap();
+    let restart = NodeId::Numeric(2, 3);
+    let dialog = NodeId::String(2, "__alarm/i=3".into());
+    let name = c.read(&[(dialog.clone(), 3)]).unwrap();
+    assert_eq!(
+        name[0].value,
+        Some(Variant::QualifiedName(Box::new(QualifiedName { ns: 2, name: "RestartDialog".into() })))
+    );
+    let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
+    let fields = ["EventId", "DialogState/Id", "Prompt", "ResponseOptionSet", "LastResponse", "Retain"];
+    let mut spec = MonitorSpec::events(SERVER, 1, &fields);
+    spec.event_where =
+        vec![(14, vec![FilterOperand::Literal(Variant::NodeId(Box::new(NodeId::ns0(DIALOG_CONDITION_TYPE))))])];
+    assert_eq!(c.monitor(sub, &[spec]).unwrap()[0].0, status::GOOD);
+
+    assert_eq!(call(&mut c, &dialog, RESPOND, &[Variant::Int32(0)]).0, BAD_DIALOG_NOT_ACTIVE);
+    // The application asks: a negative value raises the dialog.
+    c.write(&[(restart.clone(), Variant::Int32(-1))]).unwrap();
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][1], text(&ev[0][2]).as_str()), (&Variant::Boolean(true), "Restart the line?"));
+    assert_eq!(ev[0][5], Variant::Boolean(true));
+    assert_eq!(call(&mut c, &dialog, RESPOND, &[Variant::Int32(5)]).0, BAD_DIALOG_RESPONSE_INVALID);
+    assert_eq!(call(&mut c, &dialog, RESPOND2, &[Variant::Int32(0), comment("go")]).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!(
+        (&ev[0][1], &ev[0][4], &ev[0][5]),
+        (&Variant::Boolean(false), &Variant::Int32(0), &Variant::Boolean(false))
+    );
+    // The answer is in the variable.
+    assert_eq!(c.read(&[(restart, 13)]).unwrap()[0].value, Some(Variant::Int32(0)));
+    let _ = std::fs::remove_dir_all(dir);
 }

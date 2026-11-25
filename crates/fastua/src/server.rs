@@ -52,6 +52,9 @@ pub struct Limits {
     pub max_sampling_interval_ms: f64,
     pub max_keep_alive_count: u32,
     pub max_lifetime_count: u32,
+    /// Events kept for HistoryRead on the Server object (0 = no event
+    /// history).
+    pub event_history: usize,
 }
 
 impl Default for Limits {
@@ -81,6 +84,7 @@ impl Default for Limits {
             max_sampling_interval_ms: 3_600_000.0,
             max_keep_alive_count: 100_000,
             max_lifetime_count: 1_000_000,
+            event_history: 0,
         }
     }
 }
@@ -104,10 +108,17 @@ pub struct ServerConfig {
     /// half the cores). The others sleep in `recv`: spinning on more threads
     /// than free cores steals CPU from the threads doing the work.
     pub busy_poll_threads: usize,
+    /// URL of the HTTPS endpoint (`opc.https://host:port`) when HTTPS is
+    /// served (see [`crate::https`]).
+    pub https_url: Option<String>,
+    /// Count every request per session and service (SessionDiagnostics).
+    pub session_diagnostics: bool,
 }
 
 impl ServerConfig {
-    /// Every supported endpoint, anonymous users read-only.
+    /// Every supported endpoint but the deprecated ECC_nistP256 /
+    /// ECC_nistP384 ones (offered only when listed), anonymous users
+    /// read-only.
     pub fn all_endpoints(listen: String, endpoint_url: String) -> ServerConfig {
         let mut endpoints = vec![(Policy::None, Mode::None)];
         let ecc = crate::ecc::Suite::ALL.into_iter().map(Policy::Ecc);
@@ -124,6 +135,8 @@ impl ServerConfig {
             x509_users: Access::ReadWrite,
             busy_poll: Duration::ZERO,
             busy_poll_threads: 0,
+            https_url: None,
+            session_diagnostics: false,
         }
     }
 }
@@ -173,6 +186,46 @@ pub struct Session {
     /// Subscriptions and queued Publish requests, driven by the thread of
     /// the connection the session is bound to.
     pub subs: Mutex<SessionSubs>,
+    /// SessionDiagnostics / SessionSecurityDiagnostics (Part 5 §12.11).
+    pub diag: SessionDiag,
+}
+
+/// What a session's diagnostics report beyond its other fields.
+pub struct SessionDiag {
+    /// The client's ApplicationDescription, as encoded in CreateSession.
+    pub client_description: Box<[u8]>,
+    pub server_uri: Option<String>,
+    pub endpoint_url: Option<String>,
+    pub max_response: u32,
+    pub connected: i64,
+    /// Set by the once-a-second sweeper from the `touched` flag.
+    pub last_contact: std::sync::atomic::AtomicI64,
+    /// Service counters (see [`crate::diagnostics::COUNTERS`]); counted only
+    /// with `--session-diagnostics`.
+    pub counters: [AtomicU32; crate::diagnostics::COUNTERS],
+    /// Identities of the successive ActivateSession calls.
+    pub identities: Mutex<Vec<Arc<str>>>,
+}
+
+impl SessionDiag {
+    pub fn new(
+        client_description: &[u8],
+        server_uri: Option<String>,
+        endpoint_url: Option<String>,
+        max_response: u32,
+    ) -> SessionDiag {
+        let now = now_ticks();
+        SessionDiag {
+            client_description: client_description.into(),
+            server_uri,
+            endpoint_url,
+            max_response,
+            connected: now,
+            last_contact: std::sync::atomic::AtomicI64::new(now),
+            counters: std::array::from_fn(|_| AtomicU32::new(0)),
+            identities: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 pub struct Server {
@@ -191,6 +244,9 @@ pub struct Server {
     next_channel: AtomicU32,
     /// GetEndpoints / CreateSession answer, encoded once (array included).
     endpoints_encoded: Vec<u8>,
+    /// Offset of the HTTPS endpoint in `endpoints_encoded` (it comes last;
+    /// the length when there is none).
+    https_at: usize,
     /// FindServers answer, encoded once (array of one ApplicationDescription).
     application_encoded: Vec<u8>,
     next_subscription: AtomicU32,
@@ -296,6 +352,8 @@ impl Server {
             n => n,
         };
         let info = store.info().clone();
+        // EnabledFlag of ServerDiagnostics.
+        info.diagnostics.counting.store(config.session_diagnostics, Ordering::Relaxed);
         // An ECC endpoint needs our certificate on its curve.
         config.endpoints.retain(|(p, _)| match p.ecc() {
             Some(s) if pki.ecc_own(s.curve).is_none() => {
@@ -304,12 +362,25 @@ impl Server {
             }
             _ => true,
         });
+        // (url, policy, mode, transport profile)
+        let mut offered: Vec<(&str, Policy, Mode, &str)> = config
+            .endpoints
+            .iter()
+            .map(|&(p, m)| (config.endpoint_url.as_str(), p, m, TRANSPORT_PROFILE_BINARY))
+            .collect();
+        if let Some(url) = &config.https_url {
+            offered.push((url, Policy::None, Mode::None, crate::https::TRANSPORT_PROFILE_HTTPS));
+        }
         let mut endpoints_encoded = Vec::new();
+        let mut https_at = None;
         {
             let mut w = Writer::new(&mut endpoints_encoded);
-            w.i32(config.endpoints.len() as i32);
-            for &(policy, mode) in &config.endpoints {
-                w.string(&config.endpoint_url);
+            w.i32(offered.len() as i32);
+            for &(url, policy, mode, profile) in &offered {
+                if profile != TRANSPORT_PROFILE_BINARY {
+                    https_at = Some(w.len());
+                }
+                w.string(url);
                 write_application_description(&mut w, &info, &config.endpoint_url);
                 w.bytes(Some(pki.certificate_for(policy)));
                 w.i32(mode as i32);
@@ -334,10 +405,11 @@ impl Server {
                     w.str(None);
                     w.str(sec);
                 }
-                w.string(TRANSPORT_PROFILE_BINARY);
+                w.string(profile);
                 w.u8(policy.security_level(mode));
             }
         }
+        let https_at = https_at.unwrap_or(endpoints_encoded.len());
         let mut application_encoded = Vec::new();
         {
             let mut w = Writer::new(&mut application_encoded);
@@ -357,6 +429,7 @@ impl Server {
             spin_limit: AtomicUsize::new(spin_cap),
             spin_cap,
             endpoints_encoded,
+            https_at,
             application_encoded,
             next_subscription: AtomicU32::new(1),
             orphans: Mutex::new(Vec::new()),
@@ -392,6 +465,25 @@ impl Server {
         &self.endpoints_encoded
     }
 
+    /// Writes the endpoints (array included) with the given transports.
+    pub fn write_endpoints(&self, w: &mut Writer, tcp: bool, https: bool) {
+        let all = &self.endpoints_encoded;
+        let n = i32::from_le_bytes(all[..4].try_into().unwrap());
+        let has_https = self.https_at < all.len();
+        match (tcp, https && has_https) {
+            (true, true) => w.raw(all),
+            (true, false) => {
+                w.i32(n - has_https as i32);
+                w.raw(&all[4..self.https_at]);
+            }
+            (false, true) => {
+                w.i32(1);
+                w.raw(&all[self.https_at..]);
+            }
+            (false, false) => w.empty_array(),
+        }
+    }
+
     pub fn application_encoded(&self) -> &[u8] {
         &self.application_encoded
     }
@@ -405,6 +497,7 @@ impl Server {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         &self,
         name: String,
@@ -413,6 +506,7 @@ impl Server {
         security: Security,
         server_nonce: Vec<u8>,
         client_nonce: Vec<u8>,
+        diag: SessionDiag,
     ) -> Result<Arc<Session>, u32> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if sessions.len() >= self.limits().max_sessions {
@@ -440,10 +534,12 @@ impl Server {
             can_write: AtomicBool::new(false),
             identity: Mutex::new(Arc::from("")),
             subs: Mutex::new(SessionSubs::default()),
+            diag,
         });
         sessions.insert(session.token.clone(), session.clone());
         drop(sessions);
         let d = &self.store.info().diagnostics;
+        d.register(&session);
         crate::diagnostics::inc(&d.current_sessions);
         crate::diagnostics::inc(&d.cumulated_sessions);
         Ok(session)
@@ -468,6 +564,7 @@ impl Server {
         sessions.retain(|_, s| {
             if s.touched.swap(false, Ordering::Relaxed) {
                 s.last_seen.store(now, Ordering::Relaxed);
+                s.diag.last_contact.store(now_ticks(), Ordering::Relaxed);
             }
             let idle = now.saturating_sub(s.last_seen.load(Ordering::Relaxed)) as f64;
             let keep = idle <= s.timeout_ms;
@@ -492,26 +589,36 @@ impl Server {
     /// Raises an AuditSessionEventType (or subtype) for `s` when someone
     /// subscribes to events. `extra` adds the subtype's fields.
     pub fn session_event(&self, type_id: u32, s: &Session, action: &str, ok: bool, extra: impl FnOnce(Event) -> Event) {
+        let outcome = if ok { "succeeded" } else { "failed" };
+        let message = format!("{action} of session '{}' {outcome}", s.name);
+        self.audit_event(type_id, s, (NodeId::ns0(ids::SERVER), action), &message, ok, |e| {
+            extra(e.with(crate::events::types::SESSION_ID, Variant::NodeId(Box::new(s.id.clone()))))
+        });
+    }
+
+    /// Raises an AuditEventType (or subtype) on behalf of session `s`, when
+    /// someone subscribes to events. `source` is (SourceNode, SourceName).
+    pub fn audit_event(
+        &self,
+        type_id: u32,
+        s: &Session,
+        source: (NodeId, &str),
+        message: &str,
+        ok: bool,
+        extra: impl FnOnce(Event) -> Event,
+    ) {
         use crate::events::types::*;
         let space = self.store.load();
         if !space.events.active() {
             return;
         }
         let user = s.identity.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let outcome = if ok { "succeeded" } else { "failed" };
-        let ev = Event::new(
-            type_id,
-            NodeId::ns0(ids::SERVER),
-            action,
-            &format!("{action} of session '{}' {outcome}", s.name),
-            if ok { 100 } else { 500 },
-        )
-        .with(ACTION_TIME_STAMP, Variant::DateTime(now_ticks()))
-        .with(STATUS, Variant::Boolean(ok))
-        .with(SERVER_ID, Variant::string(&self.store.info().application_uri))
-        .with(CLIENT_AUDIT_ENTRY_ID, Variant::String(None))
-        .with(CLIENT_USER_ID, Variant::string(&user))
-        .with(SESSION_ID, Variant::NodeId(Box::new(s.id.clone())));
+        let ev = Event::new(type_id, source.0, source.1, message, if ok { 100 } else { 500 })
+            .with(ACTION_TIME_STAMP, Variant::DateTime(now_ticks()))
+            .with(STATUS, Variant::Boolean(ok))
+            .with(SERVER_ID, Variant::string(&self.store.info().application_uri))
+            .with(CLIENT_AUDIT_ENTRY_ID, Variant::String(None))
+            .with(CLIENT_USER_ID, Variant::string(&user));
         space.events.emit(extra(ev));
     }
 
@@ -562,6 +669,8 @@ impl Server {
             std::thread::Builder::new().name("fastua-sessions".into()).spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(1));
                 server.expire_sessions();
+                // Timed shelves end on time (to the second).
+                server.store.load().alarms.tick(crate::types::now_ticks());
             })?;
         }
         if !self.config.busy_poll.is_zero() {

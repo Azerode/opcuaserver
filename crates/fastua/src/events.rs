@@ -21,6 +21,13 @@ pub mod types {
     pub const AUDIT_SESSION_EVENT_TYPE: u32 = 2069;
     pub const AUDIT_CREATE_SESSION_EVENT_TYPE: u32 = 2071;
     pub const AUDIT_ACTIVATE_SESSION_EVENT_TYPE: u32 = 2075;
+    pub const AUDIT_UPDATE_EVENT_TYPE: u32 = 2099;
+    pub const AUDIT_WRITE_UPDATE_EVENT_TYPE: u32 = 2100;
+    pub const AUDIT_HISTORY_UPDATE_EVENT_TYPE: u32 = 2104;
+    pub const AUDIT_HISTORY_VALUE_UPDATE_EVENT_TYPE: u32 = 3006;
+    pub const AUDIT_HISTORY_DELETE_EVENT_TYPE: u32 = 3012;
+    pub const AUDIT_HISTORY_RAW_MODIFY_DELETE_EVENT_TYPE: u32 = 3014;
+    pub const AUDIT_HISTORY_AT_TIME_DELETE_EVENT_TYPE: u32 = 3019;
     pub const SYSTEM_EVENT_TYPE: u32 = 2130;
     pub const BASE_MODEL_CHANGE_EVENT_TYPE: u32 = 2132;
     pub const EVENT_QUEUE_OVERFLOW_EVENT_TYPE: u32 = 3035;
@@ -44,6 +51,18 @@ pub mod types {
     pub const CLIENT_CERTIFICATE_THUMBPRINT: u32 = 2746;
     pub const REVISED_SESSION_TIMEOUT: u32 = 2074;
     pub const ACTIVATE_SECURE_CHANNEL_ID: u32 = 11485;
+    pub const WRITE_ATTRIBUTE_ID: u32 = 2750;
+    pub const WRITE_INDEX_RANGE: u32 = 2101;
+    pub const WRITE_OLD_VALUE: u32 = 2102;
+    pub const WRITE_NEW_VALUE: u32 = 2103;
+    pub const HISTORY_PARAMETER_DATA_TYPE_ID: u32 = 2751;
+    pub const HISTORY_VALUE_UPDATED_NODE: u32 = 3026;
+    pub const HISTORY_PERFORM_INSERT_REPLACE: u32 = 3031;
+    pub const HISTORY_DELETE_UPDATED_NODE: u32 = 3027;
+    pub const HISTORY_IS_DELETE_MODIFIED: u32 = 3015;
+    pub const HISTORY_START_TIME: u32 = 3016;
+    pub const HISTORY_END_TIME: u32 = 3017;
+    pub const HISTORY_REQ_TIMES: u32 = 3020;
 
     /// Duration data type.
     pub const DURATION: u32 = 290;
@@ -56,6 +75,16 @@ pub mod types {
     pub const EXCLUSIVE_LIMIT_ALARM_TYPE: u32 = 9341;
     pub const DISCRETE_ALARM_TYPE: u32 = 10523;
     pub const OFF_NORMAL_ALARM_TYPE: u32 = 10637;
+    pub const DIALOG_CONDITION_TYPE: u32 = 2830;
+    pub const DIALOG_STATE: u32 = 9055;
+    pub const DIALOG_STATE_ID: u32 = 9056;
+    pub const DIALOG_STATE_TRANSITION_TIME: u32 = 9060;
+    pub const PROMPT: u32 = 2831;
+    pub const RESPONSE_OPTION_SET: u32 = 9064;
+    pub const DEFAULT_RESPONSE: u32 = 9065;
+    pub const OK_RESPONSE: u32 = 9066;
+    pub const CANCEL_RESPONSE: u32 = 9067;
+    pub const LAST_RESPONSE: u32 = 9068;
     pub const REFRESH_START_EVENT_TYPE: u32 = 2787;
     pub const REFRESH_END_EVENT_TYPE: u32 = 2788;
 
@@ -86,6 +115,26 @@ pub mod types {
     pub const ACTIVE_STATE_TRANSITION_TIME: u32 = 9165;
     pub const INPUT_NODE: u32 = 11120;
     pub const SUPPRESSED_OR_SHELVED: u32 = 9215;
+    pub const MAX_TIME_SHELVED: u32 = 9216;
+    pub const SUPPRESSED_STATE: u32 = 9169;
+    pub const SUPPRESSED_STATE_ID: u32 = 9170;
+    pub const SUPPRESSED_STATE_TRANSITION_TIME: u32 = 9174;
+    pub const OUT_OF_SERVICE_STATE: u32 = 16371;
+    pub const OUT_OF_SERVICE_STATE_ID: u32 = 16372;
+    pub const OUT_OF_SERVICE_STATE_TRANSITION_TIME: u32 = 16376;
+    pub const SILENCE_STATE: u32 = 16380;
+    pub const SILENCE_STATE_ID: u32 = 16381;
+    pub const SILENCE_STATE_TRANSITION_TIME: u32 = 16385;
+    pub const LATCHED_STATE: u32 = 18190;
+    pub const LATCHED_STATE_ID: u32 = 18191;
+    pub const LATCHED_STATE_TRANSITION_TIME: u32 = 18195;
+    pub const SHELVING_STATE: u32 = 9178;
+    pub const SHELVING_STATE_CURRENT_STATE: u32 = 9179;
+    pub const SHELVING_STATE_CURRENT_STATE_ID: u32 = 9180;
+    pub const SHELVING_STATE_LAST_TRANSITION: u32 = 9184;
+    pub const SHELVING_STATE_LAST_TRANSITION_ID: u32 = 9185;
+    pub const SHELVING_STATE_LAST_TRANSITION_TIME: u32 = 9188;
+    pub const SHELVING_STATE_UNSHELVE_TIME: u32 = 9189;
     pub const HIGH_HIGH_LIMIT: u32 = 11124;
     pub const HIGH_LIMIT: u32 = 11125;
     pub const LOW_LIMIT: u32 = 11126;
@@ -173,6 +222,67 @@ pub const EVENT_TYPES: &[EventTypeDef] = &[
         fields: &[(ACTIVATE_SECURE_CHANNEL_ID, "SecureChannelId", 12, -1)],
     },
     EventTypeDef {
+        id: AUDIT_UPDATE_EVENT_TYPE,
+        name: "AuditUpdateEventType",
+        parent: AUDIT_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[],
+    },
+    EventTypeDef {
+        id: AUDIT_WRITE_UPDATE_EVENT_TYPE,
+        name: "AuditWriteUpdateEventType",
+        parent: AUDIT_UPDATE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[
+            (WRITE_ATTRIBUTE_ID, "AttributeId", 7, -1),
+            (WRITE_INDEX_RANGE, "IndexRange", 291, -1),
+            (WRITE_OLD_VALUE, "OldValue", 24, -1),
+            (WRITE_NEW_VALUE, "NewValue", 24, -1),
+        ],
+    },
+    EventTypeDef {
+        id: AUDIT_HISTORY_UPDATE_EVENT_TYPE,
+        name: "AuditHistoryUpdateEventType",
+        parent: AUDIT_UPDATE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[(HISTORY_PARAMETER_DATA_TYPE_ID, "ParameterDataTypeId", 17, -1)],
+    },
+    EventTypeDef {
+        id: AUDIT_HISTORY_VALUE_UPDATE_EVENT_TYPE,
+        name: "AuditHistoryValueUpdateEventType",
+        parent: AUDIT_HISTORY_UPDATE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[
+            (HISTORY_VALUE_UPDATED_NODE, "UpdatedNode", 17, -1),
+            (HISTORY_PERFORM_INSERT_REPLACE, "PerformInsertReplace", 11293, -1),
+        ],
+    },
+    EventTypeDef {
+        id: AUDIT_HISTORY_DELETE_EVENT_TYPE,
+        name: "AuditHistoryDeleteEventType",
+        parent: AUDIT_HISTORY_UPDATE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[(HISTORY_DELETE_UPDATED_NODE, "UpdatedNode", 17, -1)],
+    },
+    EventTypeDef {
+        id: AUDIT_HISTORY_RAW_MODIFY_DELETE_EVENT_TYPE,
+        name: "AuditHistoryRawModifyDeleteEventType",
+        parent: AUDIT_HISTORY_DELETE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[
+            (HISTORY_IS_DELETE_MODIFIED, "IsDeleteModified", 1, -1),
+            (HISTORY_START_TIME, "StartTime", crate::types::ids::UTC_TIME, -1),
+            (HISTORY_END_TIME, "EndTime", crate::types::ids::UTC_TIME, -1),
+        ],
+    },
+    EventTypeDef {
+        id: AUDIT_HISTORY_AT_TIME_DELETE_EVENT_TYPE,
+        name: "AuditHistoryAtTimeDeleteEventType",
+        parent: AUDIT_HISTORY_DELETE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[(HISTORY_REQ_TIMES, "ReqTimes", crate::types::ids::UTC_TIME, 1)],
+    },
+    EventTypeDef {
         id: SYSTEM_EVENT_TYPE,
         name: "SystemEventType",
         parent: BASE_EVENT_TYPE,
@@ -257,7 +367,32 @@ pub const EVENT_TYPES: &[EventTypeDef] = &[
             (ACTIVE_STATE_EFFECTIVE_DISPLAY_NAME, "ActiveState/EffectiveDisplayName", 21, -1),
             (ACTIVE_STATE_TRANSITION_TIME, "ActiveState/TransitionTime", crate::types::ids::UTC_TIME, -1),
             (INPUT_NODE, "InputNode", 17, -1),
+            (SHELVING_STATE, "ShelvingState", 0, -1),
+            (SHELVING_STATE_CURRENT_STATE, "ShelvingState/CurrentState", 21, -1),
+            (SHELVING_STATE_CURRENT_STATE_ID, "ShelvingState/CurrentState/Id", 17, -1),
+            (SHELVING_STATE_LAST_TRANSITION, "ShelvingState/LastTransition", 21, -1),
+            (SHELVING_STATE_LAST_TRANSITION_ID, "ShelvingState/LastTransition/Id", 17, -1),
+            (
+                SHELVING_STATE_LAST_TRANSITION_TIME,
+                "ShelvingState/LastTransition/TransitionTime",
+                crate::types::ids::UTC_TIME,
+                -1,
+            ),
+            (SHELVING_STATE_UNSHELVE_TIME, "ShelvingState/UnshelveTime", 290, -1),
             (SUPPRESSED_OR_SHELVED, "SuppressedOrShelved", 1, -1),
+            (MAX_TIME_SHELVED, "MaxTimeShelved", 290, -1),
+            (SUPPRESSED_STATE, "SuppressedState", 21, -1),
+            (SUPPRESSED_STATE_ID, "SuppressedState/Id", 1, -1),
+            (SUPPRESSED_STATE_TRANSITION_TIME, "SuppressedState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (OUT_OF_SERVICE_STATE, "OutOfServiceState", 21, -1),
+            (OUT_OF_SERVICE_STATE_ID, "OutOfServiceState/Id", 1, -1),
+            (OUT_OF_SERVICE_STATE_TRANSITION_TIME, "OutOfServiceState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (SILENCE_STATE, "SilenceState", 21, -1),
+            (SILENCE_STATE_ID, "SilenceState/Id", 1, -1),
+            (SILENCE_STATE_TRANSITION_TIME, "SilenceState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (LATCHED_STATE, "LatchedState", 21, -1),
+            (LATCHED_STATE_ID, "LatchedState/Id", 1, -1),
+            (LATCHED_STATE_TRANSITION_TIME, "LatchedState/TransitionTime", crate::types::ids::UTC_TIME, -1),
         ],
     },
     EventTypeDef {
@@ -296,6 +431,23 @@ pub const EVENT_TYPES: &[EventTypeDef] = &[
         parent: DISCRETE_ALARM_TYPE,
         is_abstract: false,
         fields: &[(NORMAL_STATE, "NormalState", 17, -1)],
+    },
+    EventTypeDef {
+        id: DIALOG_CONDITION_TYPE,
+        name: "DialogConditionType",
+        parent: CONDITION_TYPE,
+        is_abstract: false,
+        fields: &[
+            (DIALOG_STATE, "DialogState", 21, -1),
+            (DIALOG_STATE_ID, "DialogState/Id", 1, -1),
+            (DIALOG_STATE_TRANSITION_TIME, "DialogState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (PROMPT, "Prompt", 21, -1),
+            (RESPONSE_OPTION_SET, "ResponseOptionSet", 21, 1),
+            (DEFAULT_RESPONSE, "DefaultResponse", 6, -1),
+            (OK_RESPONSE, "OkResponse", 6, -1),
+            (CANCEL_RESPONSE, "CancelResponse", 6, -1),
+            (LAST_RESPONSE, "LastResponse", 6, -1),
+        ],
     },
 ];
 
@@ -416,13 +568,49 @@ pub struct EventBus {
     head: AtomicU64,
     ring: Mutex<VecDeque<Arc<Event>>>,
     subscribers: AtomicUsize,
+    /// Event history (HistoryRead with ReadEventDetails): the last
+    /// `history_capacity` events with a sequence number (0 = off).
+    history: Mutex<EventHistory>,
+    history_capacity: AtomicUsize,
+}
+
+#[derive(Default)]
+pub struct EventHistory {
+    /// Sequence number of the next event recorded.
+    pub next: u64,
+    pub events: VecDeque<Arc<Event>>,
+}
+
+impl EventHistory {
+    /// Sequence number of `events[0]`.
+    pub fn first(&self) -> u64 {
+        self.next - self.events.len() as u64
+    }
 }
 
 impl EventBus {
-    /// Someone listens: worth building an event.
+    /// Someone listens, or events are recorded: worth building an event.
     #[inline]
     pub fn active(&self) -> bool {
-        self.subscribers.load(Ordering::Relaxed) > 0
+        self.subscribers.load(Ordering::Relaxed) > 0 || self.history_capacity.load(Ordering::Relaxed) > 0
+    }
+
+    /// Keeps the last `n` events for HistoryRead (0 = none).
+    pub fn set_history_capacity(&self, n: usize) {
+        self.history_capacity.store(n, Ordering::Relaxed);
+        let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        while h.events.len() > n {
+            h.events.pop_front();
+        }
+    }
+
+    pub fn history_capacity(&self) -> usize {
+        self.history_capacity.load(Ordering::Relaxed)
+    }
+
+    /// Runs `f` on the event history, under its lock.
+    pub fn history_with<R>(&self, f: impl FnOnce(&EventHistory) -> R) -> R {
+        f(&self.history.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     #[inline]
@@ -431,15 +619,29 @@ impl EventBus {
     }
 
     pub fn emit(&self, ev: Event) {
-        if !self.active() {
+        let listeners = self.subscribers.load(Ordering::Relaxed) > 0;
+        let capacity = self.history_capacity.load(Ordering::Relaxed);
+        if !listeners && capacity == 0 {
             return;
         }
-        let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-        if ring.len() == RING {
-            ring.pop_front();
+        let ev = Arc::new(ev);
+        // ConditionRefresh replays are for one subscription, not history.
+        if capacity > 0 && ev.target.is_none() {
+            let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            if h.events.len() >= capacity {
+                h.events.pop_front();
+            }
+            h.events.push_back(ev.clone());
+            h.next += 1;
         }
-        ring.push_back(Arc::new(ev));
-        self.head.fetch_add(1, Ordering::Release);
+        if listeners {
+            let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+            if ring.len() == RING {
+                ring.pop_front();
+            }
+            ring.push_back(ev);
+            self.head.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Calls `f` for every event after `cursor`; returns the new cursor and
@@ -844,6 +1046,18 @@ impl EventFilter {
     fn fields(&self, ev: &Event) -> Box<[Variant]> {
         self.select.iter().map(|f| f.value(ev).cloned().unwrap_or_default()).collect()
     }
+
+    /// Encodes the selected fields of `ev` as a HistoryEventFieldList,
+    /// without copying them.
+    pub fn write_fields(&self, ev: &Event, w: &mut Writer) {
+        w.i32(self.select.len() as i32);
+        for f in &self.select {
+            match f.value(ev) {
+                Some(v) => w.variant(v),
+                None => w.variant(&Variant::Empty),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- monitored items
@@ -1184,6 +1398,28 @@ mod tests {
         assert_eq!(sev, vec![Variant::UInt16(1), Variant::UInt16(3)]);
         assert_eq!(it.queue[0][1], Variant::NodeId(Box::new(NodeId::ns0(EVENT_QUEUE_OVERFLOW_EVENT_TYPE))));
         drop(it);
+        assert!(!bus.active());
+    }
+
+    #[test]
+    fn event_history_keeps_the_newest() {
+        let bus = EventBus::default();
+        bus.set_history_capacity(2);
+        assert!(bus.active());
+        for s in 1..=3 {
+            bus.emit(ev(s));
+        }
+        // Recorded without a listener: the subscription ring stays empty.
+        assert_eq!(bus.head(), 0);
+        let sev =
+            |h: &EventHistory| -> Vec<Variant> { h.events.iter().map(|e| e.get(SEVERITY).unwrap().clone()).collect() };
+        bus.history_with(|h| {
+            assert_eq!((h.first(), h.next), (1, 3));
+            assert_eq!(sev(h), vec![Variant::UInt16(2), Variant::UInt16(3)]);
+        });
+        bus.set_history_capacity(1);
+        bus.history_with(|h| assert_eq!(sev(h), vec![Variant::UInt16(3)]));
+        bus.set_history_capacity(0);
         assert!(!bus.active());
     }
 }

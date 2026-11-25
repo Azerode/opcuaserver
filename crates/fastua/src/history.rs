@@ -61,6 +61,11 @@ struct Store {
     raw: VecDeque<Sample>,
     cap: usize,
     modified: VecDeque<Modified>,
+    /// Persistence on (see [`crate::persist`]): the values recorded since
+    /// the last flush, in arrival order.
+    journal: Option<Vec<Sample>>,
+    /// HistoryUpdate changed past values: the file is rewritten.
+    rewrite: bool,
 }
 
 pub struct History {
@@ -120,7 +125,16 @@ impl Store {
         }
     }
 
+    /// Records a new value (a write of the variable).
+    fn push_new(&mut self, s: Sample) {
+        if let Some(j) = &mut self.journal {
+            j.push(s.clone());
+        }
+        self.insert(s);
+    }
+
     fn log(&mut self, sample: Sample, kind: u32, user: &Arc<str>, now: i64) {
+        self.rewrite |= self.journal.is_some();
         if self.modified.len() >= self.cap.max(1) {
             self.modified.pop_front();
         }
@@ -168,7 +182,13 @@ impl History {
                 head: AtomicU32::new(0),
                 slots: std::array::from_fn(|_| Default::default()),
             },
-            store: Mutex::new(Store { raw: VecDeque::with_capacity(cap.min(1024)), cap, modified: VecDeque::new() }),
+            store: Mutex::new(Store {
+                raw: VecDeque::with_capacity(cap.min(1024)),
+                cap,
+                modified: VecDeque::new(),
+                journal: None,
+                rewrite: false,
+            }),
         }
     }
 
@@ -212,9 +232,12 @@ impl History {
             st.raw.drain(..keep_from);
             let skip = excess - keep_from; // more staged values than capacity
             st.raw.extend((skip as u32..n as u32).map(|k| sample(slot(h.wrapping_add(k)))));
+            if let Some(j) = &mut st.journal {
+                j.extend((0..n as u32).map(|k| sample(slot(h.wrapping_add(k)))));
+            }
         } else {
             for k in 0..n as u32 {
-                st.insert(sample(slot(h.wrapping_add(k))));
+                st.push_new(sample(slot(h.wrapping_add(k))));
             }
         }
         self.stage.head.store(t, Ordering::Release);
@@ -265,7 +288,57 @@ impl History {
     /// Records a write of the current value.
     #[inline]
     pub fn record(&self, s: Sample) {
-        self.lock().insert(s);
+        self.lock().push_new(s);
+    }
+
+    /// The values are written to disk.
+    pub(crate) fn persisting(&self) -> bool {
+        self.store.lock().unwrap_or_else(|e| e.into_inner()).journal.is_some()
+    }
+
+    /// Starts persistence with the values and modifications read back from
+    /// disk (`rewrite`: the file must be rewritten, it was damaged or of
+    /// another kind).
+    pub fn start_persisting(&self, restored: Vec<Sample>, modified: Vec<Modified>, rewrite: bool) {
+        let mut st = self.lock();
+        for s in restored {
+            st.insert(s);
+        }
+        for m in modified {
+            if st.modified.len() >= st.cap.max(1) {
+                st.modified.pop_front();
+            }
+            st.modified.push_back(m);
+        }
+        st.journal = Some(Vec::new());
+        st.rewrite = rewrite;
+    }
+
+    /// The file holds too many evicted values: rewrite it next time.
+    pub(crate) fn request_rewrite(&self) {
+        self.lock().rewrite = true;
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.store.lock().unwrap_or_else(|e| e.into_inner()).cap
+    }
+
+    /// Encodes what reaches the disk next with `f`, under the lock: every
+    /// value and modification when the file is rewritten (returns true),
+    /// else the values recorded since the last call.
+    pub fn take_for_disk(&self, mut f: impl FnMut(&Sample, Option<&Modified>)) -> bool {
+        let mut st = self.lock();
+        let st = &mut *st;
+        let Some(j) = &mut st.journal else { return false };
+        let rewrite = std::mem::take(&mut st.rewrite);
+        if rewrite {
+            st.raw.iter().for_each(|s| f(s, None));
+            st.modified.iter().for_each(|m| f(&m.sample, Some(m)));
+        } else {
+            j.iter().for_each(|s| f(s, None));
+        }
+        j.clear();
+        rewrite
     }
 
     pub fn len(&self) -> usize {
@@ -584,12 +657,62 @@ const CP_RAW: u8 = 1;
 const CP_MODIFIED: u8 = 2;
 const CP_AT_TIME: u8 = 3;
 pub(crate) const CP_PROCESSED: u8 = 4;
+const CP_EVENTS: u8 = 5;
 
 /// What a HistoryRead asks for.
 enum Details {
     Raw(RawQuery),
     AtTime { times: Vec<i64>, stepped: bool },
     Processed(ProcessedQuery),
+    Events(EventQuery),
+}
+
+/// ReadEventDetails (DateTime 0 = unspecified).
+pub struct EventQuery {
+    pub max: usize,
+    pub start: i64,
+    pub end: i64,
+    pub filter: crate::events::EventFilter,
+}
+
+impl EventQuery {
+    /// Newest first: the start time is after the end time, or only the end
+    /// time is given.
+    fn reverse(&self) -> bool {
+        (self.start == 0 && self.end != 0) || (self.end != 0 && self.start > self.end)
+    }
+
+    /// The event time is in `[start, end)` (forward), `(end, start]`
+    /// (reverse) or `.. end]` (reverse from the end time only), like raw
+    /// reads.
+    fn in_range(&self, t: i64) -> bool {
+        if self.reverse() {
+            if self.start == 0 {
+                t <= self.end
+            } else {
+                t <= self.start && t > self.end
+            }
+        } else {
+            t >= self.start && (self.end == 0 || t < self.end)
+        }
+    }
+}
+
+fn parse_event_details(body: &[u8]) -> Result<EventQuery, u32> {
+    let bad = |_| status::BAD_HISTORY_OPERATION_INVALID;
+    let mut r = Reader::new(body);
+    let max = r.u32().map_err(bad)? as usize;
+    let start = r.i64().map_err(bad)?;
+    let end = r.i64().map_err(bad)?;
+    let (ty, enc, fbody) = r.extension_object_raw().map_err(bad)?;
+    if ty.as_ns0() != Some(ids::EVENT_FILTER_ENCODING) || enc != 1 {
+        return Err(crate::events::codes::BAD_EVENT_FILTER_INVALID);
+    }
+    let (filter, result) = crate::events::parse_filter(fbody).map_err(bad)?;
+    if !result.is_good() || filter.select_len() == 0 {
+        return Err(crate::events::codes::BAD_EVENT_FILTER_INVALID);
+    }
+    Ok(EventQuery { max, start, end, filter })
 }
 
 /// ReadProcessedDetails (aggregates).
@@ -645,7 +768,7 @@ fn parse_details(type_id: &NodeId, body: &[u8]) -> Result<Details, u32> {
             }
             Ok(d)
         }
-        Some(ids::READ_EVENT_DETAILS_ENCODING) => Err(status::BAD_HISTORY_OPERATION_UNSUPPORTED),
+        Some(ids::READ_EVENT_DETAILS_ENCODING) => parse_event_details(body).map(Details::Events),
         _ => Err(status::BAD_HISTORY_OPERATION_INVALID),
     }
 }
@@ -744,6 +867,9 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
             Some(Err(false)) => Some((usize::MAX, usize::MAX)),
         };
         let result = (|| -> Result<NodeResult, u32> {
+            if let Details::Events(q) = &details {
+                return read_events(space, &id, q, cp, release, body);
+            }
             let hist = history_of(space, &id, ACCESS_HISTORY_READ)?;
             if enc_name.is_some_and(|e| !e.is_empty()) {
                 return Err(status::BAD_DATA_ENCODING_UNSUPPORTED);
@@ -753,6 +879,7 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
                 Details::Raw(_) => CP_RAW,
                 Details::AtTime { .. } => CP_AT_TIME,
                 Details::Processed(_) => CP_PROCESSED,
+                Details::Events(_) => CP_EVENTS,
             };
             let resume = cp.map(|b| cp_decode(&id, kind, b)).transpose()?;
             if release {
@@ -834,6 +961,7 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
                     let more = (to < total).then(|| cp_encode(&id, kind, Resume { ts: 0, skip: to as u32 }));
                     Ok((status::GOOD, more, Some(ids::HISTORY_DATA_ENCODING)))
                 }
+                Details::Events(_) => unreachable!(),
             }
         })();
         match result {
@@ -860,6 +988,85 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
     Ok(())
 }
 
+/// HistoryRead of events on a notifier: a HistoryEvent encoded under the
+/// event history lock straight from the recorded events. The continuation
+/// point holds the sequence number of the next event to look at.
+fn read_events(
+    space: &crate::address_space::AddressSpace,
+    id: &NodeId,
+    q: &EventQuery,
+    cp: Option<&[u8]>,
+    release: bool,
+    body: &mut Vec<u8>,
+) -> Result<NodeResult, u32> {
+    use crate::address_space::NodeKind;
+    let node = space.get(id).ok_or(status::BAD_NODE_ID_UNKNOWN)?;
+    let NodeKind::Object { event_notifier } = node.kind else {
+        return Err(status::BAD_HISTORY_OPERATION_UNSUPPORTED);
+    };
+    // EventNotifier bit 2: HistoryRead.
+    if event_notifier & 4 == 0 {
+        return Err(status::BAD_HISTORY_OPERATION_UNSUPPORTED);
+    }
+    // Part 11 §6.5.4: an open-ended read needs a count.
+    if (q.start == 0 && q.end == 0) || ((q.start == 0 || q.end == 0) && q.max == 0) {
+        return Err(status::BAD_INVALID_TIMESTAMP_ARGUMENT);
+    }
+    let resume = cp.map(|b| cp_decode(id, CP_EVENTS, b)).transpose()?;
+    if release {
+        return Ok((status::GOOD, None, None));
+    }
+    let max = if q.max == 0 { MAX_RETURN_VALUES } else { q.max.min(MAX_RETURN_VALUES) };
+    let reverse = q.reverse();
+    body.clear();
+    let mut w = Writer::new(body);
+    w.i32(0);
+    let mut count = 0usize;
+    let more = space.events.history_with(|h| {
+        let (first, next) = (h.first(), h.next);
+        // Events dropped from the history since the continuation point
+        // was handed out are skipped.
+        let mut seq = match resume {
+            Some(r) => (r.ts as u64).clamp(first, next),
+            None if reverse => next,
+            None => first,
+        };
+        let time = |ev: &crate::events::Event| match ev.get(TIME) {
+            Some(Variant::DateTime(t)) => *t,
+            _ => 0,
+        };
+        loop {
+            let ev = if reverse {
+                if seq == first {
+                    return None;
+                }
+                seq -= 1;
+                &h.events[(seq - first) as usize]
+            } else {
+                if seq == next {
+                    return None;
+                }
+                seq += 1;
+                &h.events[(seq - 1 - first) as usize]
+            };
+            if q.in_range(time(ev)) && q.filter.matches(ev) {
+                q.filter.write_fields(ev, &mut w);
+                count += 1;
+                if count == max {
+                    // The last one returned: resume after it.
+                    let at_end = if reverse { seq == first } else { seq == next };
+                    let limited = q.max != 0 && q.max <= MAX_RETURN_VALUES && (q.start == 0 || q.end == 0);
+                    return (!at_end && !limited).then_some(seq);
+                }
+            }
+        }
+    });
+    w.patch_u32(0, count as u32);
+    let code = if count == 0 { status::GOOD_NO_DATA } else { status::GOOD };
+    let cp = more.map(|seq| cp_encode(id, CP_EVENTS, Resume { ts: seq as i64, skip: 0 }));
+    Ok((code, cp, Some(ids::HISTORY_EVENT_ENCODING)))
+}
+
 /// (status, continuation point, encoding id of the result in `body`).
 type NodeResult = (u32, Option<Vec<u8>>, Option<u32>);
 
@@ -867,6 +1074,11 @@ type NodeResult = (u32, Option<Vec<u8>>, Option<u32>);
 fn user_name(identity: &str) -> Arc<str> {
     identity.strip_prefix("user:").unwrap_or(identity).into()
 }
+
+use crate::events::types::*;
+
+/// (event type, updated node, fields) of an AuditHistoryUpdateEvent.
+type AuditReport = (u32, NodeId, Vec<(u32, Variant)>);
 
 pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
     let s = session(ctx, h, true)?;
@@ -878,12 +1090,15 @@ pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w
     }
     check_count(ctx, n)?;
     let space = ctx.server.store.cached(ctx.space);
+    let audit = space.events.active();
     let now = now_ticks();
     begin(w, ids::HISTORY_UPDATE_RESPONSE, h);
     w.i32(n as i32);
     for _ in 0..n {
         let (type_id, _enc, body) = r.extension_object_raw().map_err(decode_err)?;
         let mut b = Reader::new(body);
+        // What the AuditHistoryUpdateEvent reports: (event type, node, fields).
+        let mut report: Option<AuditReport> = None;
         let (code, ops) = (|| -> Result<(u32, Vec<u32>), u32> {
             let bad = |_| status::BAD_HISTORY_OPERATION_INVALID;
             match type_id.as_ns0() {
@@ -891,6 +1106,13 @@ pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w
                     let id = b.node_id().map_err(bad)?;
                     let mode = b.u32().map_err(bad)?;
                     let values = b.array(1, |r| r.data_value()).map_err(bad)?;
+                    if audit {
+                        let fields = vec![
+                            (HISTORY_VALUE_UPDATED_NODE, Variant::NodeId(Box::new(id.clone()))),
+                            (HISTORY_PERFORM_INSERT_REPLACE, Variant::Int32(mode as i32)),
+                        ];
+                        report = Some((AUDIT_HISTORY_VALUE_UPDATE_EVENT_TYPE, id.clone(), fields));
+                    }
                     let hist = check_update(space, &id, can_write)?;
                     if !(UPDATE_INSERT..=UPDATE_UPDATE).contains(&mode) {
                         return Err(status::BAD_HISTORY_OPERATION_INVALID);
@@ -921,6 +1143,15 @@ pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w
                     let modified = b.bool().map_err(bad)?;
                     let start = b.i64().map_err(bad)?;
                     let end = b.i64().map_err(bad)?;
+                    if audit {
+                        let fields = vec![
+                            (HISTORY_DELETE_UPDATED_NODE, Variant::NodeId(Box::new(id.clone()))),
+                            (HISTORY_IS_DELETE_MODIFIED, Variant::Boolean(modified)),
+                            (HISTORY_START_TIME, Variant::DateTime(start)),
+                            (HISTORY_END_TIME, Variant::DateTime(end)),
+                        ];
+                        report = Some((AUDIT_HISTORY_RAW_MODIFY_DELETE_EVENT_TYPE, id.clone(), fields));
+                    }
                     let hist = check_update(space, &id, can_write)?;
                     if start == 0 || end == 0 {
                         return Err(status::BAD_INVALID_TIMESTAMP_ARGUMENT);
@@ -931,6 +1162,19 @@ pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w
                 Some(ids::DELETE_AT_TIME_DETAILS_ENCODING) => {
                     let id = b.node_id().map_err(bad)?;
                     let times = b.array(8, |r| r.i64()).map_err(bad)?;
+                    if audit {
+                        let req = times.iter().map(|&t| Variant::DateTime(t)).collect();
+                        let req = Variant::Array(Box::new(VariantArray {
+                            type_id: builtin::DATETIME,
+                            items: req,
+                            dims: None,
+                        }));
+                        let fields = vec![
+                            (HISTORY_DELETE_UPDATED_NODE, Variant::NodeId(Box::new(id.clone()))),
+                            (HISTORY_REQ_TIMES, req),
+                        ];
+                        report = Some((AUDIT_HISTORY_AT_TIME_DELETE_EVENT_TYPE, id.clone(), fields));
+                    }
                     let hist = check_update(space, &id, can_write)?;
                     Ok((status::GOOD, times.into_iter().map(|t| hist.delete_at(t, &user, now)).collect()))
                 }
@@ -941,6 +1185,21 @@ pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w
             }
         })()
         .unwrap_or_else(|code| (code, Vec::new()));
+        if let Some((ty, node, fields)) = report {
+            let ok = status::is_good(code) && ops.iter().all(|&c| status::is_good(c));
+            let name = space.get(&node).map_or_else(|| node.to_string(), |n| n.browse_name.name.to_string());
+            let message = format!("History update of {name}{}", if ok { "" } else { " failed" });
+            // The DataType of the details: its binary encoding id minus 2
+            // (UpdateDataDetails 680/682, DeleteRawModifiedDetails 686/688, ...).
+            let param = Variant::NodeId(Box::new(NodeId::ns0(type_id.as_ns0().unwrap_or(2) - 2)));
+            ctx.server.audit_event(ty, &s, (node, &name), &message, ok, |mut e| {
+                e = e.with(HISTORY_PARAMETER_DATA_TYPE_ID, param);
+                for (decl, v) in fields {
+                    e = e.with(decl, v);
+                }
+                e
+            });
+        }
         w.u32(code);
         w.i32(ops.len() as i32);
         for c in ops {

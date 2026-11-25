@@ -46,13 +46,37 @@ pub const ACCESS_READ: u8 = 0x01;
 pub const ACCESS_WRITE: u8 = 0x02;
 
 pub enum NodeKind {
-    Object { event_notifier: u8 },
-    Variable { data_type: NodeId, value_rank: i32, access: u8, value: ValueSource },
-    ObjectType { is_abstract: bool },
-    VariableType { is_abstract: bool, data_type: NodeId, value_rank: i32 },
-    ReferenceType { is_abstract: bool, symmetric: bool, inverse_name: Option<LocalizedText> },
-    DataType { is_abstract: bool },
-    Method { executable: bool },
+    Object {
+        event_notifier: u8,
+    },
+    Variable {
+        data_type: NodeId,
+        value_rank: i32,
+        access: u8,
+        value: ValueSource,
+    },
+    ObjectType {
+        is_abstract: bool,
+    },
+    VariableType {
+        is_abstract: bool,
+        data_type: NodeId,
+        value_rank: i32,
+    },
+    ReferenceType {
+        is_abstract: bool,
+        symmetric: bool,
+        inverse_name: Option<LocalizedText>,
+    },
+    /// `definition`: the DataTypeDefinition attribute (a StructureDefinition
+    /// or EnumDefinition), from the nodeset.
+    DataType {
+        is_abstract: bool,
+        definition: Option<Box<Variant>>,
+    },
+    Method {
+        executable: bool,
+    },
 }
 
 pub struct Node {
@@ -525,7 +549,7 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
 
     // Data types
     for &(id, name, parent, abs) in DATA_TYPES {
-        b.ns0(id, name, NodeKind::DataType { is_abstract: abs });
+        b.ns0(id, name, NodeKind::DataType { is_abstract: abs, definition: None });
         if parent != 0 {
             b.subtype(parent, id);
         }
@@ -562,6 +586,8 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
         (at::TWO_STATE_VARIABLE_TYPE, "TwoStateVariableType", at::STATE_VARIABLE_TYPE, false),
         (at::FINITE_STATE_VARIABLE_TYPE, "FiniteStateVariableType", at::STATE_VARIABLE_TYPE, false),
         (at::CONDITION_VARIABLE_TYPE, "ConditionVariableType", ids::BASE_DATA_VARIABLE_TYPE, false),
+        (at::TRANSITION_VARIABLE_TYPE, "TransitionVariableType", ids::BASE_DATA_VARIABLE_TYPE, false),
+        (at::FINITE_TRANSITION_VARIABLE_TYPE, "FiniteTransitionVariableType", at::TRANSITION_VARIABLE_TYPE, false),
     ] {
         b.ns0(id, name, vt(21, -1, abs));
         b.subtype(parent, id);
@@ -575,6 +601,7 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
             at::FINITE_STATE_MACHINE_TYPE,
             false,
         ),
+        (at::SHELVED_STATE_MACHINE_TYPE, "ShelvedStateMachineType", at::FINITE_STATE_MACHINE_TYPE, false),
         (at::BASE_CONDITION_CLASS_TYPE, "BaseConditionClassType", ids::BASE_OBJECT_TYPE, true),
         (at::PROCESS_CONDITION_CLASS_TYPE, "ProcessConditionClassType", at::BASE_CONDITION_CLASS_TYPE, true),
     ] {
@@ -598,10 +625,17 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
                 .iter()
                 .any(|f| f.1.len() > name.len() && f.1.starts_with(name) && f.1.as_bytes()[name.len()] == b'/');
             if data_type == 0 {
-                b.object(decl, leaf, parent, at::EXCLUSIVE_LIMIT_STATE_MACHINE_TYPE);
+                let type_def = if leaf == "ShelvingState" {
+                    at::SHELVED_STATE_MACHINE_TYPE
+                } else {
+                    at::EXCLUSIVE_LIMIT_STATE_MACHINE_TYPE
+                };
+                b.object(decl, leaf, parent, type_def);
             } else if has_children {
                 let type_def = if leaf == "CurrentState" {
                     at::FINITE_STATE_VARIABLE_TYPE
+                } else if leaf == "LastTransition" {
+                    at::FINITE_TRANSITION_VARIABLE_TYPE
                 } else if leaf.ends_with("State") {
                     at::TWO_STATE_VARIABLE_TYPE
                 } else {
@@ -612,7 +646,24 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
                 b.property(decl, leaf, parent, data_type, rank, ValueSource::Static(Variant::Empty));
             }
             let d = b.idx(decl);
-            b.link(d, ids::HAS_MODELLING_RULE, mandatory);
+            // Optional parts of AlarmConditionType (Part 9 §5.8.2).
+            let optional = matches!(
+                name,
+                "ShelvingState"
+                    | "MaxTimeShelved"
+                    | "SuppressedState"
+                    | "OutOfServiceState"
+                    | "SilenceState"
+                    | "LatchedState"
+                    | "SuppressedState/TransitionTime"
+                    | "OutOfServiceState/TransitionTime"
+                    | "SilenceState/TransitionTime"
+                    | "LatchedState/TransitionTime"
+                    | "ShelvingState/LastTransition"
+                    | "ShelvingState/LastTransition/TransitionTime"
+            );
+            let rule = if optional { b.idx(ids::MODELLING_RULE_OPTIONAL) } else { mandatory };
+            b.link(d, ids::HAS_MODELLING_RULE, rule);
         }
     }
     // Condition methods (Part 9 §5.5, §5.7).
@@ -635,7 +686,9 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     b.method(at::CONFIRM, "Confirm", ACK, &[event_id(), comment()], &[]);
 
     // Server object: the root notifier of every event.
-    let server = b.ns0(ids::SERVER, "Server", NodeKind::Object { event_notifier: 1 });
+    // SubscribeToEvents, plus HistoryRead when events are recorded.
+    let notifier = if info.limits.event_history > 0 { 1 | 4 } else { 1 };
+    let server = b.ns0(ids::SERVER, "Server", NodeKind::Object { event_notifier: notifier });
     let (objects, st) = (b.idx(ids::OBJECTS_FOLDER), b.idx(ids::SERVER_TYPE));
     b.link(objects, ids::ORGANIZES, server);
     b.link(server, ids::HAS_TYPE_DEFINITION, st);
@@ -698,8 +751,9 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     diagnostics_values(b);
 }
 
-/// Live values of ServerDiagnosticsSummary, and empty per-session arrays
-/// (per-session diagnostics are not collected: EnabledFlag is false).
+/// Live values of ServerDiagnosticsSummary, the per-session arrays and
+/// EnabledFlag (true with `--session-diagnostics`, which counts requests
+/// per session).
 fn diagnostics_values(b: &mut Builder) {
     use crate::diagnostics::{FIELD_NODES, SUMMARY, SUMMARY_NODE};
     let mut set = |id: u32, v: ValueSource| {
@@ -712,13 +766,15 @@ fn diagnostics_values(b: &mut Builder) {
     for (i, &id) in FIELD_NODES.iter().enumerate() {
         set(id, ValueSource::Diagnostics(i as u8));
     }
-    // SamplingIntervalDiagnosticsArray, SubscriptionDiagnosticsArray,
-    // SessionDiagnosticsArray, SessionSecurityDiagnosticsArray.
-    for id in [2289, 2290, 3707, 3708] {
-        let empty =
-            Variant::Array(Box::new(VariantArray { type_id: builtin::EXTENSIONOBJECT, items: vec![], dims: None }));
-        set(id, ValueSource::Static(empty));
-    }
+    use crate::diagnostics::{ENABLED_FLAG, SECURITY_ARRAY, SESSIONS_ARRAY, SUBSCRIPTIONS_ARRAY};
+    // Encoded when read from the live sessions.
+    set(3707, ValueSource::Diagnostics(SESSIONS_ARRAY));
+    set(3708, ValueSource::Diagnostics(SECURITY_ARRAY));
+    set(2290, ValueSource::Diagnostics(SUBSCRIPTIONS_ARRAY));
+    set(2294, ValueSource::Diagnostics(ENABLED_FLAG));
+    // SamplingIntervalDiagnosticsArray: sampling follows each item.
+    let empty = Variant::Array(Box::new(VariantArray { type_id: builtin::EXTENSIONOBJECT, items: vec![], dims: None }));
+    set(2289, ValueSource::Static(empty));
 }
 
 /// Completes namespace 0 from the official nodeset (see [`crate::ns0`]).
@@ -738,6 +794,11 @@ fn merge_nodeset(b: &mut Builder) {
             let node = &mut b.nodes[i as usize];
             if node.description.is_none() {
                 node.description = n.description;
+            }
+            if let (NodeKind::DataType { definition, .. }, NodeKind::DataType { definition: d, .. }) =
+                (&mut node.kind, n.kind)
+            {
+                *definition = d;
             }
             continue;
         }
@@ -859,16 +920,17 @@ fn build_server_details(b: &mut Builder, info: &ServerInfo) {
     for (id, name) in [(12165, "MaxNodesPerHistoryReadData"), (12167, "MaxNodesPerHistoryUpdateData")] {
         b.property(id, name, ops, 7, -1, fixed(per_call.clone()));
     }
-    for (id, name) in [(12166, "MaxNodesPerHistoryReadEvents"), (12168, "MaxNodesPerHistoryUpdateEvents")] {
-        b.property(id, name, ops, 7, -1, fixed(Variant::UInt32(0)));
-    }
+    let event_history = l.event_history > 0;
+    let read_events = if event_history { per_call.clone() } else { Variant::UInt32(0) };
+    b.property(12166, "MaxNodesPerHistoryReadEvents", ops, 7, -1, fixed(read_events));
+    b.property(12168, "MaxNodesPerHistoryUpdateEvents", ops, 7, -1, fixed(Variant::UInt32(0)));
 
     // Historical access (Part 11 §5.4.2).
     let hist = ids::HISTORY_SERVER_CAPABILITIES;
     b.object(hist, "HistoryServerCapabilities", caps, ids::HISTORY_SERVER_CAPABILITIES_TYPE);
     for (id, name, value) in [
         (11193, "AccessHistoryDataCapability", true),
-        (11242, "AccessHistoryEventsCapability", false),
+        (11242, "AccessHistoryEventsCapability", event_history),
         (11196, "InsertDataCapability", true),
         (11197, "ReplaceDataCapability", true),
         (11198, "UpdateDataCapability", true),
@@ -885,7 +947,8 @@ fn build_server_details(b: &mut Builder, info: &ServerInfo) {
     }
     let max_values = crate::history::MAX_RETURN_VALUES as u32;
     b.property(11273, "MaxReturnDataValues", hist, 7, -1, fixed(Variant::UInt32(max_values)));
-    b.property(11274, "MaxReturnEventValues", hist, 7, -1, fixed(Variant::UInt32(0)));
+    let max_events = if event_history { max_values } else { 0 };
+    b.property(11274, "MaxReturnEventValues", hist, 7, -1, fixed(Variant::UInt32(max_events)));
     b.object(ids::HISTORY_AGGREGATE_FUNCTIONS, "AggregateFunctions", hist, ids::FOLDER_TYPE);
     b.folder(2996, "ModellingRules", ids::SERVER_SERVER_CAPABILITIES);
     b.folder(2997, "AggregateFunctions", ids::SERVER_SERVER_CAPABILITIES);
@@ -1021,7 +1084,8 @@ pub fn build(
     let mut fresh = 0usize;
     let mut stamp = None;
     let mut history: Vec<(Arc<ValueCell>, Option<usize>)> = Vec::new();
-    let events = previous.map(|p| p.events.clone()).unwrap_or_default();
+    let events: Arc<crate::events::EventBus> = previous.map(|p| p.events.clone()).unwrap_or_default();
+    events.set_history_capacity(info.limits.event_history);
     let alarms = previous.map(|p| p.alarms.clone()).unwrap_or_default();
     // Applied once the build succeeded, like history.
     let mut conditions: Vec<PendingAlarm> = Vec::new();
@@ -1093,7 +1157,7 @@ pub fn build(
                     .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
                 b.link(group, ids::HAS_COMPONENT, var);
                 if let Some(a) = &it.alarm {
-                    let name = format!("{}Alarm", it.name);
+                    let name = format!("{}{}", it.name, a.suffix());
                     let cond = b
                         .add(Node {
                             id: alarm_id,
@@ -1107,6 +1171,25 @@ pub fn build(
                     let td = b.idx(a.type_id());
                     b.link(cond, ids::HAS_TYPE_DEFINITION, td);
                     b.link(var, ids::HAS_CONDITION, cond);
+                    // Target of the shelving methods (Part 9 §5.8.10).
+                    if !a.is_dialog() {
+                        let shelving = b
+                            .add(Node {
+                                id: NodeId::String(
+                                    ns,
+                                    format!("__alarm/{}{}", it.node_id, crate::alarms::SHELVING_STATE_SUFFIX).into(),
+                                ),
+                                browse_name: QualifiedName { ns: 0, name: "ShelvingState".into() },
+                                display_name: LocalizedText::new("ShelvingState"),
+                                description: None,
+                                refs: Vec::with_capacity(2),
+                                kind: NodeKind::Object { event_notifier: 0 },
+                            })
+                            .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
+                        let sst = b.idx(crate::alarms::types::SHELVED_STATE_MACHINE_TYPE);
+                        b.link(cond, ids::HAS_COMPONENT, shelving);
+                        b.link(shelving, ids::HAS_TYPE_DEFINITION, sst);
+                    }
                 }
                 let Some((low, high)) = it.eu_range else {
                     b.link(var, ids::HAS_TYPE_DEFINITION, bdv_type);

@@ -9,7 +9,7 @@
 use crate::address_space::AddressSpace;
 use crate::codec::{Reader, Writer};
 use crate::crypto::{self, ChannelKeys, Mode, Policy, SYM_SIGNATURE_LEN};
-use crate::ecc::{self, EccKeys, TAG_LEN};
+use crate::ecc::{self, EccKeys, LegacyKeys, TAG_LEN};
 use crate::pki::CertInfo;
 use crate::server::{random_bytes, Server, Session};
 use crate::services;
@@ -38,11 +38,16 @@ pub struct Security {
     /// ECC SecureChannelEnhancements: our signature of the first
     /// OpenSecureChannel response, binding session signatures to the channel.
     pub channel_thumbprint: Option<Arc<[u8]>>,
+    /// A TLS connection of the HTTPS transport (policy None, protected by
+    /// TLS).
+    pub https: bool,
 }
 
 impl Security {
     pub const NONE: Security =
-        Security { policy: Policy::None, mode: Mode::None, client_cert: None, channel_thumbprint: None };
+        Security { policy: Policy::None, mode: Mode::None, client_cert: None, channel_thumbprint: None, https: false };
+    pub const HTTPS: Security =
+        Security { policy: Policy::None, mode: Mode::None, client_cert: None, channel_thumbprint: None, https: true };
 }
 
 /// Symmetric keys of one security token. The RSA keys stay inline (no
@@ -52,6 +57,8 @@ impl Security {
 enum Keys {
     Rsa(ChannelKeys),
     Ecc(EccKeys),
+    /// Deprecated ECC_nistP256 / ECC_nistP384: AES-CBC + HMAC.
+    EccCbc(LegacyKeys),
 }
 
 /// A verified ECC OPN: plain text, client certificate, request signature.
@@ -665,13 +672,20 @@ impl<'a> Connection<'a> {
                 let secret = eph
                     .agree(suite, &client_nonce)
                     .map_err(|_| Fatal::Protocol(BAD_NONCE_INVALID, "bad client nonce"))?;
-                ikm = match &self.channel {
-                    Some(ch) => ch.ikm.clone(),
-                    None => vec![0u8; suite.secret_len()],
-                };
-                Some(Keys::Ecc(
-                    EccKeys::derive(suite, &mut ikm, &secret, &client_nonce, &server_nonce).map_err(|_| kd())?,
-                ))
+                if suite.is_aead() {
+                    ikm = match &self.channel {
+                        Some(ch) => ch.ikm.clone(),
+                        None => vec![0u8; suite.secret_len()],
+                    };
+                    Some(Keys::Ecc(
+                        EccKeys::derive(suite, &mut ikm, &secret, &client_nonce, &server_nonce).map_err(|_| kd())?,
+                    ))
+                } else {
+                    // No IKM chaining: each exchange derives from its secret.
+                    let encrypt = mode == Mode::SignAndEncrypt;
+                    let k = LegacyKeys::derive(suite, &secret, &client_nonce, &server_nonce, encrypt);
+                    Some(Keys::EccCbc(k.map_err(|_| kd())?))
+                }
             }
             p => {
                 random_bytes(&mut server_nonce);
@@ -684,7 +698,8 @@ impl<'a> Connection<'a> {
 
         let limits = self.server.limits();
         let lifetime = requested_lifetime.clamp(limits.min_token_lifetime_ms, limits.max_token_lifetime_ms);
-        let security = Security { policy, mode, client_cert: client_cert.clone(), channel_thumbprint: None };
+        let security =
+            Security { policy, mode, client_cert: client_cert.clone(), channel_thumbprint: None, https: false };
         let ch = match (request_type, self.channel.as_mut()) {
             (0, None) => {
                 if channel_id != 0 {
@@ -771,6 +786,7 @@ impl<'a> Connection<'a> {
                 // First exchange (SecureChannelEnhancements): the signature
                 // also covers the client's request signature and becomes the
                 // ChannelThumbprint.
+                let first = first && suite.is_aead();
                 let sig = if first {
                     let mut signed = Vec::with_capacity(w.len() + request_sig.len());
                     signed.extend_from_slice(w.buf);
@@ -874,6 +890,22 @@ impl<'a> Connection<'a> {
                         k.remote.open(token_id, prev, aad, &mut [], tag)
                     };
                     ok.map_err(|_| checks_failed("authentication failed"))?;
+                    return self.accept(use_prev, end);
+                }
+                Keys::EccCbc(k) => {
+                    // As RSA, with the policy's HMAC length.
+                    let k = &k.remote;
+                    if encrypt {
+                        k.decrypt(&mut rx[8..]).map_err(|_| checks_failed("decryption failed"))?;
+                    }
+                    end =
+                        end.checked_sub(k.sig_len()).filter(|&e| e >= 16).ok_or(checks_failed("message too short"))?;
+                    if !k.verify_parts(&[&self.hdr, &rx[..end]], &rx[end..]) {
+                        return Err(checks_failed("signature invalid"));
+                    }
+                    if encrypt {
+                        end = 8 + strip_padding(&rx[8..end], false).ok_or(checks_failed("padding invalid"))?;
+                    }
                     return self.accept(use_prev, end);
                 }
             };
@@ -994,11 +1026,11 @@ impl<'a> Connection<'a> {
         let max_body = match mode {
             Mode::None => self.send_buffer as usize - MSG_HEADER_LEN,
             // AEAD: a tag, no padding.
-            _ if policy.is_ecc() => self.send_buffer as usize - MSG_HEADER_LEN - TAG_LEN,
-            Mode::Sign => self.send_buffer as usize - MSG_HEADER_LEN - SYM_SIGNATURE_LEN,
+            _ if policy.is_aead() => self.send_buffer as usize - MSG_HEADER_LEN - TAG_LEN,
+            Mode::Sign => self.send_buffer as usize - MSG_HEADER_LEN - policy.sym_signature_len(),
             Mode::SignAndEncrypt => {
                 let encrypted = (self.send_buffer as usize - SYM_CLEAR_LEN) / crypto::AES_BLOCK * crypto::AES_BLOCK;
-                encrypted - 8 - SYM_SIGNATURE_LEN - 1
+                encrypted - 8 - policy.sym_signature_len() - 1
             }
         };
         let body_len = tx.len() - MSG_HEADER_LEN;
@@ -1048,8 +1080,7 @@ impl<'a> Connection<'a> {
             mode => {
                 let sig = match mode {
                     Mode::None => 0,
-                    _ if policy.is_ecc() => TAG_LEN,
-                    _ => SYM_SIGNATURE_LEN,
+                    _ => policy.sym_signature_len(),
                 };
                 let max_body = self.send_buffer as usize - MSG_HEADER_LEN - sig;
                 let body_len = tx.len() - MSG_HEADER_LEN;
@@ -1084,6 +1115,23 @@ impl<'a> Connection<'a> {
                 k.local.seal(token, prev, &buf[start..], &mut [])
             };
             buf.extend_from_slice(&tag.map_err(|_| checks_failed("encryption failed"))?);
+            return Ok(());
+        }
+        if let Some(Keys::EccCbc(k)) = keys {
+            let k = &k.local;
+            let sig_len = k.sig_len();
+            if mode == Mode::SignAndEncrypt {
+                let plain = buf.len() - start - SYM_CLEAR_LEN;
+                let (pad, _) = crypto::padding(plain, sig_len, crypto::AES_BLOCK, false);
+                buf.extend(std::iter::repeat_n(pad as u8, pad + 1));
+            }
+            let size = (buf.len() - start + sig_len) as u32;
+            write_msg_header(&mut buf[start..start + MSG_HEADER_LEN], kind, size, ch.id, token, seq, request_id);
+            let sig = k.sign_parts(&[&buf[start..]]);
+            buf.extend_from_slice(sig.as_ref());
+            if mode == Mode::SignAndEncrypt {
+                k.encrypt(&mut buf[start + SYM_CLEAR_LEN..]).map_err(|_| checks_failed("encryption failed"))?;
+            }
             return Ok(());
         }
         let keys = match keys {

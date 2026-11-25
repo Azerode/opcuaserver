@@ -3,10 +3,16 @@
 //! EdDSA asymmetric signatures and AEAD symmetric security (AES-GCM or
 //! ChaCha20-Poly1305), with the SecureChannelEnhancements.
 //!
-//! The deprecated ECC_* policies (AES-CBC + HMAC) are not offered.
+//! The deprecated ECC_nistP256 and ECC_nistP384 policies (1.05.00 to
+//! 1.05.03) are offered too, for older clients: AES-CBC + HMAC-SHA2 symmetric
+//! security, no IKM chaining and no channel-bound signatures.
 
 use crate::crypto::{CResult, CryptoError};
-use aws_lc_rs::{aead, agreement, digest, hkdf, rand, signature};
+use aws_lc_rs::cipher::{
+    DecryptingKey, DecryptionContext, EncryptingKey, EncryptionContext, UnboundCipherKey, AES_128, AES_256,
+};
+use aws_lc_rs::iv::FixedLength;
+use aws_lc_rs::{aead, agreement, digest, hkdf, hmac, rand, signature};
 
 /// Length of the AEAD IV (nonce) and of the authentication tag.
 pub const IV_LEN: usize = 12;
@@ -23,9 +29,15 @@ pub enum Curve {
 pub enum Cipher {
     AesGcm,
     ChaChaPoly,
+    /// The deprecated ECC_nistP256 / ECC_nistP384 policies: AES-CBC and
+    /// HMAC-SHA2, without the SecureChannelEnhancements.
+    AesCbc,
 }
 
-/// One ECC AEAD security policy.
+/// AES block (and CBC IV) length.
+pub const CBC_BLOCK: usize = 16;
+
+/// One ECC security policy.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct Suite {
     pub curve: Curve,
@@ -42,9 +54,43 @@ impl Suite {
         Suite { curve: Curve::Curve25519, cipher: Cipher::ChaChaPoly },
     ];
 
+    /// The deprecated non-AEAD policies.
+    pub const LEGACY: [Suite; 2] = [
+        Suite { curve: Curve::NistP256, cipher: Cipher::AesCbc },
+        Suite { curve: Curve::NistP384, cipher: Cipher::AesCbc },
+    ];
+
+    /// Every supported ECC policy, AEAD ones first.
+    pub fn every() -> impl Iterator<Item = Suite> {
+        Suite::ALL.into_iter().chain(Suite::LEGACY)
+    }
+
+    /// AEAD symmetric security and SecureChannelEnhancements (IKM chaining,
+    /// channel-bound signatures).
+    #[inline]
+    pub fn is_aead(self) -> bool {
+        self.cipher != Cipher::AesCbc
+    }
+
+    /// Length of a symmetric signature: the AEAD tag, or the HMAC-SHA256 /
+    /// HMAC-SHA384 of the deprecated policies (also their signing key
+    /// length).
+    #[inline]
+    pub fn sym_signature_len(self) -> usize {
+        match (self.cipher, self.curve) {
+            (Cipher::AesCbc, Curve::NistP384) => 48,
+            (Cipher::AesCbc, _) => 32,
+            _ => TAG_LEN,
+        }
+    }
+
     pub fn uri(self) -> &'static str {
         use {Cipher::*, Curve::*};
         match (self.curve, self.cipher) {
+            (NistP256, AesCbc) => "http://opcfoundation.org/UA/SecurityPolicy#ECC_nistP256",
+            (NistP384, AesCbc) => "http://opcfoundation.org/UA/SecurityPolicy#ECC_nistP384",
+            // Never constructed (not in `every`).
+            (Curve25519, AesCbc) => "",
             (NistP256, AesGcm) => "http://opcfoundation.org/UA/SecurityPolicy#ECC_nistP256_AesGcm",
             (NistP256, ChaChaPoly) => "http://opcfoundation.org/UA/SecurityPolicy#ECC_nistP256_ChaChaPoly",
             (NistP384, AesGcm) => "http://opcfoundation.org/UA/SecurityPolicy#ECC_nistP384_AesGcm",
@@ -55,7 +101,7 @@ impl Suite {
     }
 
     pub fn from_uri(uri: &str) -> Option<Suite> {
-        Suite::ALL.into_iter().find(|s| s.uri() == uri)
+        Suite::every().find(|s| s.uri() == uri)
     }
 
     /// Ephemeral public key on the wire (the OpenSecureChannel nonce): the
@@ -94,6 +140,10 @@ impl Suite {
     /// Base of EndpointDescription.securityLevel (Part 7: the 384-bit tier
     /// rates like Aes256_Sha256_RsaPss).
     pub fn security_level(self) -> u8 {
+        if !self.is_aead() {
+            // Deprecated: below every current policy.
+            return if self.curve == Curve::NistP384 { 4 } else { 2 };
+        }
         match self.curve {
             Curve::NistP384 => 30,
             _ => 10,
@@ -103,6 +153,8 @@ impl Suite {
     pub fn symmetric_uri(self) -> &'static str {
         match (self.cipher, self.sym_key_len()) {
             (Cipher::ChaChaPoly, _) => "http://opcfoundation.org/UA/security/chacha20-poly1305",
+            (Cipher::AesCbc, 16) => "http://www.w3.org/2001/04/xmlenc#aes128-cbc",
+            (Cipher::AesCbc, _) => "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
             (Cipher::AesGcm, 16) => "http://opcfoundation.org/UA/security/aes128-gcm",
             _ => "http://opcfoundation.org/UA/security/aes256-gcm",
         }
@@ -126,6 +178,8 @@ impl Suite {
     fn aead(self) -> &'static aead::Algorithm {
         match (self.cipher, self.sym_key_len()) {
             (Cipher::ChaChaPoly, _) => &aead::CHACHA20_POLY1305,
+            // Not used: AeadKeys refuses non-AEAD suites.
+            (Cipher::AesCbc, _) => &aead::AES_256_GCM,
             (Cipher::AesGcm, 16) => &aead::AES_128_GCM,
             _ => &aead::AES_256_GCM,
         }
@@ -228,6 +282,14 @@ impl Ephemeral {
         let material = derive(suite, &shared, b"opcua-secret", sender, receiver, suite.sym_key_len() + IV_LEN);
         AeadKeys::new(suite, &material)
     }
+
+    /// Same for the deprecated policies: an AES-CBC key and IV, no tag.
+    pub fn secret_cbc(self, suite: Suite, peer: &[u8], sender: &[u8], receiver: &[u8]) -> CResult<Cbc> {
+        let shared = self.agree(suite, peer)?;
+        let k = suite.sym_key_len();
+        let material = derive(suite, &shared, b"opcua-secret", sender, receiver, k + CBC_BLOCK);
+        Cbc::new(&material[..k], &material[k..])
+    }
 }
 
 /// Key material of one direction (Part 6 §6.8.1): HKDF over the IKM with
@@ -258,6 +320,9 @@ pub struct AeadKeys {
 
 impl AeadKeys {
     fn new(suite: Suite, material: &[u8]) -> CResult<AeadKeys> {
+        if !suite.is_aead() {
+            return Err(CryptoError);
+        }
         let k = suite.sym_key_len();
         Ok(AeadKeys {
             key: aead::LessSafeKey::new(aead::UnboundKey::new(suite.aead(), &material[..k])?),
@@ -324,6 +389,127 @@ impl EccKeys {
         let local = derive(suite, ikm, b"opcua-server", server_nonce, client_nonce, len);
         let remote = derive(suite, ikm, b"opcua-client", client_nonce, server_nonce, len);
         Ok(EccKeys { remote: AeadKeys::new(suite, &remote)?, local: AeadKeys::new(suite, &local)? })
+    }
+}
+
+/// AES-CBC with a fixed IV, key schedules prepared once.
+pub struct Cbc {
+    enc: EncryptingKey,
+    dec: DecryptingKey,
+    iv: [u8; CBC_BLOCK],
+}
+
+impl Cbc {
+    fn new(key: &[u8], iv: &[u8]) -> CResult<Cbc> {
+        let alg = if key.len() == 16 { &AES_128 } else { &AES_256 };
+        Ok(Cbc {
+            enc: EncryptingKey::cbc(UnboundCipherKey::new(alg, key)?)?,
+            dec: DecryptingKey::cbc(UnboundCipherKey::new(alg, key)?)?,
+            iv: iv.try_into().map_err(|_| CryptoError)?,
+        })
+    }
+
+    /// In place; `data.len()` must be a multiple of 16.
+    #[inline]
+    pub fn encrypt(&self, data: &mut [u8]) -> CResult<()> {
+        if data.len() % CBC_BLOCK != 0 {
+            return Err(CryptoError);
+        }
+        self.enc.less_safe_encrypt(data, EncryptionContext::Iv128(FixedLength::from(self.iv)))?;
+        Ok(())
+    }
+
+    #[inline]
+    pub fn decrypt(&self, data: &mut [u8]) -> CResult<()> {
+        if data.len() % CBC_BLOCK != 0 {
+            return Err(CryptoError);
+        }
+        self.dec.decrypt(data, DecryptionContext::Iv128(FixedLength::from(self.iv)))?;
+        Ok(())
+    }
+}
+
+/// One direction of a deprecated ECC policy: HMAC signing key, and in
+/// SignAndEncrypt the AES-CBC key and IV.
+pub struct CbcKeys {
+    mac: hmac::Key,
+    sig_len: usize,
+    cbc: Option<Cbc>,
+}
+
+impl CbcKeys {
+    /// `material` = signing key | encrypting key | IV (the last two only
+    /// when encrypting).
+    fn new(suite: Suite, material: &[u8]) -> CResult<CbcKeys> {
+        let s = suite.sym_signature_len();
+        let alg = if s == 48 { hmac::HMAC_SHA384 } else { hmac::HMAC_SHA256 };
+        let cbc = match material.len() > s {
+            true => Some(Cbc::new(&material[s..s + suite.sym_key_len()], &material[s + suite.sym_key_len()..])?),
+            false => None,
+        };
+        Ok(CbcKeys { mac: hmac::Key::new(alg, &material[..s]), sig_len: s, cbc })
+    }
+
+    #[inline]
+    pub fn sig_len(&self) -> usize {
+        self.sig_len
+    }
+
+    /// HMAC over the concatenation of `parts`.
+    #[inline]
+    pub fn sign_parts(&self, parts: &[&[u8]]) -> hmac::Tag {
+        let mut ctx = hmac::Context::with_key(&self.mac);
+        for p in parts {
+            ctx.update(p);
+        }
+        ctx.sign()
+    }
+
+    /// Constant-time check of an HMAC over the concatenation of `parts`.
+    #[inline]
+    pub fn verify_parts(&self, parts: &[&[u8]], sig: &[u8]) -> bool {
+        let expected = self.sign_parts(parts);
+        aws_lc_rs::constant_time::verify_slices_are_equal(expected.as_ref(), sig).is_ok()
+    }
+
+    #[inline]
+    pub fn encrypt(&self, data: &mut [u8]) -> CResult<()> {
+        self.cbc.as_ref().ok_or(CryptoError)?.encrypt(data)
+    }
+
+    #[inline]
+    pub fn decrypt(&self, data: &mut [u8]) -> CResult<()> {
+        self.cbc.as_ref().ok_or(CryptoError)?.decrypt(data)
+    }
+}
+
+/// Both directions of a deprecated ECC channel, from the server's view.
+pub struct LegacyKeys {
+    /// What the client sends (we verify / decrypt).
+    pub remote: CbcKeys,
+    /// What we send.
+    pub local: CbcKeys,
+}
+
+impl LegacyKeys {
+    /// Keys of one OpenSecureChannel exchange: HKDF over the shared secret
+    /// itself (no IKM chaining). In Sign mode only the signing keys are
+    /// derived (L counts them alone, Part 6 §6.8.1).
+    pub fn derive(
+        suite: Suite,
+        secret: &[u8],
+        client_nonce: &[u8],
+        server_nonce: &[u8],
+        encrypt: bool,
+    ) -> CResult<LegacyKeys> {
+        if suite.is_aead() {
+            return Err(CryptoError);
+        }
+        let s = suite.sym_signature_len();
+        let len = if encrypt { s + suite.sym_key_len() + CBC_BLOCK } else { s };
+        let local = derive(suite, secret, b"opcua-server", server_nonce, client_nonce, len);
+        let remote = derive(suite, secret, b"opcua-client", client_nonce, server_nonce, len);
+        Ok(LegacyKeys { remote: CbcKeys::new(suite, &remote)?, local: CbcKeys::new(suite, &local)? })
     }
 }
 
@@ -398,6 +584,37 @@ mod tests {
             let _ = EccKeys::derive(suite, &mut ikm, &s_secret, &cn, &sn).unwrap();
             assert_eq!(ikm, vec![0u8; suite.secret_len()]);
             assert_ne!(first, ikm);
+        }
+    }
+
+    #[test]
+    fn legacy_keys_roundtrip() {
+        for suite in Suite::LEGACY {
+            assert_eq!(Suite::from_uri(suite.uri()), Some(suite));
+            let server = Ephemeral::generate(suite).unwrap();
+            let client = Ephemeral::generate(suite).unwrap();
+            let (sn, cn) = (server.public.clone(), client.public.clone());
+            let secret = server.agree(suite, &cn).unwrap();
+            assert_eq!(secret, client.agree(suite, &sn).unwrap());
+            for encrypt in [false, true] {
+                let srv = LegacyKeys::derive(suite, &secret, &cn, &sn, encrypt).unwrap();
+                // The client signs with the server's `remote` keys.
+                let cli = LegacyKeys::derive(suite, &secret, &cn, &sn, encrypt).unwrap();
+                let sig = cli.remote.sign_parts(&[b"head", b"body"]);
+                assert_eq!(sig.as_ref().len(), suite.sym_signature_len());
+                assert!(srv.remote.verify_parts(&[b"headbody"], sig.as_ref()));
+                assert!(!srv.local.verify_parts(&[b"headbody"], sig.as_ref()));
+                let mut data = [7u8; 32];
+                assert_eq!(cli.remote.encrypt(&mut data).is_ok(), encrypt);
+                if encrypt {
+                    srv.remote.decrypt(&mut data).unwrap();
+                    assert_eq!(data, [7u8; 32]);
+                }
+            }
+            // Sign only: L counts the signing key alone, so its key differs.
+            let a = derive(suite, &secret, b"opcua-client", &cn, &sn, suite.sym_signature_len());
+            let b = derive(suite, &secret, b"opcua-client", &cn, &sn, suite.sym_signature_len() + 48);
+            assert_ne!(a[..], b[..a.len()]);
         }
     }
 

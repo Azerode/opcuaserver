@@ -176,7 +176,8 @@ fn write_ecdh_key(ctx: &Ctx, h: &RequestHeader, s: &Session, w: &mut Writer) -> 
 
 /// Decrypts an EccEncryptedSecret (Part 4 §7.41.2.3) with the session's
 /// ephemeral key: signed by the client's application key, AEAD-encrypted
-/// `nonce | secret | padding | padding size`.
+/// (AES-CBC for the deprecated policies) `nonce | secret | padding |
+/// padding size`.
 fn decrypt_ecc_secret(ctx: &Ctx, s: &Session, data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, u32> {
     let bad = status::BAD_IDENTITY_TOKEN_INVALID;
     let suite = ctx.security.policy.ecc().ok_or(bad)?;
@@ -200,7 +201,8 @@ fn decrypt_ecc_secret(ctx: &Ctx, s: &Session, data: &[u8], nonce: &[u8]) -> Resu
         return Err(bad);
     }
     let sig_len = suite.signature_len();
-    if end != data.len() || end < r.position() + sig_len + crate::ecc::TAG_LEN {
+    let tag_len = if suite.is_aead() { crate::ecc::TAG_LEN } else { 0 };
+    if end != data.len() || end < r.position() + sig_len + tag_len {
         return Err(bad);
     }
     let signed = end - sig_len;
@@ -209,16 +211,21 @@ fn decrypt_ecc_secret(ctx: &Ctx, s: &Session, data: &[u8], nonce: &[u8]) -> Resu
     let sender = r.bytes().map_err(|_| bad)?.unwrap_or(&[]);
     let receiver = r.bytes().map_err(|_| bad)?.unwrap_or(&[]);
     let payload_at = r.position();
-    if payload_at - keys_at != key_len as usize || payload_at + crate::ecc::TAG_LEN > signed {
+    if payload_at - keys_at != key_len as usize || payload_at + tag_len > signed {
         return Err(bad);
     }
     if receiver != eph.public.as_slice() {
         return Err(bad);
     }
-    let keys = eph.secret_keys(suite, sender, sender, receiver).map_err(|_| bad)?;
-    let tag_at = signed - crate::ecc::TAG_LEN;
+    let tag_at = signed - tag_len;
     let mut plain = data[payload_at..tag_at].to_vec();
-    keys.open(0, 0, &data[..payload_at], &mut plain, &data[tag_at..signed]).map_err(|_| bad)?;
+    if suite.is_aead() {
+        let keys = eph.secret_keys(suite, sender, sender, receiver).map_err(|_| bad)?;
+        keys.open(0, 0, &data[..payload_at], &mut plain, &data[tag_at..signed]).map_err(|_| bad)?;
+    } else {
+        let cbc = eph.secret_cbc(suite, sender, sender, receiver).map_err(|_| bad)?;
+        cbc.decrypt(&mut plain).map_err(|_| bad)?;
+    }
     // nonce | secret | padding (n bytes of n) | n (UInt16)
     let mut p = Reader::new(&plain);
     let got_nonce = p.bytes().map_err(|_| bad)?.unwrap_or(&[]);
@@ -307,6 +314,9 @@ pub fn dispatch(ctx: &mut Ctx, r: &mut Reader, w: &mut Writer) -> u32 {
         Some(ids::HISTORY_UPDATE_REQUEST) => crate::history::history_update(ctx, &header, r, w),
         _ => Err(status::BAD_SERVICE_UNSUPPORTED),
     };
+    if ctx.server.config.session_diagnostics {
+        count_request(ctx, &header, &type_id, result);
+    }
     if let Err(code) = result {
         let session_service =
             matches!(type_id.as_ns0(), Some(ids::CREATE_SESSION_REQUEST | ids::ACTIVATE_SESSION_REQUEST));
@@ -315,6 +325,29 @@ pub fn dispatch(ctx: &mut Ctx, r: &mut Reader, w: &mut Writer) -> u32 {
         write_fault(w, handle, code);
     }
     handle
+}
+
+/// Session diagnostics service counters (`--session-diagnostics`).
+#[cold]
+#[inline(never)]
+fn count_request(ctx: &Ctx, header: &RequestHeader, type_id: &NodeId, result: SResult) {
+    let Some(s) = ctx.session.as_ref().filter(|s| s.token == header.auth_token) else { return };
+    let c = &s.diag.counters;
+    let bad = result.is_err();
+    let total = crate::diagnostics::TOTAL_REQUESTS;
+    c[total].fetch_add(1, Ordering::Relaxed);
+    if bad {
+        c[total + 1].fetch_add(1, Ordering::Relaxed);
+    }
+    if result == Err(status::BAD_USER_ACCESS_DENIED) {
+        c[crate::diagnostics::UNAUTHORIZED_REQUESTS].fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(i) = type_id.as_ns0().and_then(crate::diagnostics::service_slot) {
+        c[2 * i].fetch_add(1, Ordering::Relaxed);
+        if bad {
+            c[2 * i + 1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 pub(crate) fn decode_err(_: crate::codec::DecodeError) -> u32 {
@@ -371,12 +404,9 @@ fn get_endpoints(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Write
     r.skip_string_array().map_err(decode_err)?;
     let profiles = r.array(4, |r| r.str()).map_err(decode_err)?;
     begin(w, ids::GET_ENDPOINTS_RESPONSE, h);
-    let matches = profiles.is_empty() || profiles.contains(&Some(TRANSPORT_PROFILE_BINARY));
-    if matches {
-        w.raw(ctx.server.endpoints_encoded());
-    } else {
-        w.empty_array();
-    }
+    let tcp = profiles.is_empty() || profiles.contains(&Some(TRANSPORT_PROFILE_BINARY));
+    let https = profiles.is_empty() || profiles.contains(&Some(crate::https::TRANSPORT_PROFILE_HTTPS));
+    ctx.server.write_endpoints(w, tcp, https);
     Ok(())
 }
 
@@ -414,25 +444,41 @@ const BAD_APPLICATION_SIGNATURE_INVALID: u32 = 0x8058_0000;
 
 fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
     #[allow(clippy::type_complexity)]
-    let mut parse = || -> DResult<(Option<String>, String, Vec<u8>, Option<Vec<u8>>, f64)> {
-        let app_uri = read_application_uri(r)?;
-        let _server_uri = r.str()?;
-        let _endpoint_url = r.str()?;
-        let name = r.str()?.unwrap_or("").to_string();
-        let nonce = r.bytes()?.unwrap_or(&[]).to_vec();
-        let cert = r.bytes()?.filter(|c| !c.is_empty()).map(<[u8]>::to_vec);
-        let timeout = r.f64()?;
-        let _max_response = r.u32()?;
-        Ok((app_uri, name, nonce, cert, timeout))
-    };
-    let (app_uri, name, client_nonce, client_cert, requested_timeout) = parse().map_err(decode_err)?;
+    let mut parse =
+        || -> DResult<(Option<String>, String, Vec<u8>, Option<Vec<u8>>, f64, crate::server::SessionDiag)> {
+            let description = r.rest();
+            let at = r.position();
+            let app_uri = read_application_uri(r)?;
+            let description = &description[..r.position() - at];
+            let server_uri = r.str()?.map(str::to_string);
+            let endpoint_url = r.str()?.map(str::to_string);
+            let name = r.str()?.unwrap_or("").to_string();
+            let nonce = r.bytes()?.unwrap_or(&[]).to_vec();
+            let cert = r.bytes()?.filter(|c| !c.is_empty()).map(<[u8]>::to_vec);
+            let timeout = r.f64()?;
+            let max_response = r.u32()?;
+            let diag = crate::server::SessionDiag::new(description, server_uri, endpoint_url, max_response);
+            Ok((app_uri, name, nonce, cert, timeout, diag))
+        };
+    let (app_uri, name, client_nonce, client_cert, requested_timeout, diag) = parse().map_err(decode_err)?;
     let security = ctx.security.clone();
     let pki = ctx.server.pki();
 
     // Part 4 §5.6.2: checks tied to the secure channel.
     let server_signature = if security.policy == Policy::None {
-        if !ctx.server.endpoint_enabled(Policy::None, Mode::None) {
+        if !security.https && !ctx.server.endpoint_enabled(Policy::None, Mode::None) {
             return Err(status::BAD_SECURITY_POLICY_REJECTED);
+        }
+        // HTTPS with a TLS client certificate: the session's certificate
+        // is that one (Part 6 §7.4.3), with its ApplicationUri.
+        if let Some(tls_cert) = security.client_cert.as_ref().filter(|_| security.https) {
+            let leaf = client_cert.as_deref().and_then(|c| crate::pki::split_chain(c).ok()).map(|c| c[0].to_vec());
+            if leaf.as_deref() != Some(&tls_cert.der[..]) {
+                return Err(status::BAD_SECURITY_CHECKS_FAILED);
+            }
+            if app_uri.is_none() || tls_cert.application_uri != app_uri {
+                return Err(crate::pki::codes::BAD_CERTIFICATE_URI_INVALID);
+            }
         }
         None
     } else {
@@ -467,8 +513,13 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
             Policy::Ecc(suite) => {
                 // Channel-bound (SecureChannelEnhancements): ChannelThumbprint |
                 // clientNonce | H(server cert) | H(client cert) | serverNonce.
+                // Deprecated policies: client certificate | clientNonce.
                 let own = pki.ecc_own(suite.curve).ok_or(status::BAD_INTERNAL_ERROR)?;
-                let data = ecc_signature_data(&security, &client_nonce, &[&own.cert_der, &channel_cert.der], &nonce)?;
+                let data = if suite.is_aead() {
+                    ecc_signature_data(&security, &client_nonce, &[&own.cert_der, &channel_cert.der], &nonce)?
+                } else {
+                    [&channel_cert.der[..], &client_nonce].concat()
+                };
                 own.key.sign(&data).map_err(|_| status::BAD_INTERNAL_ERROR)?
             }
             p => {
@@ -485,6 +536,7 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
         security.clone(),
         nonce.clone(),
         client_nonce.clone(),
+        diag,
     )?;
     let thumbprint = client_cert.as_deref().map(|c| crate::pki::hex(&crypto::thumbprint(c)));
     let channel = ctx.channel_id;
@@ -631,13 +683,19 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
         return Err(status::BAD_SECURITY_CHECKS_FAILED);
     }
 
-    // Proof of possession of the client certificate's private key.
-    if let Some(cert) = &ctx.security.client_cert {
+    // Proof of possession of the client certificate's private key (over
+    // HTTPS, the TLS handshake proved it).
+    if let Some(cert) = ctx.security.client_cert.as_ref().filter(|_| !ctx.security.https) {
         let ok = match ctx.security.policy {
-            // Channel-bound; the algorithm field is ignored.
+            // Channel-bound (deprecated policies: server certificate |
+            // serverNonce); the algorithm field is ignored.
             Policy::Ecc(suite) => {
                 let own = &pki.ecc_own(suite.curve).ok_or(status::BAD_INTERNAL_ERROR)?.cert_der;
-                let data = ecc_signature_data(ctx.security, &nonce, &[own, own, &cert.der], &s.client_nonce)?;
+                let data = if suite.is_aead() {
+                    ecc_signature_data(ctx.security, &nonce, &[own, own, &cert.der], &s.client_nonce)?
+                } else {
+                    [&own[..], &nonce].concat()
+                };
                 suite.verify(&cert.rsa_public_key, &data, &client_sig).is_ok()
             }
             policy => {
@@ -704,7 +762,11 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
                 Policy::Ecc(suite) => {
                     let own = &pki.ecc_own(suite.curve).ok_or(status::BAD_INTERNAL_ERROR)?.cert_der;
                     let client = &ctx.security.client_cert.as_ref().ok_or(status::BAD_SECURITY_CHECKS_FAILED)?.der;
-                    let data = ecc_signature_data(ctx.security, &nonce, &[own, own, client, client], &s.client_nonce)?;
+                    let data = if suite.is_aead() {
+                        ecc_signature_data(ctx.security, &nonce, &[own, own, client, client], &s.client_nonce)?
+                    } else {
+                        [&own[..], &nonce].concat()
+                    };
                     info.curve == Some(suite.curve) && suite.verify(&info.rsa_public_key, &data, &user_sig).is_ok()
                 }
                 policy => {
@@ -726,6 +788,12 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
     // Activation may move the session to the calling channel (Part 4 §5.6.3).
     s.channel_id.store(ctx.channel_id, Ordering::Release);
     s.can_write.store(access.can_write(), Ordering::Release);
+    {
+        let mut history = s.diag.identities.lock().unwrap_or_else(|e| e.into_inner());
+        if history.len() < 16 && history.last() != Some(&identity) {
+            history.push(identity.clone());
+        }
+    }
     *s.identity.lock().unwrap_or_else(|e| e.into_inner()) = identity;
     s.activated.store(true, Ordering::Release);
     if !s.subs.lock().unwrap_or_else(|e| e.into_inner()).is_idle() {
@@ -789,6 +857,7 @@ pub mod attr {
     pub const HISTORIZING: u32 = 20;
     pub const EXECUTABLE: u32 = 21;
     pub const USER_EXECUTABLE: u32 = 22;
+    pub const DATA_TYPE_DEFINITION: u32 = 23;
     pub const ACCESS_LEVEL_EX: u32 = 27;
 }
 
@@ -1037,7 +1106,7 @@ pub fn attribute_value(node: &Node, attribute: u32, can_write: bool) -> Option<V
         (WRITE_MASK | USER_WRITE_MASK, _) => Variant::UInt32(0),
         (IS_ABSTRACT, NodeKind::ObjectType { is_abstract })
         | (IS_ABSTRACT, NodeKind::VariableType { is_abstract, .. })
-        | (IS_ABSTRACT, NodeKind::DataType { is_abstract })
+        | (IS_ABSTRACT, NodeKind::DataType { is_abstract, .. })
         | (IS_ABSTRACT, NodeKind::ReferenceType { is_abstract, .. }) => Variant::Boolean(*is_abstract),
         (SYMMETRIC, NodeKind::ReferenceType { symmetric, .. }) => Variant::Boolean(*symmetric),
         (INVERSE_NAME, NodeKind::ReferenceType { inverse_name: Some(n), .. }) => {
@@ -1069,6 +1138,7 @@ pub fn attribute_value(node: &Node, attribute: u32, can_write: bool) -> Option<V
         (EXECUTABLE, NodeKind::Method { executable }) | (USER_EXECUTABLE, NodeKind::Method { executable }) => {
             Variant::Boolean(*executable)
         }
+        (DATA_TYPE_DEFINITION, NodeKind::DataType { definition: Some(d), .. }) => (**d).clone(),
         _ => return None,
     })
 }
@@ -1133,6 +1203,10 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
     let n = r.length(11).map_err(decode_err)?.unwrap_or(0);
     check_count(ctx, n)?;
     let space = ctx.server.store.cached(ctx.space);
+    // AuditWriteUpdateEvents only while someone subscribes to events: one
+    // relaxed load per request otherwise.
+    let audit = space.events.active();
+    let auditor = if audit { ctx.session.clone() } else { None };
     let now = now_ticks(); // server timestamp of the written values
     begin(w, ids::WRITE_RESPONSE, h);
     w.i32(n as i32);
@@ -1141,6 +1215,7 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
         let attribute = r.u32().map_err(decode_err)?;
         let range = r.str().map_err(decode_err)?;
         let dv = r.data_value().map_err(decode_err)?;
+        let mut old = Variant::Empty;
         let code = (|| {
             let node = space.get(&id).ok_or(status::BAD_NODE_ID_UNKNOWN)?;
             if attribute == 0 || attribute > attr::ACCESS_LEVEL_EX {
@@ -1168,6 +1243,9 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
             if dv.server_timestamp.is_some() {
                 return Err(status::BAD_WRITE_NOT_SUPPORTED);
             }
+            if audit {
+                old = cell.read().value;
+            }
             if let Some(range) = range.filter(|s| !s.is_empty()) {
                 return write_range(cell, range, &dv, now);
             }
@@ -1181,10 +1259,40 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
             cell.write(v, dv.status.unwrap_or(status::GOOD), dv.source_timestamp.unwrap_or(now), now);
             Ok(())
         })();
-        w.u32(code.err().unwrap_or(status::GOOD));
+        let code = code.err().unwrap_or(status::GOOD);
+        if let Some(s) = &auditor {
+            audit_write(ctx.server, s, space, &id, attribute, range, old, dv.value.unwrap_or_default(), code);
+        }
+        w.u32(code);
     }
     w.empty_array();
     Ok(())
+}
+
+/// Raises an AuditWriteUpdateEventType for one write operation (Part 5 §6.4.24).
+#[cold]
+#[allow(clippy::too_many_arguments)]
+fn audit_write(
+    server: &crate::server::Server,
+    s: &crate::server::Session,
+    space: &AddressSpace,
+    id: &NodeId,
+    attribute: u32,
+    range: Option<&str>,
+    old: Variant,
+    new: Variant,
+    code: u32,
+) {
+    use crate::events::types::*;
+    let ok = status::is_good(code);
+    let name = space.get(id).map_or_else(|| id.to_string(), |n| n.browse_name.name.to_string());
+    let message = if ok { format!("Write of {name}") } else { format!("Write of {name} failed (0x{code:08X})") };
+    server.audit_event(AUDIT_WRITE_UPDATE_EVENT_TYPE, s, (id.clone(), &name), &message, ok, |e| {
+        e.with(WRITE_ATTRIBUTE_ID, Variant::UInt32(attribute))
+            .with(WRITE_INDEX_RANGE, range.map_or(Variant::String(None), Variant::string))
+            .with(WRITE_OLD_VALUE, old)
+            .with(WRITE_NEW_VALUE, new)
+    });
 }
 
 // ---------------------------------------------------------------- View

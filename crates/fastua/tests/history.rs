@@ -1,7 +1,8 @@
 //! Historical access (HistoryRead / HistoryUpdate) over a real connection.
 
 use fastua::address_space::ServerInfo;
-use fastua::client::Client;
+use fastua::client::HistoryResult;
+use fastua::client::{Client, FilterOperand, MonitorSpec};
 use fastua::codec::Writer;
 use fastua::history::{UPDATE_INSERT, UPDATE_REPLACE, UPDATE_UPDATE};
 use fastua::pki::Pki;
@@ -24,15 +25,20 @@ const FIXED: NodeId = NodeId::Numeric(2, 2);
 const PLAIN: NodeId = NodeId::Numeric(2, 3);
 
 fn start(name: &str) -> (String, PathBuf) {
+    start_with(name, Limits::default())
+}
+
+fn start_with(name: &str, limits: Limits) -> (String, PathBuf) {
     let dir = std::env::temp_dir().join(format!("fastua-hist-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("m.json"), MACHINE).unwrap();
-    let store = Store::open(&dir, ServerInfo::default()).unwrap();
+    let info = ServerInfo { limits: limits.clone(), ..ServerInfo::default() };
+    let store = Store::open(&dir, info).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let mut config = ServerConfig::all_endpoints(addr.clone(), format!("opc.tcp://{addr}"));
-    config.limits = Limits::default();
+    config.limits = limits;
     config.anonymous = Some(Access::ReadWrite);
     let pki = Pki::open(&dir.join("pki"), "urn:test:fastua", "localhost", false).unwrap();
     let server = Server::new(store, config, pki, Users::default());
@@ -126,7 +132,11 @@ fn writes_are_recorded_and_read_back() {
         .unwrap();
     assert_eq!(r[0].status, status::BAD_INVALID_TIMESTAMP_ARGUMENT);
     let fault = c.history_read(ids::READ_EVENT_DETAILS_ENCODING, &[], 2, false, &[(TEMP, None)]).unwrap();
-    assert_eq!(fault, Err(status::BAD_HISTORY_OPERATION_UNSUPPORTED));
+    assert_eq!(fault, Err(status::BAD_HISTORY_OPERATION_INVALID));
+    // No event history by default.
+    let details = MonitorSpec::events(NodeId::ns0(ids::SERVER), 0, &["Message"]).read_event_details(10, 1, 0);
+    let r = c.history_read(ids::READ_EVENT_DETAILS_ENCODING, &details, 2, false, &[(server(), None)]).unwrap().unwrap();
+    assert_eq!(r[0].status, status::BAD_HISTORY_OPERATION_UNSUPPORTED);
 }
 
 #[test]
@@ -359,4 +369,160 @@ fn aggregate_filter_on_monitored_items() {
     let good: Vec<_> = avgs.iter().filter(|d| d.status == Some(fastua::history::CALCULATED)).collect();
     assert!(good.len() >= 2, "{avgs:?}");
     assert!(counts.iter().any(|d| matches!(d.value, Some(Variant::Int32(n)) if n > 0)), "{counts:?}");
+}
+
+fn server() -> NodeId {
+    NodeId::ns0(ids::SERVER)
+}
+
+/// AuditWriteUpdateEvents of Temp writes: (Time, NewValue).
+fn write_events(c: &mut Client, max: u32, start: i64, end: i64, cp: Option<Vec<u8>>) -> HistoryResult {
+    let mut spec = MonitorSpec::events(server(), 0, &["Time", "2100:NewValue"]);
+    spec.event_where = vec![(14, vec![FilterOperand::Literal(Variant::NodeId(Box::new(NodeId::ns0(2100))))])];
+    let details = spec.read_event_details(max, start, end);
+    let mut r =
+        c.history_read(ids::READ_EVENT_DETAILS_ENCODING, &details, 2, false, &[(server(), cp)]).unwrap().unwrap();
+    r.remove(0)
+}
+
+fn new_values(r: &HistoryResult) -> Vec<f64> {
+    r.events
+        .iter()
+        .map(|f| match &f[1] {
+            Variant::Double(x) => *x,
+            v => panic!("{v:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn event_history_on_the_server_object() {
+    let (addr, dir) = start_with("events", Limits { event_history: 50, ..Limits::default() });
+    let mut c = client(&addr);
+    // The Server object announces HistoryRead in its EventNotifier.
+    let v = c.read(&[(server(), 12), (NodeId::ns0(11242), 13), (NodeId::ns0(11274), 13)]).unwrap();
+    assert_eq!(v[0].value, Some(Variant::Byte(5)));
+    assert_eq!(v[1].value, Some(Variant::Boolean(true)));
+    assert_eq!(v[2].value, Some(Variant::UInt32(10_000)));
+
+    let before = now_ticks() - 1;
+    for x in [1.0, 2.0, 3.0, 4.0, 5.0] {
+        c.write(&[(TEMP, Variant::Double(x))]).unwrap();
+    }
+    let after = now_ticks() + 1;
+
+    // Forward, all at once.
+    let r = write_events(&mut c, 0, before, after, None);
+    assert_eq!(r.status, status::GOOD);
+    assert_eq!(r.type_id, ids::HISTORY_EVENT_ENCODING);
+    assert_eq!(new_values(&r), [1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert!(r.continuation_point.is_none());
+
+    // Two per call with continuation points.
+    let mut seen = Vec::new();
+    let mut cp = None;
+    loop {
+        let r = write_events(&mut c, 2, before, after, cp);
+        seen.extend(new_values(&r));
+        cp = r.continuation_point;
+        if cp.is_none() {
+            break;
+        }
+    }
+    assert_eq!(seen, [1.0, 2.0, 3.0, 4.0, 5.0]);
+
+    // Reverse (start after end), and the newest N with only an end time.
+    assert_eq!(new_values(&write_events(&mut c, 0, after, before, None)), [5.0, 4.0, 3.0, 2.0, 1.0]);
+    let r = write_events(&mut c, 2, 0, after, None);
+    assert_eq!(new_values(&r), [5.0, 4.0]);
+    assert!(r.continuation_point.is_none());
+    // The oldest N with only a start time.
+    assert_eq!(new_values(&write_events(&mut c, 2, before, 0, None)), [1.0, 2.0]);
+
+    // Nothing in range, bad arguments, and a variable is no notifier.
+    assert_eq!(write_events(&mut c, 0, after, after + 10_000, None).status, status::GOOD_NO_DATA);
+    assert_eq!(write_events(&mut c, 0, 0, after, None).status, status::BAD_INVALID_TIMESTAMP_ARGUMENT);
+    let details = MonitorSpec::events(server(), 0, &["Message"]).read_event_details(0, before, after);
+    let r = c.history_read(ids::READ_EVENT_DETAILS_ENCODING, &details, 2, false, &[(TEMP, None)]).unwrap().unwrap();
+    assert_eq!(r[0].status, status::BAD_HISTORY_OPERATION_UNSUPPORTED);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn temp_cell(store: &Store) -> std::sync::Arc<fastua::value::ValueCell> {
+    let space = store.load_full();
+    match &space.get(&TEMP).unwrap().kind {
+        fastua::address_space::NodeKind::Variable { value: fastua::address_space::ValueSource::Cell(c), .. } => {
+            c.clone()
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn source_times(cell: &fastua::value::ValueCell) -> Vec<i64> {
+    let (_, values, _) = cell.history().unwrap().window(0, i64::MAX);
+    values.iter().map(|s| s.source_ts).collect()
+}
+
+#[test]
+fn history_survives_a_restart() {
+    use fastua::persist::Persistence;
+    let dir = std::env::temp_dir().join(format!("fastua-hist-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::write(dir.join("cfg/m.json"), MACHINE).unwrap();
+    let hist = dir.join("history");
+
+    // First run: 100 writes (more than the inline staging buffer), with one
+    // flush in the middle.
+    {
+        let store = Store::open(&dir.join("cfg"), ServerInfo::default()).unwrap();
+        let mut p = Persistence::open(&hist).unwrap();
+        p.pass(&store.load_full());
+        let cell = temp_cell(&store);
+        for t in 1..=100i64 {
+            cell.write(&Variant::Double(t as f64), status::GOOD, t, t);
+            if t == 50 {
+                p.pass(&store.load_full());
+            }
+        }
+        p.pass(&store.load_full());
+    }
+    // Second run: everything is back (capacity 100), then new writes evict
+    // the oldest and are appended.
+    {
+        let store = Store::open(&dir.join("cfg"), ServerInfo::default()).unwrap();
+        let mut p = Persistence::open(&hist).unwrap();
+        p.pass(&store.load_full());
+        let cell = temp_cell(&store);
+        assert_eq!(source_times(&cell), (1..=100).collect::<Vec<_>>());
+        for t in 101..=110i64 {
+            cell.write(&Variant::Double(t as f64), status::GOOD, t, t);
+        }
+        p.pass(&store.load_full());
+    }
+    {
+        let store = Store::open(&dir.join("cfg"), ServerInfo::default()).unwrap();
+        let mut p = Persistence::open(&hist).unwrap();
+        p.pass(&store.load_full());
+        let cell = temp_cell(&store);
+        assert_eq!(source_times(&cell), (11..=110).collect::<Vec<_>>());
+        let h = cell.history().unwrap();
+        let s = h.window(0, i64::MAX).1[0].clone();
+        assert_eq!(s.value, Variant::Double(11.0));
+        // HistoryUpdate deletes rewrite the file.
+        assert_eq!(h.delete_raw(false, 11, 61, &"op".into(), 0), 50);
+        p.pass(&store.load_full());
+    }
+    {
+        let store = Store::open(&dir.join("cfg"), ServerInfo::default()).unwrap();
+        Persistence::open(&hist).unwrap().pass(&store.load_full());
+        let cell = temp_cell(&store);
+        assert_eq!(source_times(&cell), (61..=110).collect::<Vec<_>>());
+        // The deletions are in the modified history again.
+        let q = fastua::history::RawQuery { modified: true, start: 1, end: 200, max: 0, bounds: false };
+        let (mods, _) = cell.history().unwrap().read_raw(&q, None).unwrap();
+        assert_eq!(mods.len(), 50);
+        assert_eq!(mods[0].modification.as_ref().map(|m| (m.1, &*m.2)), Some((fastua::history::UPDATE_DELETE, "op")));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }
