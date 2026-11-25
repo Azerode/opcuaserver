@@ -22,7 +22,9 @@ const PLANT: &str = r#"{ "Name": "Plant", "Namespace": "urn:plant",
     { "Name": "Temp", "NodeId": "ns=3;i=1", "Type": "System.Double",
       "Alarm": { "LowLow": 0, "Low": 10, "High": 80, "HighHigh": 95, "Severity": 700, "Deadband": 2 } },
     { "Name": "Valve", "NodeId": "ns=3;i=2", "Type": "System.Boolean",
-      "Alarm": { "Normal": false, "Severity": 300, "Message": "Valve open" } } ] } ] }"#;
+      "Alarm": { "Normal": false, "Severity": 300, "Message": "Valve open" } },
+    { "Name": "Restart", "NodeId": "ns=3;i=3", "Type": "Int32",
+      "Dialog": { "Prompt": "Restart the line?", "Options": ["Yes", "No"], "Default": 1, "Ok": 0, "Cancel": 1 } } ] } ] }"#;
 
 fn start(name: &str) -> (String, PathBuf) {
     let dir = std::env::temp_dir().join(format!("fastua-al-{name}-{}", std::process::id()));
@@ -317,5 +319,42 @@ fn suppression_and_out_of_service() {
     assert_eq!((&ev[0][0], text(&ev[0][2]).as_str()), (&Variant::Boolean(true), "Out of Service"));
     assert_eq!(call(&mut c, &temp_alarm, SUPPRESS, &[comment("x")]).0, BAD_TOO_MANY_ARGUMENTS);
     assert_eq!(call(&mut c, &temp_alarm, RESET, &[]).0, BAD_INVALID_STATE);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn dialog_condition() {
+    let (addr, dir) = start("dialog");
+    let mut c = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
+    c.create_session("operator").unwrap();
+    let restart = NodeId::Numeric(2, 3);
+    let dialog = NodeId::String(2, "__alarm/i=3".into());
+    let name = c.read(&[(dialog.clone(), 3)]).unwrap();
+    assert_eq!(
+        name[0].value,
+        Some(Variant::QualifiedName(Box::new(QualifiedName { ns: 2, name: "RestartDialog".into() })))
+    );
+    let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
+    let fields = ["EventId", "DialogState/Id", "Prompt", "ResponseOptionSet", "LastResponse", "Retain"];
+    let mut spec = MonitorSpec::events(SERVER, 1, &fields);
+    spec.event_where =
+        vec![(14, vec![FilterOperand::Literal(Variant::NodeId(Box::new(NodeId::ns0(DIALOG_CONDITION_TYPE))))])];
+    assert_eq!(c.monitor(sub, &[spec]).unwrap()[0].0, status::GOOD);
+
+    assert_eq!(call(&mut c, &dialog, RESPOND, &[Variant::Int32(0)]).0, BAD_DIALOG_NOT_ACTIVE);
+    // The application asks: a negative value raises the dialog.
+    c.write(&[(restart.clone(), Variant::Int32(-1))]).unwrap();
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][1], text(&ev[0][2]).as_str()), (&Variant::Boolean(true), "Restart the line?"));
+    assert_eq!(ev[0][5], Variant::Boolean(true));
+    assert_eq!(call(&mut c, &dialog, RESPOND, &[Variant::Int32(5)]).0, BAD_DIALOG_RESPONSE_INVALID);
+    assert_eq!(call(&mut c, &dialog, RESPOND2, &[Variant::Int32(0), comment("go")]).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!(
+        (&ev[0][1], &ev[0][4], &ev[0][5]),
+        (&Variant::Boolean(false), &Variant::Int32(0), &Variant::Boolean(false))
+    );
+    // The answer is in the variable.
+    assert_eq!(c.read(&[(restart, 13)]).unwrap()[0].value, Some(Variant::Int32(0)));
     let _ = std::fs::remove_dir_all(dir);
 }

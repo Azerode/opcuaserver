@@ -625,7 +625,17 @@ fn call_method(
         }
         Ok(())
     };
-    let caller = crate::alarms::Caller { user: &user, can_write, refresh: &mut check };
+    let mut write = |id: &NodeId, v: Variant| {
+        let Some(node) = space.get(id) else { return };
+        if let NodeKind::Variable { value: crate::address_space::ValueSource::Cell(cell), .. } = &node.kind {
+            let f = crate::value::variant_as_f64(&v).unwrap_or(0.0);
+            if let Some(v) = crate::value::variant_from_f64(cell.kind(), f) {
+                let now = now_ticks();
+                cell.write(&v, status::GOOD, now, now);
+            }
+        }
+    };
+    let caller = crate::alarms::Caller { user: &user, can_write, refresh: &mut check, write: &mut write };
     if let Some(r) = crate::alarms::call(&space.alarms, &space.events, object, method, args, caller) {
         if r.is_ok() {
             *resend = true;

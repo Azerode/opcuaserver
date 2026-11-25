@@ -45,11 +45,12 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Methods Acknowledge, Confirm, AddComment, Enable, Disable, ConditionRefresh and ConditionRefresh2, through Call.
   - Shelving: TimedShelve, OneShotShelve and Unshelve (and their 1.05 variants with a comment) on the condition's ShelvingState; a timed shelve ends on its own, a one-shot shelve when the alarm returns to normal. Events carry ShelvingState and SuppressedOrShelved.
   - Suppress / Unsuppress, RemoveFromService / PlaceInService (write rights), Silence and Reset (with `"Latching": true` an alarm stays active until reset), each with its 1.05 variant taking a comment. SuppressedOrShelved covers shelving, suppression and out of service.
+  - Dialogs: an item with a `Dialog` (`Prompt`, `Options`, `Default`, `Ok`, `Cancel`, signed numeric Type) gets a DialogConditionType. Writing a negative value raises the question; Respond / Respond2 write the chosen option index into the variable and close it.
   - Branches: an alarm active again while its previous occurrence is not acknowledged and confirmed keeps that occurrence as a branch, with its own BranchId and EventId, acknowledged and confirmed on its own and reported by ConditionRefresh.
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: per-session diagnostics arrays, dialog conditions, the deprecated non-AEAD ECC policies, HTTPS with client certificates or the JSON encoding.
+Not yet: per-session diagnostics arrays, the deprecated non-AEAD ECC policies, HTTPS with client certificates or the JSON encoding.
 
 ## Build and run
 

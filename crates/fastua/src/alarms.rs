@@ -68,6 +68,9 @@ pub mod types {
     pub const PLACE_IN_SERVICE2: u32 = 24322;
     pub const RESET: u32 = 18199;
     pub const RESET2: u32 = 24324;
+    /// DialogConditionType.Respond / Respond2.
+    pub const RESPOND: u32 = 9069;
+    pub const RESPOND2: u32 = 24312;
 
     /// States of ExclusiveLimitStateMachineType.
     pub const HIGH_HIGH: u32 = 9329;
@@ -92,6 +95,8 @@ pub mod codes {
     pub const BAD_CONDITION_NOT_SHELVED: u32 = 0x80D2_0000;
     pub const BAD_SHELVING_TIME_OUT_OF_RANGE: u32 = 0x80D3_0000;
     pub const BAD_INVALID_STATE: u32 = 0x80AF_0000;
+    pub const BAD_DIALOG_NOT_ACTIVE: u32 = 0x80CD_0000;
+    pub const BAD_DIALOG_RESPONSE_INVALID: u32 = 0x80CE_0000;
 }
 use codes::*;
 
@@ -102,6 +107,9 @@ pub enum AlarmKind {
     Limit { low_low: Option<f64>, low: Option<f64>, high: Option<f64>, high_high: Option<f64> },
     /// OffNormalAlarmType: active while the value differs from `normal`.
     OffNormal { normal: f64 },
+    /// DialogConditionType: a question is pending while the value is
+    /// negative; Respond writes the selected option index into the variable.
+    Dialog { prompt: String, options: Vec<String>, default: i32, ok: i32, cancel: i32 },
 }
 
 /// The `Alarm` section of a configured item.
@@ -124,6 +132,20 @@ impl AlarmConfig {
         match self.kind {
             AlarmKind::Limit { .. } => EXCLUSIVE_LIMIT_ALARM_TYPE,
             AlarmKind::OffNormal { .. } => OFF_NORMAL_ALARM_TYPE,
+            AlarmKind::Dialog { .. } => DIALOG_CONDITION_TYPE,
+        }
+    }
+
+    pub fn is_dialog(&self) -> bool {
+        matches!(self.kind, AlarmKind::Dialog { .. })
+    }
+
+    /// Browse name suffix of the condition object.
+    pub fn suffix(&self) -> &'static str {
+        if self.is_dialog() {
+            "Dialog"
+        } else {
+            "Alarm"
         }
     }
 }
@@ -238,6 +260,8 @@ struct State {
     /// Last shelving transition (id, name, time); id 0 = none yet.
     shelving_transition: (u32, &'static str, i64),
     branches: Vec<Branch>,
+    /// DialogConditionType.LastResponse.
+    last_response: i32,
 }
 
 impl State {
@@ -311,6 +335,7 @@ impl Condition {
             latched: (false, now),
             shelving_transition: (0, "", now),
             branches: Vec::new(),
+            last_response: -1,
         };
         Condition { id, source, source_name: source_name.to_string(), cfg: Mutex::new(cfg), st: Mutex::new(st), bus }
     }
@@ -350,7 +375,7 @@ impl Condition {
             .with(CONDITION_ID, Variant::NodeId(Box::new(self.id.clone())))
             .with(CONDITION_CLASS_ID, Variant::NodeId(Box::new(NodeId::ns0(PROCESS_CONDITION_CLASS_TYPE))))
             .with(CONDITION_CLASS_NAME, text("ProcessConditionClassType"))
-            .with(CONDITION_NAME, Variant::string(&format!("{}Alarm", self.source_name)))
+            .with(CONDITION_NAME, Variant::string(&format!("{}{}", self.source_name, cfg.suffix())))
             .with(BRANCH_ID, Variant::NodeId(Box::new(branch.cloned().unwrap_or(NodeId::NULL))))
             .with(RETAIN, Variant::Boolean(if branch.is_some() { st.retain_branch() } else { st.retain() }))
             .with(ENABLED_STATE, two_state(st.enabled, "Enabled", "Disabled"))
@@ -365,7 +390,24 @@ impl Condition {
             .with(CONDITION_CLIENT_USER_ID, Variant::string(&st.user))
             // Clients that select every field on BaseEventType (asyncua)
             // resolve "ClientUserId" to the AuditEventType declaration.
-            .with(CLIENT_USER_ID, Variant::string(&st.user))
+            .with(CLIENT_USER_ID, Variant::string(&st.user));
+        if let AlarmKind::Dialog { prompt, options, default, ok, cancel } = &cfg.kind {
+            let set = options.iter().map(|o| text(o)).collect();
+            return ev
+                .with(DIALOG_STATE, two_state(active, "Active", "Inactive"))
+                .with(DIALOG_STATE_ID, Variant::Boolean(active))
+                .with(DIALOG_STATE_TRANSITION_TIME, Variant::DateTime(st.active_ts))
+                .with(PROMPT, text(prompt))
+                .with(
+                    RESPONSE_OPTION_SET,
+                    Variant::Array(Box::new(VariantArray { type_id: builtin::LOCALIZEDTEXT, items: set, dims: None })),
+                )
+                .with(DEFAULT_RESPONSE, Variant::Int32(*default))
+                .with(OK_RESPONSE, Variant::Int32(*ok))
+                .with(CANCEL_RESPONSE, Variant::Int32(*cancel))
+                .with(LAST_RESPONSE, Variant::Int32(st.last_response));
+        }
+        let ev = ev
             .with(ACKED_STATE, two_state(st.acked, "Acknowledged", "Unacknowledged"))
             .with(ACKED_STATE_ID, Variant::Boolean(st.acked))
             .with(ACKED_STATE_TRANSITION_TIME, Variant::DateTime(st.acked_ts))
@@ -438,6 +480,7 @@ impl Condition {
                 }
             }
             AlarmKind::OffNormal { .. } => ev.with(NORMAL_STATE, Variant::NodeId(Box::new(self.source.clone()))),
+            AlarmKind::Dialog { .. } => ev, // returned above
         }
     }
 
@@ -453,6 +496,13 @@ impl Condition {
     /// back towards normal).
     fn level_of(cfg: &AlarmConfig, f: f64, cur: Level) -> Level {
         match &cfg.kind {
+            AlarmKind::Dialog { .. } => {
+                if f < 0.0 {
+                    Level::Off
+                } else {
+                    Level::Normal
+                }
+            }
             AlarmKind::OffNormal { normal } => {
                 if f != *normal {
                     Level::Off
@@ -501,6 +551,24 @@ impl Condition {
             st.level
         };
         if level == st.level && !quality_changed {
+            return;
+        }
+        if let AlarmKind::Dialog { prompt, options, .. } = &cfg.kind {
+            let was = st.level;
+            st.level = level;
+            st.severity = cfg.severity;
+            if level != was {
+                st.active_ts = now_ticks();
+            }
+            st.message = if level == Level::Off {
+                prompt.clone()
+            } else {
+                // Answered (Respond, or the application wrote the answer).
+                st.last_response = f as i32;
+                let answer = options.get(f as usize).map_or("", String::as_str);
+                format!("{}: {answer}", cfg.message.as_deref().unwrap_or(prompt))
+            };
+            self.emit(&mut st, &cfg);
             return;
         }
         let was = st.level;
@@ -653,6 +721,29 @@ impl Condition {
             Shelving::Timed(_) => format!("{}Alarm shelved", self.source_name),
         };
         self.emit(&mut st, &cfg);
+        Ok(())
+    }
+
+    /// Respond / Respond2: checks the answer (the caller then writes it into
+    /// the variable, which closes the dialog and reports it).
+    pub fn respond(&self, selected: i32, comment: &str, user: &str) -> Result<(), u32> {
+        let cfg = self.config();
+        let AlarmKind::Dialog { options, .. } = &cfg.kind else { return Err(BAD_METHOD_INVALID) };
+        let mut st = self.lock();
+        if !st.enabled {
+            return Err(BAD_CONDITION_DISABLED);
+        }
+        if st.level != Level::Off {
+            return Err(BAD_DIALOG_NOT_ACTIVE);
+        }
+        if selected < 0 || selected as usize >= options.len() {
+            return Err(BAD_DIALOG_RESPONSE_INVALID);
+        }
+        st.user = user.to_string();
+        if !comment.is_empty() {
+            st.comment = comment.to_string();
+            st.comment_ts = now_ticks();
+        }
         Ok(())
     }
 
@@ -883,6 +974,8 @@ pub struct Caller<'a> {
     /// Checks that a subscription (and event item) belongs to the session
     /// (ConditionRefresh, ConditionRefresh2).
     pub refresh: &'a mut dyn FnMut(u32, Option<u32>) -> Result<(), u32>,
+    /// Writes a value into a variable (the answer of a dialog).
+    pub write: &'a mut dyn FnMut(&NodeId, Variant),
 }
 
 /// A condition method of the Call service, `None` for other methods.
@@ -894,7 +987,7 @@ pub fn call(
     args: &[Variant],
     caller: Caller<'_>,
 ) -> Option<MethodResult> {
-    let Caller { user, can_write, refresh } = caller;
+    let Caller { user, can_write, refresh, write } = caller;
     let m = method.as_ns0()?;
     let shelving = [
         TIMED_SHELVE,
@@ -923,6 +1016,7 @@ pub fn call(
     if ![ENABLE, DISABLE, ADD_COMMENT, ACKNOWLEDGE, CONFIRM, CONDITION_REFRESH, CONDITION_REFRESH2].contains(&m)
         && !shelving.contains(&m)
         && !states.contains(&m)
+        && !matches!(m, RESPOND | RESPOND2)
     {
         return None;
     }
@@ -1011,6 +1105,33 @@ pub fn call(
     let Some(c) = alarms.get(object) else {
         return fail(if object.as_ns0().is_some() { BAD_METHOD_INVALID } else { status::BAD_NODE_ID_UNKNOWN });
     };
+    if matches!(m, RESPOND | RESPOND2) {
+        let want = if m == RESPOND { 1 } else { 2 };
+        if args.len() < want {
+            return fail(BAD_ARGUMENTS_MISSING);
+        }
+        if args.len() > want {
+            return fail(BAD_TOO_MANY_ARGUMENTS);
+        }
+        let mut results = vec![status::GOOD; want];
+        let Variant::Int32(selected) = args[0] else {
+            results[0] = status::BAD_TYPE_MISMATCH;
+            return Some(Err((BAD_INVALID_ARGUMENT, results)));
+        };
+        let comment = match args.get(1) {
+            None | Some(Variant::Empty) => "",
+            Some(Variant::LocalizedText(t)) => t.text.as_deref().unwrap_or(""),
+            Some(_) => {
+                results[1] = status::BAD_TYPE_MISMATCH;
+                return Some(Err((BAD_INVALID_ARGUMENT, results)));
+            }
+        };
+        if let Err(code) = c.respond(selected, comment, user) {
+            return fail(code);
+        }
+        write(&c.source, Variant::Int32(selected));
+        return Some(Ok(Vec::new()));
+    }
     if states.contains(&m) {
         let with_comment = matches!(m, SUPPRESS2 | UNSUPPRESS2 | REMOVE_FROM_SERVICE2 | PLACE_IN_SERVICE2 | RESET2);
         let want = with_comment as usize;

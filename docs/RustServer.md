@@ -387,6 +387,15 @@ An item with an `Alarm` gets a condition object `<Name>Alarm`
   (Suppress2, ..., Reset2) take a comment. A call that changes nothing
   reports nothing. SuppressedOrShelved is true when shelved, suppressed or
   out of service; the events still go out.
+- **Dialogs (DialogConditionType, Part 9 §5.6):** an item with
+  `"Dialog": {"Prompt": "Restart?", "Options": ["Yes", "No"], "Default": 1,
+  "Ok": 0, "Cancel": 1}` (signed numeric Type) gets a condition
+  `<Name>Dialog`. The application raises the question by writing a negative
+  value; Respond (or Respond2 with a comment) checks the option index
+  (`BadDialogNotActive`, `BadDialogResponseInvalid`) and writes it into the
+  variable, which closes the dialog. Writing any value >= 0 also closes it
+  (the application answered or withdrew it). Events carry DialogState,
+  Prompt, ResponseOptionSet, Default / Ok / CancelResponse and LastResponse.
 - **Branches (Part 9 §4.4):** an alarm that becomes active again while its
   previous occurrence is not yet acknowledged and confirmed keeps that
   occurrence as a branch (a more severe limit is the same occurrence). The
@@ -398,7 +407,7 @@ An item with an `Alarm` gets a condition object `<Name>Alarm`
 - **Reloads:** condition states survive reloads; new limits or severity
   apply at the next evaluation; a removed alarm disappears.
 
-Not yet: dialog conditions and the
+Not yet: the
 condition's state variables as browsable nodes (their values travel in the
 events).
 

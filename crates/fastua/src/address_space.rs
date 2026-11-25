@@ -1154,7 +1154,7 @@ pub fn build(
                     .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
                 b.link(group, ids::HAS_COMPONENT, var);
                 if let Some(a) = &it.alarm {
-                    let name = format!("{}Alarm", it.name);
+                    let name = format!("{}{}", it.name, a.suffix());
                     let cond = b
                         .add(Node {
                             id: alarm_id,
@@ -1169,22 +1169,24 @@ pub fn build(
                     b.link(cond, ids::HAS_TYPE_DEFINITION, td);
                     b.link(var, ids::HAS_CONDITION, cond);
                     // Target of the shelving methods (Part 9 §5.8.10).
-                    let shelving = b
-                        .add(Node {
-                            id: NodeId::String(
-                                ns,
-                                format!("__alarm/{}{}", it.node_id, crate::alarms::SHELVING_STATE_SUFFIX).into(),
-                            ),
-                            browse_name: QualifiedName { ns: 0, name: "ShelvingState".into() },
-                            display_name: LocalizedText::new("ShelvingState"),
-                            description: None,
-                            refs: Vec::with_capacity(2),
-                            kind: NodeKind::Object { event_notifier: 0 },
-                        })
-                        .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
-                    let sst = b.idx(crate::alarms::types::SHELVED_STATE_MACHINE_TYPE);
-                    b.link(cond, ids::HAS_COMPONENT, shelving);
-                    b.link(shelving, ids::HAS_TYPE_DEFINITION, sst);
+                    if !a.is_dialog() {
+                        let shelving = b
+                            .add(Node {
+                                id: NodeId::String(
+                                    ns,
+                                    format!("__alarm/{}{}", it.node_id, crate::alarms::SHELVING_STATE_SUFFIX).into(),
+                                ),
+                                browse_name: QualifiedName { ns: 0, name: "ShelvingState".into() },
+                                display_name: LocalizedText::new("ShelvingState"),
+                                description: None,
+                                refs: Vec::with_capacity(2),
+                                kind: NodeKind::Object { event_notifier: 0 },
+                            })
+                            .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
+                        let sst = b.idx(crate::alarms::types::SHELVED_STATE_MACHINE_TYPE);
+                        b.link(cond, ids::HAS_COMPONENT, shelving);
+                        b.link(shelving, ids::HAS_TYPE_DEFINITION, sst);
+                    }
                 }
                 let Some((low, high)) = it.eu_range else {
                     b.link(var, ids::HAS_TYPE_DEFINITION, bdv_type);

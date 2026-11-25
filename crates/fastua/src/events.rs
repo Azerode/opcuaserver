@@ -75,6 +75,16 @@ pub mod types {
     pub const EXCLUSIVE_LIMIT_ALARM_TYPE: u32 = 9341;
     pub const DISCRETE_ALARM_TYPE: u32 = 10523;
     pub const OFF_NORMAL_ALARM_TYPE: u32 = 10637;
+    pub const DIALOG_CONDITION_TYPE: u32 = 2830;
+    pub const DIALOG_STATE: u32 = 9055;
+    pub const DIALOG_STATE_ID: u32 = 9056;
+    pub const DIALOG_STATE_TRANSITION_TIME: u32 = 9060;
+    pub const PROMPT: u32 = 2831;
+    pub const RESPONSE_OPTION_SET: u32 = 9064;
+    pub const DEFAULT_RESPONSE: u32 = 9065;
+    pub const OK_RESPONSE: u32 = 9066;
+    pub const CANCEL_RESPONSE: u32 = 9067;
+    pub const LAST_RESPONSE: u32 = 9068;
     pub const REFRESH_START_EVENT_TYPE: u32 = 2787;
     pub const REFRESH_END_EVENT_TYPE: u32 = 2788;
 
@@ -421,6 +431,23 @@ pub const EVENT_TYPES: &[EventTypeDef] = &[
         parent: DISCRETE_ALARM_TYPE,
         is_abstract: false,
         fields: &[(NORMAL_STATE, "NormalState", 17, -1)],
+    },
+    EventTypeDef {
+        id: DIALOG_CONDITION_TYPE,
+        name: "DialogConditionType",
+        parent: CONDITION_TYPE,
+        is_abstract: false,
+        fields: &[
+            (DIALOG_STATE, "DialogState", 21, -1),
+            (DIALOG_STATE_ID, "DialogState/Id", 1, -1),
+            (DIALOG_STATE_TRANSITION_TIME, "DialogState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (PROMPT, "Prompt", 21, -1),
+            (RESPONSE_OPTION_SET, "ResponseOptionSet", 21, 1),
+            (DEFAULT_RESPONSE, "DefaultResponse", 6, -1),
+            (OK_RESPONSE, "OkResponse", 6, -1),
+            (CANCEL_RESPONSE, "CancelResponse", 6, -1),
+            (LAST_RESPONSE, "LastResponse", 6, -1),
+        ],
     },
 ];
 
