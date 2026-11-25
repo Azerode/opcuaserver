@@ -54,8 +54,18 @@ NodeId and type keeps its current value across reloads.
 
 - Blocking thread per connection, `TCP_NODELAY`, buffers allocated once per
   connection; single-chunk responses are built in place and sent with one syscall.
+- Buffered receive: one `recv` brings a whole request (and any pipelined requests).
+- Optional busy polling (`--busy-poll US`): a connection thread polls its socket for
+  `US` microseconds before sleeping, which removes the scheduler wake-up from the
+  round trip (loopback: ~30 µs → ~7 µs when the client also polls) at the cost of one
+  busy core per active connection. It also sets `SO_BUSY_POLL` for NIC-level polling
+  (needs `CAP_NET_ADMIN` above `net.core.busy_read`). Best combined with pinning the
+  server to dedicated cores (`taskset`, `isolcpus`).
 - Zero-copy decoding, all lengths bounded before allocation.
-- Address space references resolved to dense indexes at build time; NodeId lookup through FxHash.
+- Address space references resolved to dense indexes at build time; numeric NodeIds of
+  dense namespaces looked up in a direct table, others through FxHash.
+- Fixed-layout fast paths for the RequestHeader and ReadValueId; one coarse clock read
+  per request.
 - Variable values in a seqlock: wait-free reads, no shared writes on read.
 - Release profile: fat LTO, 1 codegen unit, `panic = "abort"`.
 

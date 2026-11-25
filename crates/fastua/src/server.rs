@@ -68,6 +68,10 @@ pub struct ServerConfig {
     pub anonymous: Option<Access>,
     /// Rights of users authenticated by a trusted X.509 certificate.
     pub x509_users: Access,
+    /// How long a connection thread polls its socket before sleeping (zero =
+    /// never). Removes the wake-up latency at the cost of a busy core per
+    /// connection while its client is idle.
+    pub busy_poll: Duration,
 }
 
 impl ServerConfig {
@@ -85,6 +89,7 @@ impl ServerConfig {
             endpoints,
             anonymous: Some(Access::ReadOnly),
             x509_users: Access::ReadWrite,
+            busy_poll: Duration::ZERO,
         }
     }
 }
@@ -362,6 +367,9 @@ impl Server {
         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         let r = std::thread::Builder::new().name("fastua-conn".into()).spawn(move || {
             let _ = stream.set_nodelay(true);
+            if !server.config.busy_poll.is_zero() {
+                crate::net::set_kernel_busy_poll(&stream, server.config.busy_poll);
+            }
             if let Err(e) = crate::channel::run(&server, stream) {
                 crate::log!("connection {peer} closed: {e}");
             }

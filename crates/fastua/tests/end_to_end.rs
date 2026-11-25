@@ -12,6 +12,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 fn start(dir: &std::path::Path, limits: Limits) -> String {
+    start_with(dir, limits, std::time::Duration::ZERO)
+}
+
+fn start_with(dir: &std::path::Path, limits: Limits, busy_poll: std::time::Duration) -> String {
     let store = Store::open(dir, ServerInfo::default()).unwrap();
     store.watch().unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -19,6 +23,7 @@ fn start(dir: &std::path::Path, limits: Limits) -> String {
     let mut config = ServerConfig::all_endpoints(addr.clone(), format!("opc.tcp://{addr}"));
     config.limits = limits;
     config.anonymous = Some(Access::ReadWrite);
+    config.busy_poll = busy_poll;
     let pki = Pki::open(&dir.join("pki"), "urn:test:fastua", "localhost", false).unwrap();
     let server = Server::new(store, config, pki, Users::default());
     std::thread::spawn(move || server.serve(listener));
@@ -163,4 +168,59 @@ fn hot_reload_is_visible_to_connected_clients() {
         assert!(t.elapsed() < Duration::from_secs(5), "reload not observed");
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+/// Many requests in one TCP write: the receive buffer holds several chunks
+/// at once; every response must come back, in order, with the right value.
+/// Runs with and without busy polling.
+#[test]
+fn pipelined_requests_and_busy_poll() {
+    for (name, spin) in [("pipe", 0u64), ("spin", 200)] {
+        let dir = temp_config(name, MACHINE);
+        let addr = start_with(&dir, Limits::default(), std::time::Duration::from_micros(spin));
+        let mut c = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
+        c.create_session("pipe").unwrap();
+        let ns = 2;
+        assert_eq!(c.write(&[(NodeId::Numeric(ns, 2), Variant::Int32(41))]).unwrap(), vec![status::GOOD]);
+        for n in [1usize, 2, 50, 700] {
+            let all = c.read_pipelined(&[(NodeId::Numeric(ns, 2), 13)], n).unwrap();
+            assert_eq!(all.len(), n);
+            for dv in all {
+                assert_eq!(dv[0].value, Some(Variant::Int32(41)), "{name} x{n}");
+            }
+        }
+        // Normal request/response still works after the pipelined bursts.
+        assert_eq!(c.read(&[(NodeId::Numeric(ns, 2), 13)]).unwrap()[0].value, Some(Variant::Int32(41)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Mutual certificate authentication on every policy and mode: session,
+/// read, write and a multi-chunk response, through the test client's own
+/// implementation of the secure channel.
+#[test]
+fn secure_channels_end_to_end() {
+    use fastua::crypto::{Mode, Policy};
+    let dir = temp_config("secure", MACHINE);
+    let addr = start(&dir, Limits::default());
+    let (cert, key) = fastua::pki::generate_self_signed("urn:fastua:test-client", "localhost").unwrap();
+    let trusted = dir.join("pki/trusted/certs");
+    std::fs::create_dir_all(&trusted).unwrap();
+    std::fs::write(trusted.join("client.der"), &cert).unwrap();
+    let server_cert = std::fs::read(dir.join("pki/own/certs/fastua.der")).unwrap();
+    let url = format!("opc.tcp://{addr}");
+    for policy in Policy::SECURE {
+        for mode in [Mode::Sign, Mode::SignAndEncrypt] {
+            let mut c = Client::connect_secure(&addr, &url, policy, mode, &cert, &key, &server_cert).unwrap();
+            c.create_session("secure").unwrap();
+            let id = NodeId::Numeric(2, 2);
+            assert_eq!(c.write(&[(id.clone(), Variant::Int32(7))]).unwrap(), vec![status::GOOD], "{policy:?} {mode:?}");
+            assert_eq!(c.read(&[(id.clone(), 13)]).unwrap()[0].value, Some(Variant::Int32(7)));
+            let many = vec![(id.clone(), 13); 3000];
+            assert_eq!(c.read(&many).unwrap().len(), 3000, "multi-chunk {policy:?} {mode:?}");
+            let all = c.read_pipelined(&[(id, 13)], 20).unwrap();
+            assert_eq!(all.len(), 20);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -17,5 +17,11 @@ libc = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = { version = "0.10", features = ["compress"] }
 time = "0.3.44"
 x509-parser = { version = "0.18", default-features = false }
+
+# The aarch64 SHA-2 instructions are behind sha2's "asm" feature (x86 SHA-NI is
+# detected at run time without it).
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha2 = { version = "0.10", features = ["compress", "asm"] }
