@@ -447,3 +447,76 @@ fn event_history_on_the_server_object() {
     assert_eq!(r[0].status, status::BAD_HISTORY_OPERATION_UNSUPPORTED);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+fn temp_cell(store: &Store) -> std::sync::Arc<fastua::value::ValueCell> {
+    let space = store.load_full();
+    match &space.get(&TEMP).unwrap().kind {
+        fastua::address_space::NodeKind::Variable { value: fastua::address_space::ValueSource::Cell(c), .. } => {
+            c.clone()
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn source_times(cell: &fastua::value::ValueCell) -> Vec<i64> {
+    let (_, values, _) = cell.history().unwrap().window(0, i64::MAX);
+    values.iter().map(|s| s.source_ts).collect()
+}
+
+#[test]
+fn history_survives_a_restart() {
+    use fastua::persist::Persistence;
+    let dir = std::env::temp_dir().join(format!("fastua-hist-persist-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("cfg")).unwrap();
+    std::fs::write(dir.join("cfg/m.json"), MACHINE).unwrap();
+    let hist = dir.join("history");
+
+    // First run: 100 writes (more than the inline staging buffer), with one
+    // flush in the middle.
+    {
+        let store = Store::open(&dir.join("cfg"), ServerInfo::default()).unwrap();
+        let mut p = Persistence::open(&hist).unwrap();
+        p.pass(&store.load_full());
+        let cell = temp_cell(&store);
+        for t in 1..=100i64 {
+            cell.write(&Variant::Double(t as f64), status::GOOD, t, t);
+            if t == 50 {
+                p.pass(&store.load_full());
+            }
+        }
+        p.pass(&store.load_full());
+    }
+    // Second run: everything is back (capacity 100), then new writes evict
+    // the oldest and are appended.
+    {
+        let store = Store::open(&dir.join("cfg"), ServerInfo::default()).unwrap();
+        let mut p = Persistence::open(&hist).unwrap();
+        p.pass(&store.load_full());
+        let cell = temp_cell(&store);
+        assert_eq!(source_times(&cell), (1..=100).collect::<Vec<_>>());
+        for t in 101..=110i64 {
+            cell.write(&Variant::Double(t as f64), status::GOOD, t, t);
+        }
+        p.pass(&store.load_full());
+    }
+    {
+        let store = Store::open(&dir.join("cfg"), ServerInfo::default()).unwrap();
+        let mut p = Persistence::open(&hist).unwrap();
+        p.pass(&store.load_full());
+        let cell = temp_cell(&store);
+        assert_eq!(source_times(&cell), (11..=110).collect::<Vec<_>>());
+        let h = cell.history().unwrap();
+        let s = h.window(0, i64::MAX).1[0].clone();
+        assert_eq!(s.value, Variant::Double(11.0));
+        // HistoryUpdate deletes rewrite the file.
+        assert_eq!(h.delete_raw(false, 11, 61, &"op".into(), 0), 50);
+        p.pass(&store.load_full());
+    }
+    {
+        let store = Store::open(&dir.join("cfg"), ServerInfo::default()).unwrap();
+        Persistence::open(&hist).unwrap().pass(&store.load_full());
+        assert_eq!(source_times(&temp_cell(&store)), (61..=110).collect::<Vec<_>>());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

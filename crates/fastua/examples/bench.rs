@@ -327,6 +327,29 @@ fn history_engine() {
     hist.set_history(Some(10_000));
     println!("history        write, no history  {:>6.1} ns", run(&plain));
     println!("history        write, historized  {:>6.1} ns", run(&hist));
+    // With --history-dir: the journal is emptied by the persistence thread
+    // every second; here every 100 000 writes, outside the timing.
+    let persisted = ValueCell::new(builtin::DOUBLE, 0);
+    persisted.set_history(Some(10_000));
+    persisted.history().unwrap().start_persisting(Vec::new(), false);
+    let mut best = f64::MAX;
+    for _ in 0..7 {
+        let mut ns = 0;
+        for _ in 0..20 {
+            let t = Instant::now();
+            for i in 0..100_000 {
+                let ts = clock.get() + 1;
+                clock.set(ts);
+                persisted.write(black_box(&Variant::Double(i as f64)), status::GOOD, ts, 2);
+            }
+            ns += t.elapsed().as_nanos();
+            persisted.history().unwrap().take_for_disk(|s| {
+                black_box(s);
+            });
+        }
+        best = best.min(ns as f64 / 2_000_000.0);
+    }
+    println!("history        write, persisted   {best:>6.1} ns");
     let h = hist.history().unwrap();
     let last = clock.get();
     let mut out = Vec::with_capacity(1 << 20);

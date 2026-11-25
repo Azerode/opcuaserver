@@ -31,6 +31,8 @@ const USAGE: &str = "usage: fastua [options]
                           (default: cores - 1); fewer when the CPUs are busy
   --min-publishing-interval MS   fastest subscription publishing interval (default: 1, minimum 0.05)
   --min-sampling-interval MS     fastest monitored item sampling interval (default: 1, minimum 0.05)
+  --history-dir DIR       keep the history of historized variables in DIR across restarts
+                          (written every second by a background thread)
   --event-history N       keep the last N events for HistoryRead on the Server object (default: 0, off)";
 
 fn fail(msg: String) -> ! {
@@ -96,6 +98,7 @@ fn main() {
     let mut min_publishing: Option<f64> = None;
     let mut min_sampling: Option<f64> = None;
     let mut event_history = 0usize;
+    let mut history_dir: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("hash-password") {
@@ -144,6 +147,7 @@ fn main() {
                     min_sampling = Some(ms);
                 }
             }
+            "--history-dir" => history_dir = Some(PathBuf::from(value("--history-dir"))),
             "--event-history" => {
                 let v = value("--event-history");
                 event_history = v.parse().unwrap_or_else(|_| fail(format!("invalid --event-history '{v}'\n\n{USAGE}")));
@@ -193,6 +197,13 @@ fn main() {
         for (i, ns) in s.namespaces.iter().enumerate() {
             fastua::log!("  ns={i} {ns}");
         }
+    }
+    if let Some(dir) = &history_dir {
+        let mut p = fastua::persist::Persistence::open(dir)
+            .unwrap_or_else(|e| fail(format!("cannot open history directory {}: {e}", dir.display())));
+        p.pass(&store.load_full());
+        fastua::log!("history persisted in {}", dir.display());
+        p.spawn(store.clone(), std::time::Duration::from_secs(1));
     }
     if let Err(e) = store.watch() {
         fail(format!("cannot watch {}: {e}", config_dir.display()));

@@ -33,6 +33,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
 - **Historical access:** variables marked `Historizing` keep their last values (10 000 by default) in memory.
   - HistoryRead: raw values (with bounds, forward and reverse), modified values, values at given times (interpolated), with continuation points.
   - HistoryUpdate: insert, replace, update, delete a range, delete at times; every change goes to the modified history with its user.
+  - Persistence (`--history-dir DIR`): histories survive restarts. A background thread appends each second's new values to one file per variable; writers never touch the disk (+4.5 ns per historized write).
   - Event history (`--event-history N`): the Server object keeps the last N events; HistoryRead with ReadEventDetails returns them through an EventFilter (select and where clauses), forward or reverse, with continuation points.
   - HistoryServerCapabilities describes what is supported.
 - **Aggregates:** 37 aggregate functions of Part 13 (averages, time averages, totals, minimum / maximum and their variants, range, count, start / end and bounds, durations in state, transitions, quality durations and percentages, worst quality, standard deviation and variance).
@@ -44,7 +45,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: per-session diagnostics arrays, condition branches and shelving, dialog conditions, history persistence across restarts, the deprecated non-AEAD ECC policies, the HTTPS transport (`opc.https`).
+Not yet: per-session diagnostics arrays, condition branches and shelving, dialog conditions, the deprecated non-AEAD ECC policies, the HTTPS transport (`opc.https`).
 
 ## Build and run
 
@@ -74,6 +75,7 @@ Main options (`fastua --help` lists them all):
 | `--busy-poll US` | Polls each connection for `US` µs before sleeping. Lowest latency, at the cost of busy cores. Only as many connections spin as there are free cores, so throughput under many clients does not collapse. |
 | `--busy-poll-threads N` | Ceiling on the connections that busy-poll at once (default: cores - 1). |
 | `--min-publishing-interval MS`, `--min-sampling-interval MS` | Fastest subscription intervals (default 1 ms, at least 0.05 ms). |
+| `--history-dir DIR` | Keep the history of historized variables across restarts (written every second). |
 | `--event-history N` | Keep the last N events for HistoryRead on the Server object (default 0, off). |
 
 `echo -n 's3cret' | ./target/release/fastua hash-password` prints a password hash for the users file.

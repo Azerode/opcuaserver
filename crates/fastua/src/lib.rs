@@ -14,6 +14,7 @@ pub mod events;
 pub mod history;
 pub mod net;
 pub mod ns0;
+pub mod persist;
 pub mod pki;
 pub mod reload;
 pub mod server;

@@ -61,6 +61,11 @@ struct Store {
     raw: VecDeque<Sample>,
     cap: usize,
     modified: VecDeque<Modified>,
+    /// Persistence on (see [`crate::persist`]): the values recorded since
+    /// the last flush, in arrival order.
+    journal: Option<Vec<Sample>>,
+    /// HistoryUpdate changed past values: the file is rewritten.
+    rewrite: bool,
 }
 
 pub struct History {
@@ -120,7 +125,16 @@ impl Store {
         }
     }
 
+    /// Records a new value (a write of the variable).
+    fn push_new(&mut self, s: Sample) {
+        if let Some(j) = &mut self.journal {
+            j.push(s.clone());
+        }
+        self.insert(s);
+    }
+
     fn log(&mut self, sample: Sample, kind: u32, user: &Arc<str>, now: i64) {
+        self.rewrite |= self.journal.is_some();
         if self.modified.len() >= self.cap.max(1) {
             self.modified.pop_front();
         }
@@ -168,7 +182,13 @@ impl History {
                 head: AtomicU32::new(0),
                 slots: std::array::from_fn(|_| Default::default()),
             },
-            store: Mutex::new(Store { raw: VecDeque::with_capacity(cap.min(1024)), cap, modified: VecDeque::new() }),
+            store: Mutex::new(Store {
+                raw: VecDeque::with_capacity(cap.min(1024)),
+                cap,
+                modified: VecDeque::new(),
+                journal: None,
+                rewrite: false,
+            }),
         }
     }
 
@@ -212,9 +232,12 @@ impl History {
             st.raw.drain(..keep_from);
             let skip = excess - keep_from; // more staged values than capacity
             st.raw.extend((skip as u32..n as u32).map(|k| sample(slot(h.wrapping_add(k)))));
+            if let Some(j) = &mut st.journal {
+                j.extend((0..n as u32).map(|k| sample(slot(h.wrapping_add(k)))));
+            }
         } else {
             for k in 0..n as u32 {
-                st.insert(sample(slot(h.wrapping_add(k))));
+                st.push_new(sample(slot(h.wrapping_add(k))));
             }
         }
         self.stage.head.store(t, Ordering::Release);
@@ -265,7 +288,49 @@ impl History {
     /// Records a write of the current value.
     #[inline]
     pub fn record(&self, s: Sample) {
-        self.lock().insert(s);
+        self.lock().push_new(s);
+    }
+
+    /// The values are written to disk.
+    pub(crate) fn persisting(&self) -> bool {
+        self.store.lock().unwrap_or_else(|e| e.into_inner()).journal.is_some()
+    }
+
+    /// Starts persistence with the values read back from disk (`rewrite`:
+    /// the file must be rewritten, it was damaged or of another kind).
+    pub fn start_persisting(&self, restored: Vec<Sample>, rewrite: bool) {
+        let mut st = self.lock();
+        for s in restored {
+            st.insert(s);
+        }
+        st.journal = Some(Vec::new());
+        st.rewrite = rewrite;
+    }
+
+    /// The file holds too many evicted values: rewrite it next time.
+    pub(crate) fn request_rewrite(&self) {
+        self.lock().rewrite = true;
+    }
+
+    pub(crate) fn capacity(&self) -> usize {
+        self.store.lock().unwrap_or_else(|e| e.into_inner()).cap
+    }
+
+    /// Encodes what reaches the disk next with `f`, under the lock: every
+    /// value when the file is rewritten (returns true), else the values
+    /// recorded since the last call.
+    pub fn take_for_disk(&self, mut f: impl FnMut(&Sample)) -> bool {
+        let mut st = self.lock();
+        let st = &mut *st;
+        let Some(j) = &mut st.journal else { return false };
+        let rewrite = std::mem::take(&mut st.rewrite);
+        if rewrite {
+            st.raw.iter().for_each(&mut f);
+        } else {
+            j.iter().for_each(&mut f);
+        }
+        j.clear();
+        rewrite
     }
 
     pub fn len(&self) -> usize {

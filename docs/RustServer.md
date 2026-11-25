@@ -269,6 +269,19 @@ HistoryRead (and, when writable, HistoryWrite) AccessLevel bits.
   encodes the selected fields straight from the stored events under that
   lock, with no copy.
 - **Not yet:** annotations, HistoryUpdate of events.
+- **Persistence (`--history-dir DIR`):** each historized variable has a file
+  named by a hash of its namespace URI and identifier (so namespace index
+  changes do not matter). Writers never touch the disk: a recorded value is
+  also pushed into a journal under the history lock they already take (once
+  per 32 inline writes). A background thread wakes every second, encodes each
+  journal under that lock, appends it to the file and syncs it. HistoryUpdate
+  changes, a damaged file (torn last record, other type) or a file holding
+  more than twice the capacity make the next pass rewrite the file through a
+  temporary file and a rename. At startup the files are read back before the
+  server listens; variables added by a reload are restored on the next pass.
+  A crash loses at most the last second. The modification log
+  (HistoryModifiedData) is not persisted. Cost: 12.8 -> 17.3 ns per
+  historized write (dev VM).
 - **Cost:** a write of a variable without history checks one flag stored in
   the padding of the cell's first cache line (no measurable change). A
   historized write adds a short uncontended mutex and a push into the ring,
@@ -459,5 +472,4 @@ those elements are compared and reported, through the Variant path) and events w
 [Events](#events)), alarms and conditions (see
 [Alarms and conditions](#alarms-and-conditions)).
 
-Not yet: condition branches and shelving,
-history persistence across restarts, the deprecated non-AEAD ECC policies.
+Not yet: condition branches and shelving, the deprecated non-AEAD ECC policies.
