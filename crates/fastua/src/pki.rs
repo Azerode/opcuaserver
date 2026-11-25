@@ -4,6 +4,8 @@
 //! pki/
 //!   own/certs/fastua.der        server application instance certificate
 //!   own/private/fastua.pk8      its RSA private key (PKCS#8 DER, mode 0600)
+//!   own/certs/fastua_<curve>.der, own/private/fastua_<curve>.pk8
+//!                               ECC certificates (nistP256, nistP384, curve25519)
 //!   trusted/certs, trusted/crl  trusted application certificates / CAs, and CRLs
 //!   issuers/certs, issuers/crl  CAs used only to build chains, and their CRLs
 //!   rejected/certs              certificates that failed the trust check
@@ -83,11 +85,15 @@ fn der_len(d: &[u8]) -> Option<usize> {
 pub struct CertInfo {
     pub der: Vec<u8>,
     pub application_uri: Option<String>,
-    /// PKCS#1 RSAPublicKey (for signature verification).
+    /// The SubjectPublicKey bits: PKCS#1 RSAPublicKey, uncompressed EC
+    /// point or Ed25519 key (for signature verification).
     pub rsa_public_key: Vec<u8>,
     /// SubjectPublicKeyInfo (for encryption).
     pub spki: Vec<u8>,
+    /// RSA modulus size; 0 for ECC keys.
     pub key_bits: usize,
+    /// Curve of an ECC key.
+    pub curve: Option<crate::ecc::Curve>,
     pub thumbprint: [u8; 20],
 }
 
@@ -95,8 +101,13 @@ pub fn inspect(der: &[u8]) -> Result<CertInfo, u32> {
     let (_, cert) = X509Certificate::from_der(der).map_err(|_| BAD_CERTIFICATE_INVALID)?;
     let pk = cert.public_key();
     let spki = pk.raw.to_vec();
-    let key_bits =
-        aws_lc_rs::rsa::PublicEncryptingKey::from_der(&spki).map_err(|_| BAD_CERTIFICATE_INVALID)?.key_size_bits();
+    let curve = key_curve(&cert);
+    let key_bits = match curve {
+        Some(_) => 0,
+        None => aws_lc_rs::rsa::PublicEncryptingKey::from_der(&spki)
+            .map_err(|_| BAD_CERTIFICATE_INVALID)?
+            .key_size_bits(),
+    };
     let application_uri = cert.subject_alternative_name().ok().flatten().and_then(|san| {
         san.value.general_names.iter().find_map(|g| match g {
             GeneralName::URI(u) => Some(u.to_string()),
@@ -109,8 +120,24 @@ pub fn inspect(der: &[u8]) -> Result<CertInfo, u32> {
         rsa_public_key: pk.subject_public_key.data.to_vec(),
         spki,
         key_bits,
+        curve,
         thumbprint: thumbprint(der),
     })
+}
+
+/// The curve of an EC (P-256, P-384) or Ed25519 public key.
+fn key_curve(cert: &X509Certificate) -> Option<crate::ecc::Curve> {
+    use crate::ecc::Curve;
+    let alg = &cert.public_key().algorithm;
+    match alg.algorithm.to_id_string().as_str() {
+        "1.3.101.112" => Some(Curve::Curve25519),
+        "1.2.840.10045.2.1" => match alg.parameters.as_ref()?.as_oid().ok()?.to_id_string().as_str() {
+            "1.2.840.10045.3.1.7" => Some(Curve::NistP256),
+            "1.3.132.0.34" => Some(Curve::NistP384),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn verification_alg(oid: &str) -> Option<&'static [&'static dyn VerificationAlgorithm]> {
@@ -125,6 +152,7 @@ fn verification_alg(oid: &str) -> Option<&'static [&'static dyn VerificationAlgo
         ],
         "1.2.840.10045.4.3.2" => &[&signature::ECDSA_P256_SHA256_ASN1, &signature::ECDSA_P384_SHA256_ASN1],
         "1.2.840.10045.4.3.3" => &[&signature::ECDSA_P384_SHA384_ASN1, &signature::ECDSA_P256_SHA384_ASN1],
+        "1.3.101.112" => &[&signature::ED25519],
         // SHA-1 and MD5 signatures are rejected (not allowed by the supported policies).
         _ => return None,
     })
@@ -266,9 +294,11 @@ impl TrustStore {
         // Usage.
         if application {
             let ku = leaf.key_usage().map_err(|_| BAD_CERTIFICATE_INVALID)?;
+            // ECC keys sign and agree on keys: they do not encipher.
+            let ecc = key_curve(&leaf).is_some();
             if let Some(ku) = ku {
                 let k = ku.value;
-                if !k.digital_signature() || !k.key_encipherment() && !k.data_encipherment() {
+                if !k.digital_signature() || !ecc && !k.key_encipherment() && !k.data_encipherment() {
                     return Err(BAD_CERTIFICATE_USE_NOT_ALLOWED);
                 }
             }
@@ -323,6 +353,61 @@ pub struct Pki {
     pub users: TrustStore,
     /// Development switch: accept any well-formed client certificate.
     pub trust_all: bool,
+    /// One ECC certificate per curve (ECC security policies).
+    pub ecc: Vec<EccOwn>,
+}
+
+/// An ECC application instance certificate and its key.
+pub struct EccOwn {
+    pub curve: crate::ecc::Curve,
+    pub cert_der: Vec<u8>,
+    pub key: crate::ecc::SigningKey,
+    pub thumbprint: [u8; 20],
+}
+
+impl Pki {
+    /// Our certificate for an ECC curve.
+    pub fn ecc_own(&self, curve: crate::ecc::Curve) -> Option<&EccOwn> {
+        self.ecc.iter().find(|e| e.curve == curve)
+    }
+}
+
+fn curve_name(curve: crate::ecc::Curve) -> &'static str {
+    match curve {
+        crate::ecc::Curve::NistP256 => "nistP256",
+        crate::ecc::Curve::NistP384 => "nistP384",
+        crate::ecc::Curve::Curve25519 => "curve25519",
+    }
+}
+
+/// Loads (or creates) the ECC certificate of `curve` in `root/own`.
+fn load_ecc(root: &Path, curve: crate::ecc::Curve, application_uri: &str, hostname: &str) -> Result<EccOwn, String> {
+    let name = curve_name(curve);
+    let cert_path = root.join(format!("own/certs/fastua_{name}.der"));
+    let key_path = root.join(format!("own/private/fastua_{name}.pk8"));
+    let io = |e: std::io::Error| format!("{}: {e}", root.display());
+    if !cert_path.exists() || !key_path.exists() {
+        let (cert, key) =
+            generate_self_signed_ecc(curve, application_uri, hostname).map_err(|e| format!("{e:?}"))?;
+        write_private(&key_path, &key).map_err(io)?;
+        std::fs::write(&cert_path, &cert).map_err(io)?;
+        crate::log!("generated self-signed certificate {}", cert_path.display());
+    }
+    let cert_der = std::fs::read(&cert_path).map_err(io)?;
+    let key_der = std::fs::read(&key_path).map_err(io)?;
+    let info = inspect(&cert_der).map_err(|c| format!("{}: invalid certificate (0x{c:08X})", cert_path.display()))?;
+    if info.curve != Some(curve) {
+        return Err(format!("{}: not a {name} certificate", cert_path.display()));
+    }
+    let key = crate::ecc::SigningKey::from_pkcs8(curve, &key_der)
+        .map_err(|_| format!("{}: invalid private key", key_path.display()))?;
+    // The key must be the certificate's: sign and verify.
+    let probe = key.sign(b"fastua").map_err(|_| format!("{}: unusable key", key_path.display()))?;
+    let suite = crate::ecc::Suite { curve, cipher: crate::ecc::Cipher::AesGcm };
+    if suite.verify(&info.rsa_public_key, b"fastua", &probe).is_err() {
+        return Err(format!("{} does not match {}", cert_path.display(), key_path.display()));
+    }
+    Ok(EccOwn { curve, thumbprint: thumbprint(&cert_der), cert_der, key })
 }
 
 impl Pki {
@@ -361,6 +446,10 @@ impl Pki {
             applications: TrustStore::new(root).map_err(io)?,
             users: TrustStore::new(&root.join("users")).map_err(io)?,
             trust_all,
+            ecc: [crate::ecc::Curve::NistP256, crate::ecc::Curve::NistP384, crate::ecc::Curve::Curve25519]
+                .into_iter()
+                .map(|c| load_ecc(root, c, application_uri, hostname))
+                .collect::<Result<_, _>>()?,
         }))
     }
 
@@ -432,6 +521,49 @@ pub fn generate_self_signed(application_uri: &str, hostname: &str) -> Result<(Ve
     Ok((cert.der().to_vec(), pkcs8))
 }
 
+/// ECC application instance certificate (ECDSA P-256 / P-384 with SHA-256 /
+/// SHA-384, or Ed25519).
+pub fn generate_self_signed_ecc(
+    curve: crate::ecc::Curve,
+    application_uri: &str,
+    hostname: &str,
+) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
+    use rcgen::*;
+    let alg = match curve {
+        crate::ecc::Curve::NistP256 => &PKCS_ECDSA_P256_SHA256,
+        crate::ecc::Curve::NistP384 => &PKCS_ECDSA_P384_SHA384,
+        crate::ecc::Curve::Curve25519 => &PKCS_ED25519,
+    };
+    let key = KeyPair::generate_for(alg).map_err(|_| CryptoError)?;
+    let pkcs8 = key.serialize_der();
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, format!("fastua {}", curve_name(curve)));
+    dn.push(DnType::OrganizationName, "fastua");
+    params.distinguished_name = dn;
+    params.subject_alt_names = vec![
+        SanType::URI(application_uri.try_into().map_err(|_| CryptoError)?),
+        SanType::DnsName(hostname.try_into().map_err(|_| CryptoError)?),
+    ];
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::ContentCommitment,
+        KeyUsagePurpose::KeyCertSign,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth, ExtendedKeyUsagePurpose::ClientAuth];
+    params.is_ca = IsCa::ExplicitNoCa;
+    params.use_authority_key_identifier_extension = true;
+    let mut serial = [0u8; 16];
+    crate::server::random_bytes(&mut serial);
+    serial[0] &= 0x7F;
+    params.serial_number = Some(SerialNumber::from_slice(&serial));
+    let now = ::time::OffsetDateTime::now_utc();
+    params.not_before = now - ::time::Duration::days(1);
+    params.not_after = now + ::time::Duration::days(5 * 365);
+    let cert = params.self_signed(&key).map_err(|_| CryptoError)?;
+    Ok((cert.der().to_vec(), pkcs8))
+}
+
 /// Re-export for status code mapping in the channel layer.
 pub const SECURITY_CHECKS_FAILED: u32 = status::BAD_SECURITY_CHECKS_FAILED;
 
@@ -454,6 +586,30 @@ mod tests {
         assert_eq!(info.key_bits, 2048);
         let b = Pki::open(&root, "urn:test:server", "localhost", false).unwrap();
         assert_eq!(a.cert_der, b.cert_der);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ecc_certificates_are_generated_trusted_and_reloaded() {
+        use crate::ecc::Curve;
+        let root = tmp("ecc");
+        let a = Pki::open(&root, "urn:test:server", "localhost", false).unwrap();
+        assert_eq!(a.ecc.len(), 3);
+        for own in &a.ecc {
+            let info = inspect(&own.cert_der).unwrap();
+            assert_eq!(info.curve, Some(own.curve));
+            assert_eq!(info.key_bits, 0);
+            assert_eq!(info.application_uri.as_deref(), Some("urn:test:server"));
+        }
+        let b = Pki::open(&root, "urn:test:server", "localhost", false).unwrap();
+        assert_eq!(a.ecc_own(Curve::NistP384).unwrap().cert_der, b.ecc_own(Curve::NistP384).unwrap().cert_der);
+        // An ECC client certificate goes through the same trust flow.
+        for curve in [Curve::NistP256, Curve::NistP384, Curve::Curve25519] {
+            let (client, _) = generate_self_signed_ecc(curve, "urn:test:client", "client").unwrap();
+            assert_eq!(a.validate_application(&client).unwrap_err(), BAD_CERTIFICATE_UNTRUSTED);
+            std::fs::write(root.join("trusted/certs").join(format!("{curve:?}.der")), &client).unwrap();
+            assert_eq!(a.validate_application(&client).unwrap().curve, Some(curve));
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
