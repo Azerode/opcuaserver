@@ -2,7 +2,7 @@ name: Rust server
 
 on:
   push:
-    branches: [main, "feature/**"]
+    branches: [main, "feature/**", "bench/**"]
   pull_request:
   workflow_dispatch:
 
@@ -82,6 +82,14 @@ jobs:
           cc -O2 crates/fastua/tests/interop/open62541_ecc.c -I$HOME/open62541/include \
             -L$HOME/open62541/lib -lopen62541 -lssl -lcrypto -lpthread -lm -o open62541_ecc
           crates/fastua/tests/interop/open62541_ecc.sh target/release/fastua config/machines ./open62541_ecc
+      - name: Comparative benchmark (fastua vs open62541 server)
+        run: |
+          cc -O2 crates/fastua/tests/compare/open62541_server.c -I$HOME/open62541/include \
+            -L$HOME/open62541/lib -lopen62541 -lssl -lcrypto -lpthread -lm -o open62541_server
+          cargo build --release --locked --example compare
+          crates/fastua/tests/compare/run.sh target/release/fastua target/release/examples/compare \
+            ./open62541_server compare-out
+          { echo "### fastua vs open62541 (${{ matrix.arch }})"; cat compare-out/report.md; } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
           name: fastua-linux-${{ matrix.arch }}

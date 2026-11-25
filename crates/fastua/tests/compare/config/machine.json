@@ -1,0 +1,511 @@
+{
+ "Name": "Compare",
+ "Namespace": "urn:fastua:compare",
+ "Subscriptions": [
+  {
+   "Name": "DATA",
+   "Items": [
+    {
+     "Name": "V1",
+     "NodeId": "ns=1;i=1",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V2",
+     "NodeId": "ns=1;i=2",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V3",
+     "NodeId": "ns=1;i=3",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V4",
+     "NodeId": "ns=1;i=4",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V5",
+     "NodeId": "ns=1;i=5",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V6",
+     "NodeId": "ns=1;i=6",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V7",
+     "NodeId": "ns=1;i=7",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V8",
+     "NodeId": "ns=1;i=8",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V9",
+     "NodeId": "ns=1;i=9",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V10",
+     "NodeId": "ns=1;i=10",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V11",
+     "NodeId": "ns=1;i=11",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V12",
+     "NodeId": "ns=1;i=12",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V13",
+     "NodeId": "ns=1;i=13",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V14",
+     "NodeId": "ns=1;i=14",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V15",
+     "NodeId": "ns=1;i=15",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V16",
+     "NodeId": "ns=1;i=16",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V17",
+     "NodeId": "ns=1;i=17",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V18",
+     "NodeId": "ns=1;i=18",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V19",
+     "NodeId": "ns=1;i=19",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V20",
+     "NodeId": "ns=1;i=20",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V21",
+     "NodeId": "ns=1;i=21",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V22",
+     "NodeId": "ns=1;i=22",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V23",
+     "NodeId": "ns=1;i=23",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V24",
+     "NodeId": "ns=1;i=24",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V25",
+     "NodeId": "ns=1;i=25",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V26",
+     "NodeId": "ns=1;i=26",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V27",
+     "NodeId": "ns=1;i=27",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V28",
+     "NodeId": "ns=1;i=28",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V29",
+     "NodeId": "ns=1;i=29",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V30",
+     "NodeId": "ns=1;i=30",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V31",
+     "NodeId": "ns=1;i=31",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V32",
+     "NodeId": "ns=1;i=32",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V33",
+     "NodeId": "ns=1;i=33",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V34",
+     "NodeId": "ns=1;i=34",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V35",
+     "NodeId": "ns=1;i=35",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V36",
+     "NodeId": "ns=1;i=36",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V37",
+     "NodeId": "ns=1;i=37",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V38",
+     "NodeId": "ns=1;i=38",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V39",
+     "NodeId": "ns=1;i=39",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V40",
+     "NodeId": "ns=1;i=40",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V41",
+     "NodeId": "ns=1;i=41",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V42",
+     "NodeId": "ns=1;i=42",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V43",
+     "NodeId": "ns=1;i=43",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V44",
+     "NodeId": "ns=1;i=44",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V45",
+     "NodeId": "ns=1;i=45",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V46",
+     "NodeId": "ns=1;i=46",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V47",
+     "NodeId": "ns=1;i=47",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V48",
+     "NodeId": "ns=1;i=48",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V49",
+     "NodeId": "ns=1;i=49",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V50",
+     "NodeId": "ns=1;i=50",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V51",
+     "NodeId": "ns=1;i=51",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V52",
+     "NodeId": "ns=1;i=52",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V53",
+     "NodeId": "ns=1;i=53",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V54",
+     "NodeId": "ns=1;i=54",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V55",
+     "NodeId": "ns=1;i=55",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V56",
+     "NodeId": "ns=1;i=56",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V57",
+     "NodeId": "ns=1;i=57",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V58",
+     "NodeId": "ns=1;i=58",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V59",
+     "NodeId": "ns=1;i=59",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V60",
+     "NodeId": "ns=1;i=60",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V61",
+     "NodeId": "ns=1;i=61",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V62",
+     "NodeId": "ns=1;i=62",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V63",
+     "NodeId": "ns=1;i=63",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V64",
+     "NodeId": "ns=1;i=64",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V65",
+     "NodeId": "ns=1;i=65",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V66",
+     "NodeId": "ns=1;i=66",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V67",
+     "NodeId": "ns=1;i=67",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V68",
+     "NodeId": "ns=1;i=68",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V69",
+     "NodeId": "ns=1;i=69",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V70",
+     "NodeId": "ns=1;i=70",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V71",
+     "NodeId": "ns=1;i=71",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V72",
+     "NodeId": "ns=1;i=72",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V73",
+     "NodeId": "ns=1;i=73",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V74",
+     "NodeId": "ns=1;i=74",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V75",
+     "NodeId": "ns=1;i=75",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V76",
+     "NodeId": "ns=1;i=76",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V77",
+     "NodeId": "ns=1;i=77",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V78",
+     "NodeId": "ns=1;i=78",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V79",
+     "NodeId": "ns=1;i=79",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V80",
+     "NodeId": "ns=1;i=80",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V81",
+     "NodeId": "ns=1;i=81",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V82",
+     "NodeId": "ns=1;i=82",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V83",
+     "NodeId": "ns=1;i=83",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V84",
+     "NodeId": "ns=1;i=84",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V85",
+     "NodeId": "ns=1;i=85",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V86",
+     "NodeId": "ns=1;i=86",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V87",
+     "NodeId": "ns=1;i=87",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V88",
+     "NodeId": "ns=1;i=88",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V89",
+     "NodeId": "ns=1;i=89",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V90",
+     "NodeId": "ns=1;i=90",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V91",
+     "NodeId": "ns=1;i=91",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V92",
+     "NodeId": "ns=1;i=92",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V93",
+     "NodeId": "ns=1;i=93",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V94",
+     "NodeId": "ns=1;i=94",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V95",
+     "NodeId": "ns=1;i=95",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V96",
+     "NodeId": "ns=1;i=96",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V97",
+     "NodeId": "ns=1;i=97",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V98",
+     "NodeId": "ns=1;i=98",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V99",
+     "NodeId": "ns=1;i=99",
+     "Type": "System.Int32"
+    },
+    {
+     "Name": "V100",
+     "NodeId": "ns=1;i=100",
+     "Type": "System.Int32"
+    }
+   ]
+  }
+ ]
+}

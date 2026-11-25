@@ -146,6 +146,8 @@ How it gets there:
 - **Namespace 0:** compiled from the official nodeset into a 1.2 MB table, decoded when the address space is built (~2 ms per load) and given a direct lookup table like the configured namespaces.
 - **Build:** release profile with fat LTO, 1 codegen unit and `panic = "abort"`.
 
+**Against open62541:** CI runs the same load client against fastua and the open62541 server (same machine, same 100 variables, None / Basic256Sha256 / ECC nistP256) and publishes the comparison in the job summary. See [crates/fastua/tests/compare](crates/fastua/tests/compare/README.md).
+
 Details: [docs/RustServer.md](docs/RustServer.md).
 
 ## Security
