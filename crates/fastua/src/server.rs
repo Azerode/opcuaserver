@@ -52,6 +52,9 @@ pub struct Limits {
     pub max_sampling_interval_ms: f64,
     pub max_keep_alive_count: u32,
     pub max_lifetime_count: u32,
+    /// Events kept for HistoryRead on the Server object (0 = no event
+    /// history).
+    pub event_history: usize,
 }
 
 impl Default for Limits {
@@ -81,6 +84,7 @@ impl Default for Limits {
             max_sampling_interval_ms: 3_600_000.0,
             max_keep_alive_count: 100_000,
             max_lifetime_count: 1_000_000,
+            event_history: 0,
         }
     }
 }

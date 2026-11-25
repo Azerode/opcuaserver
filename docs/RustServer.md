@@ -256,8 +256,19 @@ HistoryRead (and, when writable, HistoryWrite) AccessLevel bits.
   resume, so they use no server memory and never run out
   (MaxHistoryContinuationPoints is 0, no limit). A read returns at most
   10 000 values per node (MaxReturnDataValues).
-- **Not yet:** event history (ReadEventDetails returns
-  `BadHistoryOperationUnsupported`) and annotations.
+- **HistoryRead, ReadEventDetails:** with `--event-history N` the Server
+  object (EventNotifier SubscribeToEvents | HistoryRead) records the last N
+  events it notifies (ConditionRefresh replays excluded), even with no
+  subscription. The EventFilter select clause picks the fields and its where
+  clause the events; the time range works like raw reads (forward, reverse,
+  or the newest `NumValuesPerNode` up to an end time). Continuation points
+  carry the sequence number of the next event; events dropped from the
+  history in between are skipped. AccessHistoryEventsCapability,
+  MaxReturnEventValues (10 000) and MaxNodesPerHistoryReadEvents follow the
+  option. Recording costs one short mutex and a push per event; a read
+  encodes the selected fields straight from the stored events under that
+  lock, with no copy.
+- **Not yet:** annotations, HistoryUpdate of events.
 - **Cost:** a write of a variable without history checks one flag stored in
   the padding of the cell's first cache line (no measurable change). A
   historized write adds a short uncontended mutex and a push into the ring,
@@ -448,5 +459,5 @@ those elements are compared and reported, through the Variant path) and events w
 [Events](#events)), alarms and conditions (see
 [Alarms and conditions](#alarms-and-conditions)).
 
-Not yet: condition branches and shelving, event history,
+Not yet: condition branches and shelving,
 history persistence across restarts, the deprecated non-AEAD ECC policies.

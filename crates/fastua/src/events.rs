@@ -496,13 +496,49 @@ pub struct EventBus {
     head: AtomicU64,
     ring: Mutex<VecDeque<Arc<Event>>>,
     subscribers: AtomicUsize,
+    /// Event history (HistoryRead with ReadEventDetails): the last
+    /// `history_capacity` events with a sequence number (0 = off).
+    history: Mutex<EventHistory>,
+    history_capacity: AtomicUsize,
+}
+
+#[derive(Default)]
+pub struct EventHistory {
+    /// Sequence number of the next event recorded.
+    pub next: u64,
+    pub events: VecDeque<Arc<Event>>,
+}
+
+impl EventHistory {
+    /// Sequence number of `events[0]`.
+    pub fn first(&self) -> u64 {
+        self.next - self.events.len() as u64
+    }
 }
 
 impl EventBus {
-    /// Someone listens: worth building an event.
+    /// Someone listens, or events are recorded: worth building an event.
     #[inline]
     pub fn active(&self) -> bool {
-        self.subscribers.load(Ordering::Relaxed) > 0
+        self.subscribers.load(Ordering::Relaxed) > 0 || self.history_capacity.load(Ordering::Relaxed) > 0
+    }
+
+    /// Keeps the last `n` events for HistoryRead (0 = none).
+    pub fn set_history_capacity(&self, n: usize) {
+        self.history_capacity.store(n, Ordering::Relaxed);
+        let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        while h.events.len() > n {
+            h.events.pop_front();
+        }
+    }
+
+    pub fn history_capacity(&self) -> usize {
+        self.history_capacity.load(Ordering::Relaxed)
+    }
+
+    /// Runs `f` on the event history, under its lock.
+    pub fn history_with<R>(&self, f: impl FnOnce(&EventHistory) -> R) -> R {
+        f(&self.history.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     #[inline]
@@ -511,15 +547,29 @@ impl EventBus {
     }
 
     pub fn emit(&self, ev: Event) {
-        if !self.active() {
+        let listeners = self.subscribers.load(Ordering::Relaxed) > 0;
+        let capacity = self.history_capacity.load(Ordering::Relaxed);
+        if !listeners && capacity == 0 {
             return;
         }
-        let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
-        if ring.len() == RING {
-            ring.pop_front();
+        let ev = Arc::new(ev);
+        // ConditionRefresh replays are for one subscription, not history.
+        if capacity > 0 && ev.target.is_none() {
+            let mut h = self.history.lock().unwrap_or_else(|e| e.into_inner());
+            if h.events.len() >= capacity {
+                h.events.pop_front();
+            }
+            h.events.push_back(ev.clone());
+            h.next += 1;
         }
-        ring.push_back(Arc::new(ev));
-        self.head.fetch_add(1, Ordering::Release);
+        if listeners {
+            let mut ring = self.ring.lock().unwrap_or_else(|e| e.into_inner());
+            if ring.len() == RING {
+                ring.pop_front();
+            }
+            ring.push_back(ev);
+            self.head.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Calls `f` for every event after `cursor`; returns the new cursor and
@@ -924,6 +974,18 @@ impl EventFilter {
     fn fields(&self, ev: &Event) -> Box<[Variant]> {
         self.select.iter().map(|f| f.value(ev).cloned().unwrap_or_default()).collect()
     }
+
+    /// Encodes the selected fields of `ev` as a HistoryEventFieldList,
+    /// without copying them.
+    pub fn write_fields(&self, ev: &Event, w: &mut Writer) {
+        w.i32(self.select.len() as i32);
+        for f in &self.select {
+            match f.value(ev) {
+                Some(v) => w.variant(v),
+                None => w.variant(&Variant::Empty),
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- monitored items
@@ -1264,6 +1326,28 @@ mod tests {
         assert_eq!(sev, vec![Variant::UInt16(1), Variant::UInt16(3)]);
         assert_eq!(it.queue[0][1], Variant::NodeId(Box::new(NodeId::ns0(EVENT_QUEUE_OVERFLOW_EVENT_TYPE))));
         drop(it);
+        assert!(!bus.active());
+    }
+
+    #[test]
+    fn event_history_keeps_the_newest() {
+        let bus = EventBus::default();
+        bus.set_history_capacity(2);
+        assert!(bus.active());
+        for s in 1..=3 {
+            bus.emit(ev(s));
+        }
+        // Recorded without a listener: the subscription ring stays empty.
+        assert_eq!(bus.head(), 0);
+        let sev =
+            |h: &EventHistory| -> Vec<Variant> { h.events.iter().map(|e| e.get(SEVERITY).unwrap().clone()).collect() };
+        bus.history_with(|h| {
+            assert_eq!((h.first(), h.next), (1, 3));
+            assert_eq!(sev(h), vec![Variant::UInt16(2), Variant::UInt16(3)]);
+        });
+        bus.set_history_capacity(1);
+        bus.history_with(|h| assert_eq!(sev(h), vec![Variant::UInt16(3)]));
+        bus.set_history_capacity(0);
         assert!(!bus.active());
     }
 }

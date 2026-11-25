@@ -584,12 +584,62 @@ const CP_RAW: u8 = 1;
 const CP_MODIFIED: u8 = 2;
 const CP_AT_TIME: u8 = 3;
 pub(crate) const CP_PROCESSED: u8 = 4;
+const CP_EVENTS: u8 = 5;
 
 /// What a HistoryRead asks for.
 enum Details {
     Raw(RawQuery),
     AtTime { times: Vec<i64>, stepped: bool },
     Processed(ProcessedQuery),
+    Events(EventQuery),
+}
+
+/// ReadEventDetails (DateTime 0 = unspecified).
+pub struct EventQuery {
+    pub max: usize,
+    pub start: i64,
+    pub end: i64,
+    pub filter: crate::events::EventFilter,
+}
+
+impl EventQuery {
+    /// Newest first: the start time is after the end time, or only the end
+    /// time is given.
+    fn reverse(&self) -> bool {
+        (self.start == 0 && self.end != 0) || (self.end != 0 && self.start > self.end)
+    }
+
+    /// The event time is in `[start, end)` (forward), `(end, start]`
+    /// (reverse) or `.. end]` (reverse from the end time only), like raw
+    /// reads.
+    fn in_range(&self, t: i64) -> bool {
+        if self.reverse() {
+            if self.start == 0 {
+                t <= self.end
+            } else {
+                t <= self.start && t > self.end
+            }
+        } else {
+            t >= self.start && (self.end == 0 || t < self.end)
+        }
+    }
+}
+
+fn parse_event_details(body: &[u8]) -> Result<EventQuery, u32> {
+    let bad = |_| status::BAD_HISTORY_OPERATION_INVALID;
+    let mut r = Reader::new(body);
+    let max = r.u32().map_err(bad)? as usize;
+    let start = r.i64().map_err(bad)?;
+    let end = r.i64().map_err(bad)?;
+    let (ty, enc, fbody) = r.extension_object_raw().map_err(bad)?;
+    if ty.as_ns0() != Some(ids::EVENT_FILTER_ENCODING) || enc != 1 {
+        return Err(crate::events::codes::BAD_EVENT_FILTER_INVALID);
+    }
+    let (filter, result) = crate::events::parse_filter(fbody).map_err(bad)?;
+    if !result.is_good() || filter.select_len() == 0 {
+        return Err(crate::events::codes::BAD_EVENT_FILTER_INVALID);
+    }
+    Ok(EventQuery { max, start, end, filter })
 }
 
 /// ReadProcessedDetails (aggregates).
@@ -645,7 +695,7 @@ fn parse_details(type_id: &NodeId, body: &[u8]) -> Result<Details, u32> {
             }
             Ok(d)
         }
-        Some(ids::READ_EVENT_DETAILS_ENCODING) => Err(status::BAD_HISTORY_OPERATION_UNSUPPORTED),
+        Some(ids::READ_EVENT_DETAILS_ENCODING) => parse_event_details(body).map(Details::Events),
         _ => Err(status::BAD_HISTORY_OPERATION_INVALID),
     }
 }
@@ -744,6 +794,9 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
             Some(Err(false)) => Some((usize::MAX, usize::MAX)),
         };
         let result = (|| -> Result<NodeResult, u32> {
+            if let Details::Events(q) = &details {
+                return read_events(space, &id, q, cp, release, body);
+            }
             let hist = history_of(space, &id, ACCESS_HISTORY_READ)?;
             if enc_name.is_some_and(|e| !e.is_empty()) {
                 return Err(status::BAD_DATA_ENCODING_UNSUPPORTED);
@@ -753,6 +806,7 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
                 Details::Raw(_) => CP_RAW,
                 Details::AtTime { .. } => CP_AT_TIME,
                 Details::Processed(_) => CP_PROCESSED,
+                Details::Events(_) => CP_EVENTS,
             };
             let resume = cp.map(|b| cp_decode(&id, kind, b)).transpose()?;
             if release {
@@ -834,6 +888,7 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
                     let more = (to < total).then(|| cp_encode(&id, kind, Resume { ts: 0, skip: to as u32 }));
                     Ok((status::GOOD, more, Some(ids::HISTORY_DATA_ENCODING)))
                 }
+                Details::Events(_) => unreachable!(),
             }
         })();
         match result {
@@ -858,6 +913,85 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
     }
     w.empty_array(); // diagnosticInfos
     Ok(())
+}
+
+/// HistoryRead of events on a notifier: a HistoryEvent encoded under the
+/// event history lock straight from the recorded events. The continuation
+/// point holds the sequence number of the next event to look at.
+fn read_events(
+    space: &crate::address_space::AddressSpace,
+    id: &NodeId,
+    q: &EventQuery,
+    cp: Option<&[u8]>,
+    release: bool,
+    body: &mut Vec<u8>,
+) -> Result<NodeResult, u32> {
+    use crate::address_space::NodeKind;
+    let node = space.get(id).ok_or(status::BAD_NODE_ID_UNKNOWN)?;
+    let NodeKind::Object { event_notifier } = node.kind else {
+        return Err(status::BAD_HISTORY_OPERATION_UNSUPPORTED);
+    };
+    // EventNotifier bit 2: HistoryRead.
+    if event_notifier & 4 == 0 {
+        return Err(status::BAD_HISTORY_OPERATION_UNSUPPORTED);
+    }
+    // Part 11 §6.5.4: an open-ended read needs a count.
+    if (q.start == 0 && q.end == 0) || ((q.start == 0 || q.end == 0) && q.max == 0) {
+        return Err(status::BAD_INVALID_TIMESTAMP_ARGUMENT);
+    }
+    let resume = cp.map(|b| cp_decode(id, CP_EVENTS, b)).transpose()?;
+    if release {
+        return Ok((status::GOOD, None, None));
+    }
+    let max = if q.max == 0 { MAX_RETURN_VALUES } else { q.max.min(MAX_RETURN_VALUES) };
+    let reverse = q.reverse();
+    body.clear();
+    let mut w = Writer::new(body);
+    w.i32(0);
+    let mut count = 0usize;
+    let more = space.events.history_with(|h| {
+        let (first, next) = (h.first(), h.next);
+        // Events dropped from the history since the continuation point
+        // was handed out are skipped.
+        let mut seq = match resume {
+            Some(r) => (r.ts as u64).clamp(first, next),
+            None if reverse => next,
+            None => first,
+        };
+        let time = |ev: &crate::events::Event| match ev.get(TIME) {
+            Some(Variant::DateTime(t)) => *t,
+            _ => 0,
+        };
+        loop {
+            let ev = if reverse {
+                if seq == first {
+                    return None;
+                }
+                seq -= 1;
+                &h.events[(seq - first) as usize]
+            } else {
+                if seq == next {
+                    return None;
+                }
+                seq += 1;
+                &h.events[(seq - 1 - first) as usize]
+            };
+            if q.in_range(time(ev)) && q.filter.matches(ev) {
+                q.filter.write_fields(ev, &mut w);
+                count += 1;
+                if count == max {
+                    // The last one returned: resume after it.
+                    let at_end = if reverse { seq == first } else { seq == next };
+                    let limited = q.max != 0 && q.max <= MAX_RETURN_VALUES && (q.start == 0 || q.end == 0);
+                    return (!at_end && !limited).then_some(seq);
+                }
+            }
+        }
+    });
+    w.patch_u32(0, count as u32);
+    let code = if count == 0 { status::GOOD_NO_DATA } else { status::GOOD };
+    let cp = more.map(|seq| cp_encode(id, CP_EVENTS, Resume { ts: seq as i64, skip: 0 }));
+    Ok((code, cp, Some(ids::HISTORY_EVENT_ENCODING)))
 }
 
 /// (status, continuation point, encoding id of the result in `body`).

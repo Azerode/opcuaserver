@@ -659,7 +659,9 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     b.method(at::CONFIRM, "Confirm", ACK, &[event_id(), comment()], &[]);
 
     // Server object: the root notifier of every event.
-    let server = b.ns0(ids::SERVER, "Server", NodeKind::Object { event_notifier: 1 });
+    // SubscribeToEvents, plus HistoryRead when events are recorded.
+    let notifier = if info.limits.event_history > 0 { 1 | 4 } else { 1 };
+    let server = b.ns0(ids::SERVER, "Server", NodeKind::Object { event_notifier: notifier });
     let (objects, st) = (b.idx(ids::OBJECTS_FOLDER), b.idx(ids::SERVER_TYPE));
     b.link(objects, ids::ORGANIZES, server);
     b.link(server, ids::HAS_TYPE_DEFINITION, st);
@@ -888,16 +890,17 @@ fn build_server_details(b: &mut Builder, info: &ServerInfo) {
     for (id, name) in [(12165, "MaxNodesPerHistoryReadData"), (12167, "MaxNodesPerHistoryUpdateData")] {
         b.property(id, name, ops, 7, -1, fixed(per_call.clone()));
     }
-    for (id, name) in [(12166, "MaxNodesPerHistoryReadEvents"), (12168, "MaxNodesPerHistoryUpdateEvents")] {
-        b.property(id, name, ops, 7, -1, fixed(Variant::UInt32(0)));
-    }
+    let event_history = l.event_history > 0;
+    let read_events = if event_history { per_call.clone() } else { Variant::UInt32(0) };
+    b.property(12166, "MaxNodesPerHistoryReadEvents", ops, 7, -1, fixed(read_events));
+    b.property(12168, "MaxNodesPerHistoryUpdateEvents", ops, 7, -1, fixed(Variant::UInt32(0)));
 
     // Historical access (Part 11 §5.4.2).
     let hist = ids::HISTORY_SERVER_CAPABILITIES;
     b.object(hist, "HistoryServerCapabilities", caps, ids::HISTORY_SERVER_CAPABILITIES_TYPE);
     for (id, name, value) in [
         (11193, "AccessHistoryDataCapability", true),
-        (11242, "AccessHistoryEventsCapability", false),
+        (11242, "AccessHistoryEventsCapability", event_history),
         (11196, "InsertDataCapability", true),
         (11197, "ReplaceDataCapability", true),
         (11198, "UpdateDataCapability", true),
@@ -914,7 +917,8 @@ fn build_server_details(b: &mut Builder, info: &ServerInfo) {
     }
     let max_values = crate::history::MAX_RETURN_VALUES as u32;
     b.property(11273, "MaxReturnDataValues", hist, 7, -1, fixed(Variant::UInt32(max_values)));
-    b.property(11274, "MaxReturnEventValues", hist, 7, -1, fixed(Variant::UInt32(0)));
+    let max_events = if event_history { max_values } else { 0 };
+    b.property(11274, "MaxReturnEventValues", hist, 7, -1, fixed(Variant::UInt32(max_events)));
     b.object(ids::HISTORY_AGGREGATE_FUNCTIONS, "AggregateFunctions", hist, ids::FOLDER_TYPE);
     b.folder(2996, "ModellingRules", ids::SERVER_SERVER_CAPABILITIES);
     b.folder(2997, "AggregateFunctions", ids::SERVER_SERVER_CAPABILITIES);
@@ -1050,7 +1054,8 @@ pub fn build(
     let mut fresh = 0usize;
     let mut stamp = None;
     let mut history: Vec<(Arc<ValueCell>, Option<usize>)> = Vec::new();
-    let events = previous.map(|p| p.events.clone()).unwrap_or_default();
+    let events: Arc<crate::events::EventBus> = previous.map(|p| p.events.clone()).unwrap_or_default();
+    events.set_history_capacity(info.limits.event_history);
     let alarms = previous.map(|p| p.alarms.clone()).unwrap_or_default();
     // Applied once the build succeeded, like history.
     let mut conditions: Vec<PendingAlarm> = Vec::new();

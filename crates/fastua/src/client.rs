@@ -880,6 +880,17 @@ impl Client {
                 let (type_id, _, data) = r.extension_object_raw()?;
                 let mut d = Reader::new(data);
                 let ty = type_id.as_ns0().unwrap_or(0);
+                if ty == ids::HISTORY_EVENT_ENCODING {
+                    let events = d.array(4, |r| r.array(1, |r| r.variant()))?;
+                    return Ok(HistoryResult {
+                        status: code,
+                        continuation_point: cp,
+                        type_id: ty,
+                        values: Vec::new(),
+                        modifications: Vec::new(),
+                        events,
+                    });
+                }
                 let (values, mods) = match ty {
                     0 => (Vec::new(), Vec::new()),
                     _ => {
@@ -894,7 +905,14 @@ impl Client {
                         (values, mods)
                     }
                 };
-                Ok(HistoryResult { status: code, continuation_point: cp, type_id: ty, values, modifications: mods })
+                Ok(HistoryResult {
+                    status: code,
+                    continuation_point: cp,
+                    type_id: ty,
+                    values,
+                    modifications: mods,
+                    events: Vec::new(),
+                })
             })
             .map_err(bad)?;
         Ok(Ok(results))
@@ -1007,6 +1025,8 @@ pub struct HistoryResult {
     pub values: Vec<DataValue>,
     /// (modification time, HistoryUpdateType, user name).
     pub modifications: Vec<(i64, u32, String)>,
+    /// HistoryEvent: the selected fields of each event.
+    pub events: Vec<Vec<Variant>>,
 }
 
 /// EndpointDescription: (security policy URI, security mode, user token
@@ -1210,6 +1230,18 @@ impl MonitorSpec {
             event_select: Some(fields.iter().map(|f| f.to_string()).collect()),
             ..MonitorSpec::value(node, handle)
         }
+    }
+
+    /// An encoded ReadEventDetails (for [`Client::history_read`]) selecting
+    /// the `event_select` fields of the events matching `event_where`.
+    pub fn read_event_details(&self, max: u32, start: i64, end: i64) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut w = Writer::new(&mut buf);
+        w.u32(max);
+        w.i64(start);
+        w.i64(end);
+        self.write_event_filter(&mut w);
+        buf
     }
 
     fn write_event_filter(&self, w: &mut Writer) {

@@ -30,7 +30,8 @@ const USAGE: &str = "usage: fastua [options]
   --busy-poll-threads N   at most N connections busy-poll at once, the others sleep
                           (default: cores - 1); fewer when the CPUs are busy
   --min-publishing-interval MS   fastest subscription publishing interval (default: 1, minimum 0.05)
-  --min-sampling-interval MS     fastest monitored item sampling interval (default: 1, minimum 0.05)";
+  --min-sampling-interval MS     fastest monitored item sampling interval (default: 1, minimum 0.05)
+  --event-history N       keep the last N events for HistoryRead on the Server object (default: 0, off)";
 
 fn fail(msg: String) -> ! {
     eprintln!("{msg}");
@@ -94,6 +95,7 @@ fn main() {
     let mut busy_poll_threads = 0;
     let mut min_publishing: Option<f64> = None;
     let mut min_sampling: Option<f64> = None;
+    let mut event_history = 0usize;
 
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("hash-password") {
@@ -142,6 +144,10 @@ fn main() {
                     min_sampling = Some(ms);
                 }
             }
+            "--event-history" => {
+                let v = value("--event-history");
+                event_history = v.parse().unwrap_or_else(|_| fail(format!("invalid --event-history '{v}'\n\n{USAGE}")));
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -163,6 +169,7 @@ fn main() {
     if let Some(ms) = min_sampling {
         limits.min_sampling_interval_ms = ms;
     }
+    limits.event_history = event_history;
     let info = ServerInfo {
         application_uri: app_uri.unwrap_or_else(|| format!("urn:{hostname}:fastua")),
         limits: limits.clone(),
