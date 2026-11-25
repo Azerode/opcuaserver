@@ -158,6 +158,8 @@ pub struct Session {
     pub server_nonce: Mutex<Vec<u8>>,
     /// CreateSession clientNonce (channel-bound ECC signatures).
     pub client_nonce: Vec<u8>,
+    /// Ephemeral key sent for the next EccEncryptedSecret (ECC channels).
+    pub ecdh: Mutex<Option<crate::ecc::Ephemeral>>,
     /// Rights of the identity given at the last ActivateSession.
     pub can_write: AtomicBool,
     /// User identity of the last ActivateSession ("anonymous", "user:<name>",
@@ -253,8 +255,8 @@ impl Server {
                 if config.anonymous.is_some() {
                     tokens.push((ANONYMOUS_POLICY_ID, 0, None));
                 }
-                // ECC: user names need EccEncryptedSecret (not supported).
-                if !users.is_empty() && !policy.is_ecc() {
+                // ECC: the password travels as an EccEncryptedSecret.
+                if !users.is_empty() {
                     tokens.push((USERNAME_POLICY_ID, 1, token_policy));
                 }
                 tokens.push((CERTIFICATE_POLICY_ID, 2, token_policy));
@@ -365,6 +367,7 @@ impl Server {
             security,
             server_nonce: Mutex::new(server_nonce),
             client_nonce,
+            ecdh: Mutex::new(None),
             can_write: AtomicBool::new(false),
             identity: Mutex::new(Arc::from("")),
             subs: Mutex::new(SessionSubs::default()),

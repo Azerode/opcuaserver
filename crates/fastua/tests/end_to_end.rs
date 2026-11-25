@@ -268,3 +268,58 @@ fn ecc_channels_end_to_end() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// User name / password on ECC endpoints: the password travels as an
+/// EccEncryptedSecret for the ephemeral key the server sent in CreateSession.
+#[test]
+fn ecc_user_name_login() {
+    use fastua::crypto::{Mode, Policy};
+    use fastua::ecc::{Curve, Suite};
+    let dir = temp_config("ecc-user", MACHINE);
+    let users = std::env::temp_dir().join(format!("fastua-ecc-users-{}.json", std::process::id()));
+    std::fs::write(
+        &users,
+        format!(
+            r#"{{ "users": [ {{ "name": "operator", "password": "{}", "write": true }} ] }}"#,
+            fastua::users::hash_password("s3cret")
+        ),
+    )
+    .unwrap();
+    let store = Store::open(&dir, ServerInfo::default()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut config = ServerConfig::all_endpoints(addr.clone(), format!("opc.tcp://{addr}"));
+    config.anonymous = None;
+    let pki = Pki::open(&dir.join("pki"), "urn:test:fastua", "localhost", false).unwrap();
+    let server = Server::new(store, config, pki, Users::load(&users).unwrap());
+    std::thread::spawn(move || server.serve(listener));
+    let trusted = dir.join("pki/trusted/certs");
+    std::fs::create_dir_all(&trusted).unwrap();
+    let url = format!("opc.tcp://{addr}");
+    for suite in Suite::ALL {
+        let (cert, key) =
+            fastua::pki::generate_self_signed_ecc(suite.curve, "urn:fastua:test-client", "localhost").unwrap();
+        std::fs::write(trusted.join(format!("client-{suite:?}.der")), &cert).unwrap();
+        let name = match suite.curve {
+            Curve::NistP256 => "nistP256",
+            Curve::NistP384 => "nistP384",
+            Curve::Curve25519 => "curve25519",
+        };
+        let server_cert = std::fs::read(dir.join(format!("pki/own/certs/fastua_{name}.der"))).unwrap();
+        for mode in [Mode::Sign, Mode::SignAndEncrypt] {
+            let policy = Policy::Ecc(suite);
+            let connect = || Client::connect_secure(&addr, &url, policy, mode, &cert, &key, &server_cert).unwrap();
+            let mut c = connect();
+            c.create_session_as("ecc-user", Some(("operator", "s3cret")))
+                .unwrap_or_else(|e| panic!("{suite:?} {mode:?}: {e}"));
+            let id = NodeId::Numeric(2, 2);
+            assert_eq!(c.write(&[(id, Variant::Int32(5))]).unwrap(), vec![status::GOOD], "{suite:?} {mode:?}");
+            // Wrong password, and anonymous (disabled) are refused.
+            let err = connect().create_session_as("ecc-user", Some(("operator", "nope"))).unwrap_err();
+            assert!(err.to_string().contains("801F0000"), "{err}"); // BadUserAccessDenied
+            assert!(connect().create_session("anon").is_err());
+        }
+    }
+    let _ = std::fs::remove_file(&users);
+    let _ = std::fs::remove_dir_all(&dir);
+}

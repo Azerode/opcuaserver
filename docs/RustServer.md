@@ -328,7 +328,7 @@ The ECC policies follow OPC UA 1.05.04 and later with the SecureChannelEnhanceme
 - **Keys:** HKDF (SHA-256, SHA-384 for P-384) over the shared secret, with salt = info = length ‖ `opcua-server`/`opcua-client` ‖ sender nonce ‖ receiver nonce. The input keying material is chained across renewals (XOR of the successive secrets).
 - **Messages:** AES-GCM (128-bit for P-256 and curve25519, 256-bit for P-384) or ChaCha20-Poly1305, with a 16-byte tag and no padding. The IV is the derived IV masked with the TokenId and the previous sequence number. Sign mode authenticates the whole chunk. Sequence numbers start at 0 and wrap from 2³²−1 to 0.
 - **Channel binding:** the server signs its first OpenSecureChannel response together with the client's request signature; that signature is the ChannelThumbprint, prepended to the CreateSession and ActivateSession signatures, which cover certificate hashes instead of certificates. The SignatureData algorithm is left empty.
-- **Users:** anonymous and X.509 (a user certificate on the policy's curve). User names would need EccEncryptedSecret, not implemented yet, so ECC endpoints do not offer them.
+- **Users:** anonymous, X.509 (a user certificate on the policy's curve) and user name. When the client asks for it (`ECDHPolicyUri` in the request's AdditionalHeader), CreateSession and ActivateSession return a fresh ephemeral key signed with our key (`ECDHKey`). The password comes back as an EccEncryptedSecret: signed by the client's application key, AEAD-encrypted with keys from ECDH with that ephemeral key and HKDF (label `opcua-secret`), and bound to the session's server nonce. Each ephemeral key decrypts one secret.
 
 ### Certificates (`--pki DIR`, default `pki`)
 
@@ -373,7 +373,7 @@ pip install asyncua cryptography
 python3 crates/fastua/tests/interop/asyncua_interop.py target/release/fastua config/machines
 ```
 
-`crates/fastua/tests/interop/open62541_ecc.c` checks the ECC policies against the open62541 client (master, built with `UA_ENABLE_ENCRYPTION=OPENSSL`; CI pins the commit). For each of the six policies and both modes: an anonymous session, reads, a browse and a multi-chunk response. Per policy, an X.509 user on the same curve. Per curve, a token renewal: 15 s of reads on a 10 s token.
+`crates/fastua/tests/interop/open62541_ecc.c` checks the ECC policies against the open62541 client (master, built with `UA_ENABLE_ENCRYPTION=OPENSSL`; CI pins the commit). For each of the six policies and both modes: an anonymous session, reads, a browse and a multi-chunk response. Per policy, an X.509 user on the same curve, a user name login and a wrong password. Per curve, a token renewal: 15 s of reads on a 10 s token.
 
 ```bash
 cc crates/fastua/tests/interop/open62541_ecc.c -lopen62541 -lssl -lcrypto -o open62541_ecc
@@ -401,5 +401,4 @@ those elements are compared and reported, through the Variant path) and events w
 [Alarms and conditions](#alarms-and-conditions)).
 
 Not yet: the full namespace 0 nodeset, condition branches and shelving, event history,
-history persistence across restarts, user names on ECC endpoints
-(EccEncryptedSecret), the deprecated non-AEAD ECC policies.
+history persistence across restarts, the deprecated non-AEAD ECC policies.

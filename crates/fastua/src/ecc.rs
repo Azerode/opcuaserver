@@ -219,6 +219,17 @@ impl Ephemeral {
     }
 }
 
+impl Ephemeral {
+    /// Keys of an EccEncryptedSecret (Part 4 §7.41.2.3): ECDH with the
+    /// peer's ephemeral key, then HKDF over the shared secret (no IKM
+    /// chaining) with the label `opcua-secret`; the IV is used unmasked.
+    pub fn secret_keys(self, suite: Suite, peer: &[u8], sender: &[u8], receiver: &[u8]) -> CResult<AeadKeys> {
+        let shared = self.agree(suite, peer)?;
+        let material = derive(suite, &shared, b"opcua-secret", sender, receiver, suite.sym_key_len() + IV_LEN);
+        AeadKeys::new(suite, &material)
+    }
+}
+
 /// Key material of one direction (Part 6 §6.8.1): HKDF over the IKM with
 /// salt = info = L (UInt16) | label | sender nonce | receiver nonce.
 pub fn derive(suite: Suite, ikm: &[u8], label: &[u8], sender: &[u8], receiver: &[u8], len: usize) -> Vec<u8> {

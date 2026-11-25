@@ -25,6 +25,8 @@ pub struct Client {
     rx: Vec<u8>,
     /// Busy-poll for responses instead of sleeping in `recv`.
     pub spin: bool,
+    /// Ask for an ephemeral ECDH key in the next requests (policy URI).
+    ecdh: Option<&'static str>,
     sec: Option<Secure>,
 }
 
@@ -127,6 +129,7 @@ impl Client {
             tx: Vec::with_capacity(65536),
             rx: Vec::with_capacity(65536),
             spin: false,
+            ecdh: None,
             sec,
         };
         let mut w = Writer::new(&mut c.tx);
@@ -219,14 +222,26 @@ impl Client {
         Ok(())
     }
 
-    fn write_request_header(w: &mut Writer, token: &NodeId, handle: u32) {
+    fn write_request_header(w: &mut Writer, token: &NodeId, handle: u32, ecdh: Option<&str>) {
         w.node_id(token);
         w.i64(now_ticks());
         w.u32(handle);
         w.u32(0);
         w.str(None);
         w.u32(10_000);
-        w.null_extension_object();
+        match ecdh {
+            // AdditionalParametersType asking for an ephemeral ECDH key.
+            Some(uri) => {
+                let at = w.begin_extension_object(17537);
+                w.i32(1);
+                w.u16(0);
+                w.string("ECDHPolicyUri");
+                w.u8(12);
+                w.string(uri);
+                w.end_extension_object(at);
+            }
+            None => w.null_extension_object(),
+        }
     }
 
     /// OpenSecureChannel: 0 = issue, 1 = renew.
@@ -250,7 +265,7 @@ impl Client {
             w.u32(self.seq);
             w.u32(self.request_id);
             w.node_id(&NodeId::ns0(ids::OPEN_SECURE_CHANNEL_REQUEST));
-            Self::write_request_header(&mut w, &NodeId::NULL, self.handle);
+            Self::write_request_header(&mut w, &NodeId::NULL, self.handle, None);
             w.u32(0);
             w.u32(request_type);
             w.u32(mode as u32);
@@ -409,7 +424,7 @@ impl Client {
         tx.resize(start + 24, 0);
         let mut w = Writer::new(tx);
         w.node_id(&NodeId::ns0(request_type));
-        Self::write_request_header(&mut w, &self.auth_token, self.handle);
+        Self::write_request_header(&mut w, &self.auth_token, self.handle, self.ecdh);
         body(&mut w);
         let mode = self.sec.as_ref().map(|s| s.mode).unwrap_or(Mode::None);
         if let Some(k) = self.sec.as_ref().and_then(|s| s.ecc_keys.as_ref()) {
@@ -517,6 +532,15 @@ impl Client {
 
     /// CreateSession + ActivateSession (anonymous).
     pub fn create_session(&mut self, name: &str) -> io::Result<()> {
+        self.create_session_as(name, None)
+    }
+
+    /// CreateSession + ActivateSession with a user name and password (ECC
+    /// channels: an EccEncryptedSecret; others: clear text, SignAndEncrypt
+    /// only), or anonymous.
+    pub fn create_session_as(&mut self, name: &str, user: Option<(&str, &str)>) -> io::Result<()> {
+        let ecc_suite = self.sec.as_ref().and_then(|s| s.policy.ecc());
+        self.ecdh = if user.is_some() { ecc_suite.map(|s| s.uri()) } else { None };
         let mut client_nonce = [0u8; 32];
         crate::server::random_bytes(&mut client_nonce);
         let cert = self.sec.as_ref().map(|s| s.cert.clone());
@@ -541,7 +565,7 @@ impl Client {
         }
         let body = body.to_vec();
         let mut r = Reader::new(&body);
-        skip_response_header(&mut r).map_err(|_| invalid("bad header"))?;
+        let server_key = response_ecdh_key(&mut r).map_err(|_| invalid("bad header"))?;
         let _session_id = r.node_id().map_err(|_| invalid("bad session id"))?;
         let token = r.node_id().map_err(|_| invalid("bad token"))?;
         r.f64().map_err(|_| invalid("bad timeout"))?;
@@ -581,6 +605,16 @@ impl Client {
             _ => None,
         };
         self.auth_token = token;
+        let token_data = match (user, ecc_suite) {
+            (None, _) => None,
+            (Some((u, p)), None) => Some((u.to_string(), p.as_bytes().to_vec())),
+            (Some((u, p)), Some(suite)) => {
+                let (public, sig) = server_key.ok_or_else(|| invalid("no ECDHKey from the server"))?;
+                let sec = self.sec.as_ref().unwrap();
+                suite.verify(&sec.server.rsa_public_key, &public, &sig).map_err(|_| invalid("ECDHKey signature"))?;
+                Some((u.to_string(), ecc_secret(suite, sec, &public, &server_nonce, p.as_bytes())?))
+            }
+        };
         let (ty, body) = self.call(ids::ACTIVATE_SESSION_REQUEST, |w| {
             match &signature {
                 Some((alg, sig)) => {
@@ -594,16 +628,31 @@ impl Client {
             }
             w.empty_array();
             w.empty_array();
-            let at = w.begin_extension_object(ids::ANONYMOUS_IDENTITY_TOKEN_ENCODING);
-            w.string("anonymous");
-            w.end_extension_object(at);
+            match &token_data {
+                None => {
+                    let at = w.begin_extension_object(ids::ANONYMOUS_IDENTITY_TOKEN_ENCODING);
+                    w.string("anonymous");
+                    w.end_extension_object(at);
+                }
+                Some((user, secret)) => {
+                    let at = w.begin_extension_object(ids::USERNAME_IDENTITY_TOKEN_ENCODING);
+                    w.string(crate::server::USERNAME_POLICY_ID);
+                    w.string(user);
+                    w.bytes(Some(secret));
+                    w.str(None);
+                    w.end_extension_object(at);
+                }
+            }
             w.str(None);
             w.bytes(None);
         })?;
-        if ty != ids::ACTIVATE_SESSION_RESPONSE {
-            return Err(invalid(&format!("ActivateSession failed: {:08X}", service_result(body))));
-        }
-        Ok(())
+        let res = if ty != ids::ACTIVATE_SESSION_RESPONSE {
+            Err(invalid(&format!("ActivateSession failed: {:08X}", service_result(body))))
+        } else {
+            Ok(())
+        };
+        self.ecdh = None;
+        res
     }
 
     /// Sends a request without waiting for its response (see [`Client::receive`]).
@@ -967,6 +1016,78 @@ fn skip_endpoint(r: &mut Reader) -> crate::codec::DResult<()> {
     })?;
     r.str()?;
     r.u8().map(|_| ())
+}
+
+/// Skips a ResponseHeader; returns the ECDHKey (public key, signature) of its
+/// AdditionalHeader, if any.
+#[allow(clippy::type_complexity)]
+fn response_ecdh_key(r: &mut Reader) -> crate::codec::DResult<Option<(Vec<u8>, Vec<u8>)>> {
+    r.i64()?;
+    r.u32()?;
+    r.u32()?;
+    r.diagnostic_info()?;
+    r.skip_string_array()?;
+    let (ty, _, body) = r.extension_object_raw()?;
+    if ty.as_ns0() != Some(17537) {
+        return Ok(None);
+    }
+    let mut p = Reader::new(body);
+    let n = p.length(1)?.unwrap_or(0);
+    for _ in 0..n {
+        let (_, name) = p.qualified_name_ref()?;
+        if name == Some("ECDHKey") {
+            p.u8()?; // Variant ExtensionObject
+            let (_, _, key) = p.extension_object_raw()?;
+            let mut k = Reader::new(key);
+            let public = k.bytes()?.unwrap_or(&[]).to_vec();
+            let sig = k.bytes()?.unwrap_or(&[]).to_vec();
+            return Ok(Some((public, sig)));
+        }
+        p.variant()?;
+    }
+    Ok(None)
+}
+
+/// EccEncryptedSecret of `secret` for the server's ephemeral key `receiver`
+/// (Part 4 §7.41.2.3).
+fn ecc_secret(suite: ecc::Suite, sec: &Secure, receiver: &[u8], nonce: &[u8], secret: &[u8]) -> io::Result<Vec<u8>> {
+    let e = |_| invalid("EccEncryptedSecret");
+    let eph = ecc::Ephemeral::generate(suite).map_err(e)?;
+    let sender = eph.public.clone();
+    let keys = eph.secret_keys(suite, receiver, &sender, receiver).map_err(e)?;
+    let mut plain = Vec::new();
+    {
+        let mut w = Writer::new(&mut plain);
+        w.bytes(Some(nonce));
+        w.bytes(Some(secret));
+    }
+    let m = (plain.len() + 2) % 16;
+    let mut pad = if m == 0 { 0 } else { 16 - m };
+    if pad + secret.len() < 16 {
+        pad += 16;
+    }
+    plain.extend(std::iter::repeat_n(pad as u8, pad));
+    plain.extend_from_slice(&(pad as u16).to_le_bytes());
+    let mut out = Vec::new();
+    let mut w = Writer::new(&mut out);
+    w.node_id(&NodeId::ns0(17546));
+    w.u8(1);
+    w.u32(0); // patched
+    w.string(suite.uri());
+    w.bytes(Some(&sec.cert));
+    w.i64(now_ticks());
+    w.u16((8 + sender.len() + receiver.len()) as u16);
+    w.bytes(Some(&sender));
+    w.bytes(Some(receiver));
+    let payload_at = w.len();
+    let len = (payload_at + plain.len() + ecc::TAG_LEN + suite.signature_len() - 9) as u32;
+    w.patch_u32(5, len);
+    let tag = keys.seal(0, 0, &out, &mut plain).map_err(e)?;
+    out.extend_from_slice(&plain);
+    out.extend_from_slice(&tag);
+    let sig = sec.ecc().sign(&out).map_err(e)?;
+    out.extend_from_slice(&sig);
+    Ok(out)
 }
 
 pub fn skip_response_header(r: &mut Reader) -> crate::codec::DResult<u32> {
