@@ -14,9 +14,16 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Cryptography: aws-lc-rs.
 - **Users:** anonymous, user name / password (PBKDF2 hashes) and X.509 certificates, with read or read/write rights per user.
 - **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession, Read, Write, Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, ServerStatus, NamespaceArray.
+- **Subscriptions:** every Subscription and MonitoredItem service.
+  - Create / Modify / Delete, SetPublishingMode, Publish, Republish, TransferSubscriptions.
+  - SetMonitoringMode and SetTriggering.
+  - DataChangeFilter with triggers and an absolute deadband.
+  - Queues with both overflow policies.
+  - Keep-alive, lifetime and retransmission handling.
+  - The steady-state hot path allocates nothing.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: subscriptions / MonitoredItems (in progress), Call, events, the full namespace 0 nodeset, index ranges, ECC policies, the HTTPS transport (`opc.https`).
+Not yet: Call, events (EventFilter), percent deadbands, the full namespace 0 nodeset, index ranges, ECC policies, the HTTPS transport (`opc.https`).
 
 ## Build and run
 
@@ -44,6 +51,7 @@ Main options (`fastua --help` lists them all):
 | `--anonymous off\|read\|write`, `--x509-users read\|write` | Rights of anonymous users and of certificate users. |
 | `--trust-all-clients` | Accepts any client certificate (development only). |
 | `--busy-poll US` | Polls each connection for `US` µs before sleeping. Lowest latency, at the cost of one busy core per active connection. |
+| `--min-publishing-interval MS`, `--min-sampling-interval MS` | Fastest subscription intervals (default 1 ms, at least 0.05 ms). |
 
 `echo -n 's3cret' | ./target/release/fastua hash-password` prints a password hash for the users file.
 
@@ -77,6 +85,10 @@ The numbers below were measured by CI on GitHub runners. Run `cargo run --releas
 | Server crypto per Read, Sign | ~290 ns | ~280 ns |
 | Server crypto per Read, SignAndEncrypt | ~410 ns | ~410 ns |
 | Round trip p50, SignAndEncrypt, `--busy-poll` | 8.8 µs | 9.7 µs |
+| Subscription sampling pass, unchanged value | 0.9 ns/item | 2.6 ns/item |
+| Subscription changed value (sample + queue + encode) | 21 ns/item | 24 ns/item |
+| Write → notification p50 / p99, 1 ms intervals | 0.53 / 1.03 ms | 0.52 / 1.05 ms |
+| Write → notification p50 / p99, 0.1 ms intervals, `--busy-poll` | 64 / 114 µs | 64 / 113 µs |
 
 How it gets there:
 
@@ -87,6 +99,11 @@ How it gets there:
   - Numeric NodeIds use a dense index; RequestHeader and ReadValueId are decoded through fixed-layout fast paths.
   - One coarse clock read per request.
 - **Security:** HMAC-SHA256 uses states precomputed per channel key and hardware SHA instructions.
+- **Subscriptions:** sampling and publishing are driven by the connection thread, which waits for the next deadline with `ppoll`.
+  - An unchanged value costs one load.
+  - Samples go into fixed 32-byte entries, encoded straight from the value cell.
+  - Buffers are recycled, so the steady state allocates nothing (`tests/no_alloc.rs`).
+  - A notification leaves at the end of the publishing interval, as the specification requires, so the publishing interval sets the latency.
 - **Build:** release profile with fat LTO, 1 codegen unit and `panic = "abort"`.
 
 Details: [docs/RustServer.md](docs/RustServer.md).

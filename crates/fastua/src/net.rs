@@ -72,3 +72,36 @@ pub fn set_kernel_busy_poll(stream: &TcpStream, spin: Duration) {
         );
     }
 }
+
+/// Waits until the socket is readable or `timeout_ns` elapsed (nanosecond
+/// precision with `ppoll`). Returns true when readable.
+pub fn wait_readable(stream: &TcpStream, timeout_ns: u64) -> io::Result<bool> {
+    let mut fd = libc::pollfd { fd: stream.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let ts = libc::timespec {
+        tv_sec: (timeout_ns / 1_000_000_000) as libc::time_t,
+        tv_nsec: (timeout_ns % 1_000_000_000) as libc::c_long,
+    };
+    loop {
+        // SAFETY: one valid pollfd, valid timespec, no signal mask change.
+        let n = unsafe { libc::ppoll(&mut fd, 1, &ts, std::ptr::null()) };
+        if n >= 0 {
+            return Ok(n > 0);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// Lets timers of the calling thread fire within `ns` of their deadline
+/// (Linux default: 50 µs). Used by connections that drive subscriptions.
+pub fn set_timer_slack(ns: u64) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: PR_SET_TIMERSLACK takes an unsigned long and affects only this thread.
+    unsafe {
+        libc::prctl(libc::PR_SET_TIMERSLACK, ns as libc::c_ulong, 0, 0, 0);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = ns;
+}

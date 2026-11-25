@@ -11,6 +11,7 @@ pub mod pki;
 pub mod reload;
 pub mod server;
 pub mod services;
+pub mod subscription;
 pub mod types;
 pub mod users;
 pub mod value;
