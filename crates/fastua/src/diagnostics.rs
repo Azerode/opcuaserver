@@ -40,7 +40,15 @@ pub fn inc(c: &AtomicU32) {
 #[inline]
 pub fn dec(c: &AtomicU32) {
     // Never wraps below zero, even if a decrement races ahead.
-    let _ = c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1));
+    // (A plain CAS loop: `fetch_update` is deprecated on recent toolchains and
+    // its replacement `try_update` is missing on older ones.)
+    let mut v = c.load(Ordering::Relaxed);
+    while v > 0 {
+        match c.compare_exchange_weak(v, v - 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(now) => v = now,
+        }
+    }
 }
 
 /// Status codes counted as security rejections.
