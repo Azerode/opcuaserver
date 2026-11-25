@@ -102,6 +102,16 @@ Server object).
 - CI regenerates the tables from the tagged nodeset and fails if they differ.
   To move to a newer nodeset, change `NODESET_TAG` and run the script.
 
+### Server diagnostics
+
+`Server/ServerDiagnostics/ServerDiagnosticsSummary` and its twelve counters are
+live: current and cumulated sessions and subscriptions, rejected and
+security-rejected sessions (failed CreateSession / ActivateSession) and
+requests (any other ServiceFault), session timeouts. They are relaxed atomics
+touched only when a session or subscription starts or ends, or a request is
+rejected, never on a successful Read, Write or Publish. Per-session
+diagnostics are not collected (`EnabledFlag` is false, their arrays are empty).
+
 ## Subscriptions
 
 Every Subscription and MonitoredItem service is implemented: CreateSubscription,

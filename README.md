@@ -15,8 +15,9 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Cryptography: aws-lc-rs.
 - **Users:** anonymous, user name / password (PBKDF2 hashes) and X.509 certificates, with read or read/write rights per user.
 - **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession / Cancel, Read and Write (with index ranges), Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, Call, HistoryRead, HistoryUpdate.
+- **Profile:** ServerProfileArray announces the Standard 2017 UA Server profile (self-assessed against OPC 10000-7; not certified with the OPC Foundation CTT).
 - **Namespace 0:** the complete standard nodeset (5 477 nodes of `Opc.Ua.NodeSet2.xml` 1.05.07), compiled into the binary and merged with the live nodes. No cost per request.
-- **Server object:** ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities with OperationLimits and the 1.05 limits (MaxSessions, MaxSubscriptions, ...) from the configured limits, ServerDiagnostics, ServerRedundancy, Auditing, and the GetMonitoredItems and ResendData methods.
+- **Server object:** ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities with OperationLimits and the 1.05 limits (MaxSessions, MaxSubscriptions, ...) from the configured limits, ServerDiagnostics with a live ServerDiagnosticsSummary (session, subscription and rejected request counters), ServerRedundancy, Auditing, and the GetMonitoredItems and ResendData methods.
 - **Subscriptions:** every Subscription and MonitoredItem service.
   - Create / Modify / Delete, SetPublishingMode, Publish, Republish, TransferSubscriptions.
   - SetMonitoringMode and SetTriggering.
@@ -42,7 +43,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: the server diagnostics counters, condition branches and shelving, dialog conditions, event history, history persistence across restarts, the deprecated non-AEAD ECC policies, the HTTPS transport (`opc.https`).
+Not yet: per-session diagnostics arrays, condition branches and shelving, dialog conditions, event history, history persistence across restarts, the deprecated non-AEAD ECC policies, the HTTPS transport (`opc.https`).
 
 ## Build and run
 

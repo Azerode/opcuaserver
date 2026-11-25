@@ -37,6 +37,9 @@ pub enum ValueSource {
     Cell(Arc<ValueCell>),
     CurrentTime,
     ServerStatus,
+    /// A ServerDiagnosticsSummary field, or the whole summary
+    /// ([`crate::diagnostics::SUMMARY`]).
+    Diagnostics(u8),
 }
 
 pub const ACCESS_READ: u8 = 0x01;
@@ -119,6 +122,8 @@ pub struct ServerInfo {
     pub start_time: i64,
     /// Published in Server/ServerCapabilities.
     pub limits: crate::server::Limits,
+    /// Shared by every snapshot and clone.
+    pub diagnostics: Arc<crate::diagnostics::Diagnostics>,
 }
 
 impl Default for ServerInfo {
@@ -135,6 +140,7 @@ impl Default for ServerInfo {
             build_date: 0,
             start_time: now_ticks(),
             limits: Default::default(),
+            diagnostics: Default::default(),
         }
     }
 }
@@ -689,6 +695,30 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     );
     build_server_details(b, info);
     merge_nodeset(b);
+    diagnostics_values(b);
+}
+
+/// Live values of ServerDiagnosticsSummary, and empty per-session arrays
+/// (per-session diagnostics are not collected: EnabledFlag is false).
+fn diagnostics_values(b: &mut Builder) {
+    use crate::diagnostics::{FIELD_NODES, SUMMARY, SUMMARY_NODE};
+    let mut set = |id: u32, v: ValueSource| {
+        let i = b.idx(id);
+        if let NodeKind::Variable { value, .. } = &mut b.nodes[i as usize].kind {
+            *value = v;
+        }
+    };
+    set(SUMMARY_NODE, ValueSource::Diagnostics(SUMMARY));
+    for (i, &id) in FIELD_NODES.iter().enumerate() {
+        set(id, ValueSource::Diagnostics(i as u8));
+    }
+    // SamplingIntervalDiagnosticsArray, SubscriptionDiagnosticsArray,
+    // SessionDiagnosticsArray, SessionSecurityDiagnosticsArray.
+    for id in [2289, 2290, 3707, 3708] {
+        let empty =
+            Variant::Array(Box::new(VariantArray { type_id: builtin::EXTENSIONOBJECT, items: vec![], dims: None }));
+        set(id, ValueSource::Static(empty));
+    }
 }
 
 /// Completes namespace 0 from the official nodeset (see [`crate::ns0`]).
@@ -782,7 +812,7 @@ fn build_server_details(b: &mut Builder, info: &ServerInfo) {
         caps,
         12,
         1,
-        fixed(Variant::string_array(&["http://opcfoundation.org/UA-Profile/Server/EmbeddedUA2017"])),
+        fixed(Variant::string_array(&["http://opcfoundation.org/UA-Profile/Server/StandardUA2017"])),
     );
     b.property(2271, "LocaleIdArray", caps, 295, 1, fixed(Variant::string_array(&[])));
     b.property(2272, "MinSupportedSampleRate", caps, 290, -1, fixed(Variant::Double(l.min_sampling_interval_ms)));

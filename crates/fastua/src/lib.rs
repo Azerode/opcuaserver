@@ -8,6 +8,7 @@ pub mod client;
 pub mod codec;
 pub mod config;
 pub mod crypto;
+pub mod diagnostics;
 pub mod ecc;
 pub mod events;
 pub mod history;
