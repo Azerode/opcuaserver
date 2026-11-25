@@ -104,6 +104,8 @@ pub struct Connection<'a> {
     in_end: usize,
     /// Busy-poll period before sleeping in `recv` (zero = off).
     spin: std::time::Duration,
+    /// Holds one of the server's busy-poll permits.
+    spinning: bool,
     rx: Vec<u8>,
     tx: Vec<u8>,
     out: Vec<u8>,
@@ -117,6 +119,12 @@ pub struct Connection<'a> {
     /// Next sampling / publishing deadline (monotonic ns, `u64::MAX` = none).
     deadline: u64,
     slack_set: bool,
+}
+
+impl Drop for Connection<'_> {
+    fn drop(&mut self) {
+        self.stop_spinning();
+    }
 }
 
 #[derive(Debug)]
@@ -164,6 +172,7 @@ pub fn run(server: &Arc<Server>, stream: TcpStream) -> io::Result<()> {
         in_start: 0,
         in_end: 0,
         spin: server.config.busy_poll,
+        spinning: false,
         rx: Vec::with_capacity(limits.buffer_size as usize),
         tx: Vec::with_capacity(limits.buffer_size as usize + 64),
         out: Vec::new(),
@@ -198,16 +207,51 @@ impl<'a> Connection<'a> {
             self.in_end -= self.in_start;
             self.in_start = 0;
         }
-        let n = if self.conn.sessions.is_empty() {
-            crate::net::recv(&mut self.stream, &mut self.inbuf[self.in_end..], self.spin)?
-        } else {
-            self.recv_with_timers()?
-        };
+        let n = if self.conn.sessions.is_empty() { self.recv_plain()? } else { self.recv_with_timers()? };
         if n == 0 {
             return Err(Fatal::Io(io::ErrorKind::UnexpectedEof.into()));
         }
         self.in_end += n;
         Ok(())
+    }
+
+    /// True when this connection may busy-poll now (takes a permit if needed).
+    #[inline]
+    fn may_spin(&mut self) -> bool {
+        if self.spinning {
+            if self.server.spin_oversubscribed() {
+                self.stop_spinning();
+            }
+        } else if !self.spin.is_zero() {
+            self.spinning = self.server.acquire_spin();
+        }
+        self.spinning
+    }
+
+    #[inline]
+    fn stop_spinning(&mut self) {
+        if self.spinning {
+            self.spinning = false;
+            self.server.release_spin();
+        }
+    }
+
+    /// `recv` without timers: busy-polls first when a permit is free.
+    fn recv_plain(&mut self) -> io::Result<usize> {
+        if self.may_spin() {
+            let deadline = std::time::Instant::now() + self.spin;
+            loop {
+                if let Some(n) = crate::net::try_recv(&self.stream, &mut self.inbuf[self.in_end..])? {
+                    return Ok(n);
+                }
+                std::hint::spin_loop();
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+            }
+            self.stop_spinning();
+        }
+        std::io::Read::read(&mut self.stream, &mut self.inbuf[self.in_end..])
     }
 
     /// Receives while running subscription timers: waits for data or the
@@ -225,11 +269,11 @@ impl<'a> Connection<'a> {
             if now >= self.deadline {
                 self.run_timers(now)?;
                 if self.conn.sessions.is_empty() {
-                    return Ok(crate::net::recv(&mut self.stream, &mut self.inbuf[self.in_end..], self.spin)?);
+                    return Ok(self.recv_plain()?);
                 }
                 continue;
             }
-            if !self.spin.is_zero() {
+            if self.may_spin() {
                 let stop = self.deadline.min(now + self.spin.as_nanos() as u64);
                 loop {
                     if let Some(n) = crate::net::try_recv(&self.stream, &mut self.inbuf[self.in_end..])? {
@@ -244,6 +288,9 @@ impl<'a> Connection<'a> {
                 if now >= self.deadline {
                     continue;
                 }
+                // Idle for a whole spin period: sleep, and let another
+                // connection spin meanwhile.
+                self.stop_spinning();
             }
             if crate::net::wait_readable(&self.stream, self.deadline - now)? {
                 if let Some(n) = crate::net::try_recv(&self.stream, &mut self.inbuf[self.in_end..])? {

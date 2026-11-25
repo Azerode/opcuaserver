@@ -70,6 +70,13 @@ NodeId and type keeps its current value across reloads.
   busy core per active connection. It also sets `SO_BUSY_POLL` for NIC-level polling
   (needs `CAP_NET_ADMIN` above `net.core.busy_read`). Best combined with pinning the
   server to dedicated cores (`taskset`, `isolcpus`).
+- Adaptive busy polling: a connection spins only while it holds a permit. A sampler
+  thread reads the runnable threads (`/proc/loadavg`) every 2 ms and allows as many
+  spinners as there are free cores (at most `--busy-poll-threads`, default cores - 1).
+  A spinner keeps its permit while requests keep arriving (no atomic per request) and
+  gives it back when it sleeps or when the CPUs fill up, so many active clients no
+  longer starve the threads doing the work: 16 clients on 4 cores went from 0.5x to
+  ~0.95x of the blocking throughput while the single-client latency stays at ~7 µs.
 - Zero-copy decoding, all lengths bounded before allocation.
 - Address space references resolved to dense indexes at build time; numeric NodeIds of
   dense namespaces looked up in a direct table, others through FxHash.

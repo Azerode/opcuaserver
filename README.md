@@ -70,7 +70,8 @@ Main options (`fastua --help` lists them all):
 | `--users FILE` | Enables user name / password login. |
 | `--anonymous off\|read\|write`, `--x509-users read\|write` | Rights of anonymous users and of certificate users. |
 | `--trust-all-clients` | Accepts any client certificate (development only). |
-| `--busy-poll US` | Polls each connection for `US` µs before sleeping. Lowest latency, at the cost of one busy core per active connection. |
+| `--busy-poll US` | Polls each connection for `US` µs before sleeping. Lowest latency, at the cost of busy cores. Only as many connections spin as there are free cores, so throughput under many clients does not collapse. |
+| `--busy-poll-threads N` | Ceiling on the connections that busy-poll at once (default: cores - 1). |
 | `--min-publishing-interval MS`, `--min-sampling-interval MS` | Fastest subscription intervals (default 1 ms, at least 0.05 ms). |
 
 `echo -n 's3cret' | ./target/release/fastua hash-password` prints a password hash for the users file.
