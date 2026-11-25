@@ -151,6 +151,41 @@ fn services_over_https() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// HTTP clients spread one session over several connections (the OPC
+/// Foundation stack does): the session works on each, and Publish requests
+/// waiting on different connections are each answered on their own.
+#[test]
+fn session_over_several_connections() {
+    let (addr, https_addr, cert, dir) = start("multi");
+    let mut a = Client::connect_https(&https_addr, "localhost", &cert).unwrap();
+    a.create_session("multi").unwrap();
+    let mut b = Client::connect_https(&https_addr, "localhost", &cert).unwrap();
+    b.auth_token = a.auth_token.clone();
+    assert_eq!(b.write(&[(FORCE, Variant::Double(1.0))]).unwrap(), vec![status::GOOD]);
+    assert_eq!(a.read(&[(FORCE, 13)]).unwrap()[0].value, Some(Variant::Double(1.0)));
+
+    let (sub, ..) = a.create_subscription(10.0, 300, 10).unwrap();
+    assert_eq!(b.monitor(sub, &[MonitorSpec::value(FORCE, 7)]).unwrap()[0].0, status::GOOD);
+    let first = a.publish(&[]).unwrap();
+    assert_eq!(first.message.data[0].1.value, Some(Variant::Double(1.0)));
+    // Two Publish requests outstanding, one per connection, then two writes.
+    let ta = std::thread::spawn(move || a.publish(&[]).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let tb = std::thread::spawn(move || b.publish(&[]).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let mut w = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
+    w.create_session("writer").unwrap();
+    w.write(&[(FORCE, Variant::Double(2.0))]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    w.write(&[(FORCE, Variant::Double(3.0))]).unwrap();
+    let (pa, pb) = (ta.join().unwrap(), tb.join().unwrap());
+    // In queue order: the first connection's request gets the first change.
+    assert_eq!(pa.message.data[0].1.value, Some(Variant::Double(2.0)));
+    assert_eq!(pb.message.data[0].1.value, Some(Variant::Double(3.0)));
+    assert_eq!(pb.message.seq, pa.message.seq + 1);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// https-uajson: the same services with JSON bodies, transcoded around
 /// the binary service layer.
 #[test]

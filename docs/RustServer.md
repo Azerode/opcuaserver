@@ -525,12 +525,19 @@ endpoint. GetEndpoints filters on the transport profiles a client asks for.
   connections, requests answered in order. A body larger than
   MaxMessageSize gets 413, a request without Content-Length 411, any other
   method 405.
-- A TLS connection is a virtual secure channel: a session belongs to the
-  connection that activated it (ActivateSession on another connection moves
-  it, as on opc.tcp).
+- HTTP clients spread one session over several connections (the OPC
+  Foundation .NET stack opens a new one whenever the others wait on a
+  Publish). The connections of one client identity form one virtual secure
+  channel: all connections without a TLS client certificate share one, and
+  each client certificate gets its own. A session works on any connection
+  of its channel; a session activated with a certificate cannot be used
+  from a connection without it. Request ids are unique across connections.
 - Publish holds its HTTP response until a notification or a keep-alive is
-  due; the connection evaluates its subscriptions meanwhile (clients keep a
-  Publish outstanding, usually on a connection of its own).
+  due; the waiting connection evaluates the session's subscriptions
+  meanwhile. The session's Publish queue is shared by its connections and
+  answered in order: a connection answers only when its own request is at
+  the head of the queue, so every response goes out on its request's
+  connection (tested by `session_over_several_connections`).
 - Cost: a one-value Read round trip on loopback is 41 µs over HTTPS against
   34 µs over opc.tcp (dev VM, `cargo test --release --test https latency --
   --ignored --nocapture`). opc.tcp stays the fast path.

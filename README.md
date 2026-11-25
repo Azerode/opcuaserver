@@ -13,12 +13,12 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Mutual certificate authentication.
   - Token renewal and lifetime, sequence checks.
   - A PKI with chain, CRL and ApplicationUri validation.
-  - HTTPS transport (`--https-listen`, `opc.https`, https-uabinary): each request is a POST of its binary encoding over TLS (rustls), with the application certificate; sessions, subscriptions and every service work as over opc.tcp (Read round trip +7 µs on loopback). TLS client certificates (`--https-client-certs`, optional by default) are checked against the trust list and bind the session's application certificate.
+  - HTTPS transport (`--https-listen`, `opc.https`, https-uabinary): each request is a POST of its binary encoding over TLS (rustls), with the application certificate; sessions, subscriptions and every service work as over opc.tcp (Read round trip +7 µs on loopback). TLS client certificates (`--https-client-certs`, optional by default) are checked against the trust list and bind the session's application certificate. A session works on every TLS connection of the same client (HTTP clients such as the OPC Foundation stack spread requests and outstanding Publish requests over several connections); a session activated with a client certificate is reachable only from connections presenting that certificate.
   - JSON encoding (https-uajson, Part 6 §5.4 compact form): the same HTTPS endpoint takes `Content-Type: application/json` bodies. They are transcoded to and from UA binary around the service layer from a table of every namespace 0 DataType (`data/types.bin`, generated from the official nodeset), so every service works in JSON and the binary path pays nothing.
   - Cryptography: aws-lc-rs.
 - **Users:** anonymous, user name / password (PBKDF2 hashes) and X.509 certificates, with read or read/write rights per user.
 - **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession / Cancel, Read and Write (with index ranges), Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, Call, HistoryRead, HistoryUpdate.
-- **Profile:** ServerProfileArray announces the Standard 2017 UA Server profile (self-assessed against OPC 10000-7; not certified with the OPC Foundation CTT).
+- **Profile:** ServerProfileArray announces the Standard 2017 UA Server profile (self-assessed against OPC 10000-7; not certified with the OPC Foundation CTT). Four independent client stacks check it in CI, the OPC Foundation's own .NET stack among them (see [Interoperability](#interoperability)).
 - **Namespace 0:** the complete standard nodeset (5 477 nodes of `Opc.Ua.NodeSet2.xml` 1.05.07), compiled into the binary and merged with the live nodes, with the DataTypeDefinition attribute of every data type. No cost per request.
 - **Server object:** ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities with OperationLimits and the 1.05 limits (MaxSessions, MaxSubscriptions, ...) from the configured limits, ServerDiagnostics with a live ServerDiagnosticsSummary (session, subscription and rejected request counters), ServerRedundancy, Auditing, and the GetMonitoredItems and ResendData methods.
 - **Subscriptions:** every Subscription and MonitoredItem service.
@@ -167,19 +167,43 @@ Details: [docs/RustServer.md](docs/RustServer.md).
 
 The certificate store layout, the trust flow (move a file from `pki/rejected/certs/` to `pki/trusted/certs/`, no restart needed) and the users file format are described in [docs/RustServer.md](docs/RustServer.md#security).
 
+## Interoperability
+
+CI runs four third-party client stacks against the release binary on x86_64 and aarch64. Each check prints PASS or FAIL; one failure fails the job.
+
+| Client | What it checks |
+|---|---|
+| [OPC Foundation UA-.NETStandard](https://github.com/OPCFoundation/UA-.NETStandard) 1.5.378 (the reference stack) | GetEndpoints, FindServers; None and every RSA policy in Sign and SignAndEncrypt (multi-chunk responses); user name (wrong password, read-only user, password over None); **opc.https** (https-uabinary): session, Read, Browse, subscription; the whole address space browsed (BrowseNext pages sized by MaxBrowseContinuationPoints) and read through the stack's node model (about 4 900 nodes); DataTypeDefinition of every data type decoded as StructureDefinition / EnumDefinition; type tree; TranslateBrowsePaths; EURange; Write and Read back of every built-in type, type mismatch, non-writable attribute; RegisterNodes; data change and event monitored items with an OfType where clause; alarm Acknowledge through Call; GetMonitoredItems and argument errors; TransferSubscriptions to a second session; HistoryRead raw, continuation points, processed (Count), at time, events; HistoryUpdate insert. |
+| [node-opcua](https://github.com/node-opcua/node-opcua) 2.186 | Discovery; None and every RSA policy and mode; user tokens; the whole address space browsed in pages of 7 references and every mandatory attribute of every node read and strictly decoded (56 000 attributes); DataTypeDefinition; ServerStatus and BuildInfo built from their definitions; inverse browse; TranslateBrowsePaths; Write / Read of every built-in type, index range; RegisterNodes; data changes, audit events, alarm and Acknowledge; GetMonitoredItems; HistoryRead raw, continuation point, processed (Maximum), events. |
+| [open62541](https://github.com/open62541/open62541) (master) | Every ECC policy (AEAD and deprecated) in both modes with anonymous, X.509 and user name logins and token renewal ([open62541_ecc.c](crates/fastua/tests/interop/open62541_ecc.c)); None and every RSA policy, user rights, TranslateBrowsePaths, Browse / BrowseNext, Write / Read, RegisterNodes, data change and event monitored items, Call, HistoryRead with continuation points ([open62541_services.c](crates/fastua/tests/interop/open62541_services.c)). |
+| [asyncua](https://github.com/FreeOpcUa/opcua-asyncio) (Python) | Certificate trust flow (rejected / trusted), RSA policies, 4096-bit keys, user name and X.509 users, subscriptions with absolute and percent deadbands, hot reload, events and where clauses, history (raw, continuation points, processed), alarms and ConditionRefresh, index ranges. |
+
+Fixed thanks to these clients: the Filter of ReadEventDetails is an EventFilter encoded in place, not an ExtensionObject (node-opcua, .NET); legacy encrypted passwords may carry padding after the secret (.NET); an HTTPS session is no longer tied to one TLS connection (.NET).
+
+Not covered by a third-party client: the JSON encoding (https-uajson), which none of these client stacks implement (fastua's own tests cover it). The ECC policies are checked by open62541 only.
+
 ## Tests and CI
 
 ```bash
 cargo test                                   # unit + end-to-end tests
 cargo clippy --all-targets -- -D warnings
+I=crates/fastua/tests/interop B=target/release/fastua
 pip install asyncua cryptography
-python3 crates/fastua/tests/interop/asyncua_interop.py target/release/fastua config/machines
-# ECC policies against the open62541 client (built with UA_ENABLE_ENCRYPTION=OPENSSL)
-cc crates/fastua/tests/interop/open62541_ecc.c -lopen62541 -lssl -lcrypto -o open62541_ecc
-crates/fastua/tests/interop/open62541_ecc.sh target/release/fastua config/machines ./open62541_ecc
+python3 $I/asyncua_interop.py $B config/machines
+# open62541 client (built with UA_ENABLE_ENCRYPTION=OPENSSL)
+cc $I/open62541_ecc.c -lopen62541 -lssl -lcrypto -o open62541_ecc
+$I/open62541_ecc.sh $B config/machines ./open62541_ecc
+cc $I/open62541_services.c -lopen62541 -lssl -lcrypto -o open62541_services
+$I/serve.sh $B ./open62541_services
+# node-opcua (Node.js 22) and the OPC Foundation .NET stack (.NET 8 SDK)
+npm ci --prefix $I/node-opcua && $I/serve.sh $B node $I/node-opcua/interop.mjs
+dotnet build -c Release -o dotnet-interop $I/dotnet/Interop.csproj
+$I/serve.sh $B dotnet dotnet-interop/fastua-interop-dotnet.dll
 ```
 
-`.github/workflows/rust.yml` builds, tests, benchmarks and runs the asyncua and open62541 (ECC) interoperability suites natively on x86_64 and aarch64.
+`serve.sh` starts a fresh server (namespace [tests/interop/config](crates/fastua/tests/interop/config/Plant/Plant.json), every default endpoint, HTTPS, users `operator` / `viewer`, event history) and runs the client against it.
+
+`.github/workflows/rust.yml` builds, tests, benchmarks and runs the four interoperability suites natively on x86_64 and aarch64.
 
 ## Legacy C server
 

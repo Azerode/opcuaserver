@@ -634,10 +634,12 @@ fn decrypt_secret(ctx: &Ctx, data: &[u8], algorithm: Option<&str>, nonce: &[u8])
         return Err(status::BAD_IDENTITY_TOKEN_INVALID);
     }
     let len = u32::from_le_bytes(plain[..4].try_into().unwrap()) as usize;
-    if len != plain.len() - 4 || len < nonce.len() {
+    // The OPC Foundation stack pads the plain text (hiding the password
+    // length): bytes after `len` are ignored.
+    if len > plain.len() - 4 || len < nonce.len() {
         return Err(status::BAD_IDENTITY_TOKEN_INVALID);
     }
-    let (secret, tail) = plain[4..].split_at(len - nonce.len());
+    let (secret, tail) = plain[4..4 + len].split_at(len - nonce.len());
     if aws_lc_rs::constant_time::verify_slices_are_equal(tail, nonce).is_err() {
         return Err(status::BAD_IDENTITY_TOKEN_INVALID);
     }

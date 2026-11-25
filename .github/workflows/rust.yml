@@ -85,6 +85,31 @@ jobs:
           cc -O2 crates/fastua/tests/interop/open62541_ecc.c -I$HOME/open62541/include \
             -L$HOME/open62541/lib -lopen62541 -lssl -lcrypto -lpthread -lm -o open62541_ecc
           crates/fastua/tests/interop/open62541_ecc.sh target/release/fastua config/machines ./open62541_ecc
+      - name: Interoperability (open62541, RSA policies and services)
+        run: |
+          cc -O2 -Wall -Werror crates/fastua/tests/interop/open62541_services.c -I$HOME/open62541/include \
+            -L$HOME/open62541/lib -lopen62541 -lssl -lcrypto -lpthread -lm -o open62541_services
+          crates/fastua/tests/interop/serve.sh target/release/fastua ./open62541_services
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: crates/fastua/tests/interop/node-opcua/package-lock.json
+      - name: Interoperability (node-opcua)
+        run: |
+          npm ci --prefix crates/fastua/tests/interop/node-opcua --no-audit --no-fund
+          crates/fastua/tests/interop/serve.sh target/release/fastua \
+            node crates/fastua/tests/interop/node-opcua/interop.mjs
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Interoperability (OPC Foundation .NET Standard stack, opc.tcp and HTTPS)
+        env:
+          DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+          DOTNET_NOLOGO: "1"
+        run: |
+          dotnet build -c Release -o dotnet-interop crates/fastua/tests/interop/dotnet/Interop.csproj
+          crates/fastua/tests/interop/serve.sh target/release/fastua dotnet dotnet-interop/fastua-interop-dotnet.dll
       - name: Comparative benchmark (fastua vs open62541 server)
         run: |
           cc -O2 crates/fastua/tests/compare/open62541_server.c -I$HOME/open62541/include \
