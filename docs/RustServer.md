@@ -534,8 +534,16 @@ endpoint. GetEndpoints filters on the transport profiles a client asks for.
 - Cost: a one-value Read round trip on loopback is 41 µs over HTTPS against
   34 µs over opc.tcp (dev VM, `cargo test --release --test https latency --
   --ignored --nocapture`). opc.tcp stays the fast path.
-- Not supported: TLS client certificates (X.509 users still work through
-  the X509IdentityToken), chunked request bodies, the JSON encoding.
+- TLS client certificates (`--https-client-certs off|optional|required`,
+  default optional): the server asks for one during the handshake. A
+  certificate the client presents is checked against the application trust
+  list (`pki/trusted`, CRLs, `--trust-all-clients`) once the connection is
+  up; a rejected one gets 403 and the connection closes. An accepted one is
+  the connection's client certificate: CreateSession must send the same
+  certificate and its ApplicationUri (BadSecurityChecksFailed /
+  BadCertificateUriInvalid), ActivateSession needs no client signature (the
+  handshake proved the key), and the session diagnostics show it.
+- Not supported: chunked request bodies, the JSON encoding.
 
 ## Scope
 

@@ -38,6 +38,8 @@ struct Https {
     tls: std::io::BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>,
     host: String,
     line: String,
+    /// TLS client certificate, sent again in CreateSession.
+    cert: Option<Vec<u8>>,
 }
 
 /// Accepts exactly one server certificate (the tests pin the server's).
@@ -263,14 +265,35 @@ impl Client {
     /// Connects over HTTPS (`opc.https`) to `addr`, accepting only the
     /// server certificate `server_cert` (DER).
     pub fn connect_https(addr: &str, host: &str, server_cert: &[u8]) -> io::Result<Client> {
+        Self::connect_https_as(addr, host, server_cert, None)
+    }
+
+    /// Like [`Client::connect_https`], presenting `client` (certificate DER,
+    /// PKCS#8 key) as TLS client certificate; CreateSession then sends it
+    /// as the client certificate.
+    pub fn connect_https_as(
+        addr: &str,
+        host: &str,
+        server_cert: &[u8],
+        client: Option<(&[u8], &[u8])>,
+    ) -> io::Result<Client> {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
         let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
         let verifier = Arc::new(Pinned { cert: server_cert.to_vec(), provider: provider.clone() });
-        let config = rustls::ClientConfig::builder_with_provider(provider)
+        let builder = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .map_err(io::Error::other)?
             .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
+            .with_custom_certificate_verifier(verifier);
+        let config = match client {
+            None => builder.with_no_client_auth(),
+            Some((cert, key)) => builder
+                .with_client_auth_cert(
+                    vec![CertificateDer::from(cert.to_vec())],
+                    PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.to_vec())),
+                )
+                .map_err(io::Error::other)?,
+        };
         let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| invalid("bad host name"))?;
         let conn = rustls::ClientConnection::new(Arc::new(config), name).map_err(io::Error::other)?;
         let stream = TcpStream::connect(addr)?;
@@ -294,6 +317,7 @@ impl Client {
                 tls: std::io::BufReader::new(tls),
                 host: host.to_string(),
                 line: String::new(),
+                cert: client.map(|(c, _)| c.to_vec()),
             })),
         })
     }
@@ -737,7 +761,10 @@ impl Client {
         self.ecdh = if user.is_some() { ecc_suite.map(|s| s.uri()) } else { None };
         let mut client_nonce = [0u8; 32];
         crate::server::random_bytes(&mut client_nonce);
-        let cert = self.sec.as_ref().map(|s| s.cert.clone());
+        let cert = match &self.sec {
+            Some(s) => Some(s.cert.clone()),
+            None => self.https.as_ref().and_then(|h| h.cert.clone()),
+        };
         let (ty, body) = self.call(ids::CREATE_SESSION_REQUEST, |w| {
             w.string("urn:fastua:test-client");
             w.str(None);

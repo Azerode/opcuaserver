@@ -13,7 +13,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Mutual certificate authentication.
   - Token renewal and lifetime, sequence checks.
   - A PKI with chain, CRL and ApplicationUri validation.
-  - HTTPS transport (`--https-listen`, `opc.https`, https-uabinary): each request is a POST of its binary encoding over TLS (rustls), with the application certificate; sessions, subscriptions and every service work as over opc.tcp (Read round trip +7 µs on loopback).
+  - HTTPS transport (`--https-listen`, `opc.https`, https-uabinary): each request is a POST of its binary encoding over TLS (rustls), with the application certificate; sessions, subscriptions and every service work as over opc.tcp (Read round trip +7 µs on loopback). TLS client certificates (`--https-client-certs`, optional by default) are checked against the trust list and bind the session's application certificate.
   - Cryptography: aws-lc-rs.
 - **Users:** anonymous, user name / password (PBKDF2 hashes) and X.509 certificates, with read or read/write rights per user.
 - **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession / Cancel, Read and Write (with index ranges), Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, Call, HistoryRead, HistoryUpdate.
@@ -51,7 +51,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: HTTPS with client certificates or the JSON encoding.
+Not yet: the JSON encoding.
 
 ## Build and run
 
@@ -82,6 +82,7 @@ Main options (`fastua --help` lists them all):
 | `--busy-poll-threads N` | Ceiling on the connections that busy-poll at once (default: cores - 1). |
 | `--min-publishing-interval MS`, `--min-sampling-interval MS` | Fastest subscription intervals (default 1 ms, at least 0.05 ms). |
 | `--https-listen ADDR:PORT`, `--https-endpoint URL` | Also serve the HTTPS transport (`opc.https`); the endpoint URL defaults to `opc.https://<hostname>:<port>`. |
+| `--https-client-certs off\|optional\|required` | TLS client certificates on the HTTPS transport, checked against the application trust list (default: optional). |
 | `--history-dir DIR` | Keep the history of historized variables across restarts (written every second). |
 | `--event-history N` | Keep the last N events for HistoryRead on the Server object (default 0, off). |
 | `--session-diagnostics` | Count requests per session and service for SessionDiagnosticsArray (`EnabledFlag` true). The diagnostics arrays are always readable. |

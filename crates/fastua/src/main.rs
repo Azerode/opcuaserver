@@ -18,6 +18,8 @@ const USAGE: &str = "usage: fastua [options]
   --https-listen ADDR:PORT   also serve the HTTPS transport (opc.https, https-uabinary)
                           with the application certificate as TLS certificate
   --https-endpoint URL    HTTPS endpoint URL advertised (default: opc.https://<hostname>:<port>)
+  --https-client-certs off|optional|required
+                          TLS client certificates, checked against the trust list (default: optional)
   --endpoints LIST        comma-separated endpoints to offer (default: all but the deprecated ones):
                             none, basic256sha256-sign, basic256sha256-encrypt,
                             aes128-sign, aes128-encrypt, aes256-sign, aes256-encrypt,
@@ -114,6 +116,7 @@ fn main() {
     let mut history_dir: Option<PathBuf> = None;
     let mut https_listen: Option<String> = None;
     let mut https_endpoint: Option<String> = None;
+    let mut https_clients = fastua::https::ClientAuth::Optional;
 
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("hash-password") {
@@ -164,6 +167,15 @@ fn main() {
             }
             "--https-listen" => https_listen = Some(value("--https-listen")),
             "--https-endpoint" => https_endpoint = Some(value("--https-endpoint")),
+            "--https-client-certs" => {
+                use fastua::https::ClientAuth;
+                https_clients = match value("--https-client-certs").as_str() {
+                    "off" => ClientAuth::Off,
+                    "optional" => ClientAuth::Optional,
+                    "required" => ClientAuth::Required,
+                    v => fail(format!("invalid --https-client-certs '{v}'\n\n{USAGE}")),
+                }
+            }
             "--history-dir" => history_dir = Some(PathBuf::from(value("--history-dir"))),
             "--event-history" => {
                 let v = value("--event-history");
@@ -245,7 +257,7 @@ fn main() {
         let url = https_endpoint.clone().unwrap_or_else(|| format!("opc.https://{hostname}:{port}"));
         let key = std::fs::read(pki_dir.join("own/private/fastua.pk8"))
             .unwrap_or_else(|e| fail(format!("cannot read the private key for HTTPS: {e}")));
-        let tls = fastua::https::tls_config(pki.certificate_for(Policy::None), &key)
+        let tls = fastua::https::tls_config(pki.certificate_for(Policy::None), &key, https_clients)
             .unwrap_or_else(|e| fail(format!("cannot set up TLS: {e}")));
         config.https_url = Some(url.clone());
         (listener, tls, url, addr.clone())

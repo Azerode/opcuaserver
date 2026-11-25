@@ -469,6 +469,17 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
         if !security.https && !ctx.server.endpoint_enabled(Policy::None, Mode::None) {
             return Err(status::BAD_SECURITY_POLICY_REJECTED);
         }
+        // HTTPS with a TLS client certificate: the session's certificate
+        // is that one (Part 6 §7.4.3), with its ApplicationUri.
+        if let Some(tls_cert) = security.client_cert.as_ref().filter(|_| security.https) {
+            let leaf = client_cert.as_deref().and_then(|c| crate::pki::split_chain(c).ok()).map(|c| c[0].to_vec());
+            if leaf.as_deref() != Some(&tls_cert.der[..]) {
+                return Err(status::BAD_SECURITY_CHECKS_FAILED);
+            }
+            if app_uri.is_none() || tls_cert.application_uri != app_uri {
+                return Err(crate::pki::codes::BAD_CERTIFICATE_URI_INVALID);
+            }
+        }
         None
     } else {
         let channel_cert = security.client_cert.as_ref().ok_or(status::BAD_SECURITY_CHECKS_FAILED)?;
@@ -672,8 +683,9 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
         return Err(status::BAD_SECURITY_CHECKS_FAILED);
     }
 
-    // Proof of possession of the client certificate's private key.
-    if let Some(cert) = &ctx.security.client_cert {
+    // Proof of possession of the client certificate's private key (over
+    // HTTPS, the TLS handshake proved it).
+    if let Some(cert) = ctx.security.client_cert.as_ref().filter(|_| !ctx.security.https) {
         let ok = match ctx.security.policy {
             // Channel-bound (deprecated policies: server certificate |
             // serverNonce); the algorithm field is ignored.

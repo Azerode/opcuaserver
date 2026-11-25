@@ -10,6 +10,12 @@
 //! moves it). A Publish holds its HTTP response until a notification or a
 //! keep-alive is due, so clients keep a Publish outstanding as usual; the
 //! subscriptions of the connection are evaluated while it waits.
+//!
+//! TLS client certificates (Part 6 §7.4.3): the server asks for one
+//! ([`ClientAuth`]). A certificate the client presents is validated against
+//! the application trust list like an opc.tcp client certificate; it becomes
+//! the connection's client certificate, and CreateSession must then name
+//! the same certificate and its ApplicationUri.
 
 use crate::channel::{Security, MSG_HEADER_LEN};
 use crate::codec::{Reader, Writer};
@@ -27,15 +33,81 @@ pub const TRANSPORT_PROFILE_HTTPS: &str = "http://opcfoundation.org/UA-Profile/T
 /// Largest request line plus headers.
 const MAX_HEAD: usize = 16 * 1024;
 
+/// Whether HTTPS clients present a TLS client certificate.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClientAuth {
+    /// Not asked for.
+    Off,
+    /// Asked for; clients without one connect as before.
+    Optional,
+    /// Required: the handshake fails without one.
+    Required,
+}
+
+/// Accepts any client certificate during the handshake (checking only the
+/// proof of possession); the trust list decides once the connection is up
+/// (see [`connection`]), with the codes of the opc.tcp checks.
+#[derive(Debug)]
+struct AnyClient {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    mandatory: bool,
+}
+
+impl rustls::server::danger::ClientCertVerifier for AnyClient {
+    fn client_auth_mandatory(&self) -> bool {
+        self.mandatory
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 /// TLS configuration from the server's application certificate and its
 /// PKCS#8 private key (DER).
-pub fn tls_config(cert_der: &[u8], key_pkcs8: &[u8]) -> Result<Arc<rustls::ServerConfig>, String> {
+pub fn tls_config(cert_der: &[u8], key_pkcs8: &[u8], clients: ClientAuth) -> Result<Arc<rustls::ServerConfig>, String> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-    let config = rustls::ServerConfig::builder_with_provider(provider)
+    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
-        .map_err(|e| e.to_string())?
-        .with_no_client_auth()
+        .map_err(|e| e.to_string())?;
+    let builder = match clients {
+        ClientAuth::Off => builder.with_no_client_auth(),
+        _ => builder
+            .with_client_cert_verifier(Arc::new(AnyClient { provider, mandatory: clients == ClientAuth::Required })),
+    };
+    let config = builder
         .with_single_cert(
             vec![CertificateDer::from(cert_der.to_vec())],
             PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pkcs8.to_vec())),
@@ -138,7 +210,8 @@ fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerCo
     let tls = rustls::StreamOwned::new(conn, stream);
     let mut tls = BufReader::with_capacity(64 * 1024, tls);
     let channel_id = server.next_channel_id();
-    let security = Security::HTTPS;
+    let mut security = Security::HTTPS;
+    let mut first = true;
     let mut session = None;
     let mut space = None;
     let mut conn = services::ConnState::new(limits.max_message_size as usize);
@@ -148,6 +221,20 @@ fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerCo
     let mut request_id = 0u32;
     loop {
         let Some(head) = read_head(&mut tls, &mut line)? else { return Ok(()) };
+        if std::mem::take(&mut first) {
+            // The handshake is done: check the client certificate, if any.
+            if let Some(certs) = tls.get_ref().conn.peer_certificates() {
+                let chain: Vec<u8> = certs.iter().flat_map(|c| c.as_ref().iter().copied()).collect();
+                match server.pki().validate_application(&chain) {
+                    Ok(info) => security.client_cert = Some(Arc::new(info)),
+                    Err(code) => {
+                        crate::log!("https client certificate rejected (0x{code:08X})");
+                        respond(tls.get_mut(), "403 Forbidden", b"", true)?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
         // Sessions may idle longer than a HEL: from now on, wait for the
         // next request as long as the longest session timeout.
         tls.get_ref().sock.set_read_timeout(Some(Duration::from_millis(limits.max_session_timeout_ms as u64)))?;

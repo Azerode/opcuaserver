@@ -20,8 +20,8 @@ const MACHINE: &str = r#"{ "Name": "Press", "Namespace": "urn:press",
 const FORCE: NodeId = NodeId::Numeric(2, 1);
 
 /// (opc.tcp address, HTTPS address, server certificate, directory)
-fn start() -> (String, String, Vec<u8>, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("fastua-https-{}", std::process::id()));
+fn start(name: &str) -> (String, String, Vec<u8>, PathBuf) {
+    let dir = std::env::temp_dir().join(format!("fastua-https-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("cfg")).unwrap();
     std::fs::write(dir.join("cfg/m.json"), MACHINE).unwrap();
@@ -37,7 +37,7 @@ fn start() -> (String, String, Vec<u8>, PathBuf) {
     let pki = Pki::open(&dir.join("pki"), "urn:test:fastua", "localhost", false).unwrap();
     let cert = pki.certificate_for(Policy::None).to_vec();
     let key = std::fs::read(dir.join("pki/own/private/fastua.pk8")).unwrap();
-    let tls = fastua::https::tls_config(&cert, &key).unwrap();
+    let tls = fastua::https::tls_config(&cert, &key, fastua::https::ClientAuth::Optional).unwrap();
     let server = Server::new(store, config, pki, Users::default());
     let s = server.clone();
     std::thread::spawn(move || fastua::https::serve(s, https_listener, tls));
@@ -90,7 +90,7 @@ fn endpoints(c: &mut Client, profiles: &[&str]) -> Vec<(String, String)> {
 #[test]
 #[ignore]
 fn latency_https_vs_tcp() {
-    let (addr, https_addr, cert, _dir) = start();
+    let (addr, https_addr, cert, _dir) = start("latency");
     let mut h = Client::connect_https(&https_addr, "localhost", &cert).unwrap();
     h.create_session("h").unwrap();
     let mut t = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
@@ -110,7 +110,7 @@ fn latency_https_vs_tcp() {
 
 #[test]
 fn services_over_https() {
-    let (addr, https_addr, cert, dir) = start();
+    let (addr, https_addr, cert, dir) = start("services");
     let mut c = Client::connect_https(&https_addr, "localhost", &cert).unwrap();
 
     // Every endpoint, or one transport.
@@ -145,5 +145,35 @@ fn services_over_https() {
     let p = c.publish(&[(p.subscription, p.message.seq)]).unwrap();
     writer.join().unwrap();
     assert_eq!(p.message.data[0].1.value, Some(Variant::Double(9.0)));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// TLS client certificates: checked against the application trust list,
+/// then the session's certificate and ApplicationUri.
+#[test]
+fn client_certificates() {
+    let (_, https_addr, cert, dir) = start("client-certs");
+    let (mine, key) = fastua::pki::generate_self_signed("urn:fastua:test-client", "localhost").unwrap();
+    let connect = |c: &[u8], k: &[u8]| Client::connect_https_as(&https_addr, "localhost", &cert, Some((c, k))).unwrap();
+
+    // Not trusted: the connection is refused (403) at the first request.
+    assert!(connect(&mine, &key).create_session("untrusted").is_err());
+
+    let trusted = dir.join("pki/trusted/certs");
+    std::fs::create_dir_all(&trusted).unwrap();
+    std::fs::write(trusted.join("client.der"), &mine).unwrap();
+    let mut c = connect(&mine, &key);
+    c.create_session("tls-client").unwrap();
+    assert_eq!(c.read(&[(FORCE, 13)]).unwrap().len(), 1);
+
+    // Trusted, but CreateSession names another ApplicationUri.
+    let (other, other_key) = fastua::pki::generate_self_signed("urn:other", "localhost").unwrap();
+    std::fs::write(trusted.join("other.der"), &other).unwrap();
+    let err = connect(&other, &other_key).create_session("other").unwrap_err();
+    assert!(err.to_string().contains("80170000"), "{err}"); // BadCertificateUriInvalid
+
+    // Without a certificate (optional): as before.
+    let mut c = Client::connect_https(&https_addr, "localhost", &cert).unwrap();
+    c.create_session("anonymous").unwrap();
     let _ = std::fs::remove_dir_all(dir);
 }
