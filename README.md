@@ -13,7 +13,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - A PKI with chain, CRL and ApplicationUri validation.
   - Cryptography: aws-lc-rs.
 - **Users:** anonymous, user name / password (PBKDF2 hashes) and X.509 certificates, with read or read/write rights per user.
-- **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession / Cancel, Read and Write (with index ranges), Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, Call.
+- **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession / Cancel, Read and Write (with index ranges), Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, Call, HistoryRead, HistoryUpdate.
 - **Server object:** ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities with OperationLimits from the configured limits, ServerDiagnostics, ServerRedundancy, Auditing, and the GetMonitoredItems and ResendData methods.
 - **Subscriptions:** every Subscription and MonitoredItem service.
   - Create / Modify / Delete, SetPublishingMode, Publish, Republish, TransferSubscriptions.
@@ -27,9 +27,13 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - EventFilter select clauses and where clauses (comparisons, Like, Between, InList, And / Or / Not, OfType, bitwise operators), with per clause results.
   - Event queues with both overflow policies and EventQueueOverflow events.
   - Server events: session audit (create, activate, close, timeout), configuration reloaded (BaseModelChangeEventType) and configuration rejected (SystemEventType).
+- **Historical access:** variables marked `Historizing` keep their last values (10 000 by default) in memory.
+  - HistoryRead: raw values (with bounds, forward and reverse), modified values, values at given times (interpolated), with continuation points.
+  - HistoryUpdate: insert, replace, update, delete a range, delete at times; every change goes to the modified history with its user.
+  - HistoryServerCapabilities describes what is supported.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: the full namespace 0 nodeset, conditions and alarms, history, aggregates, ECC policies, the HTTPS transport (`opc.https`).
+Not yet: the full namespace 0 nodeset, conditions and alarms, event history, history persistence across restarts, aggregates, ECC policies, the HTTPS transport (`opc.https`).
 
 ## Build and run
 
@@ -73,12 +77,13 @@ Every `*.json` file in the directory, searched recursively, is one namespace:
     { "Name": "FLAGS",
       "Items": [
         { "Name": "PC", "NodeId": "ns=5;i=1000", "Type": "System.Int16", "Writable": true },
-        { "Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": { "Low": 0, "High": 200 } } ] }
+        { "Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": { "Low": 0, "High": 200 },
+          "Historizing": true, "HistoryCapacity": 50000 } ] }
   ]
 }
 ```
 
-Variables appear under `Objects/<Name>/<group>/<item>`. Supported types are Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float, Double, String, DateTime, Guid and ByteString. A numeric item with an `EURange` (`{"Low": .., "High": ..}` or `[low, high]`) becomes an AnalogItemType variable with an EURange property, which percent deadbands use. Adding, removing or editing a file takes effect about 50 ms later, without a restart.
+Variables appear under `Objects/<Name>/<group>/<item>`. Supported types are Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float, Double, String, DateTime, Guid and ByteString. A numeric item with an `EURange` (`{"Low": .., "High": ..}` or `[low, high]`) becomes an AnalogItemType variable with an EURange property, which percent deadbands use. `Historizing: true` records every write of the item for HistoryRead; `HistoryCapacity` (default 10 000) bounds the values kept. Adding, removing or editing a file takes effect about 50 ms later, without a restart.
 
 ## Performance
 
@@ -99,6 +104,9 @@ The numbers below were measured by CI on GitHub runners. Run `cargo run --releas
 | Write → notification p50 / p99, 1 ms intervals | 0.53 / 1.03 ms | 0.52 / 1.05 ms |
 | Write → notification p50 / p99, 0.1 ms intervals, `--busy-poll` | 64 / 114 µs | 64 / 113 µs |
 | Server event → EventFieldList (where clause, 6 fields) | ~340 ns | ~490 ns |
+| Write, variable without history | 8.1 ns | 12.7 ns |
+| Write, historized variable | 24 ns | 43 ns |
+| HistoryRead raw, 1000 values, per value | 9.7 ns | 15.4 ns |
 
 How it gets there:
 
@@ -116,6 +124,7 @@ How it gets there:
   - Buffers are recycled, so the steady state allocates nothing (`tests/no_alloc.rs`).
   - A notification leaves at the end of the publishing interval, as the specification requires, so the publishing interval sets the latency.
 - **Events:** event items pull from a shared ring only when their subscription is serviced. Subscriptions without event items never look at it, and raising an event costs one atomic load while nobody subscribes.
+- **History:** a write checks one flag that sits in the cell's padding; a historized write takes a short mutex and pushes into a ring that stops allocating once full. HistoryRead encodes each DataValue straight from the ring under the lock, without copying the values. Continuation points carry the resume position, so they hold no server memory.
 - **Build:** release profile with fat LTO, 1 codegen unit and `panic = "abort"`.
 
 Details: [docs/RustServer.md](docs/RustServer.md).

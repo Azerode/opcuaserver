@@ -488,6 +488,7 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
         (ids::VENDOR_SERVER_INFO_TYPE, "VendorServerInfoType"),
         (ids::SERVER_REDUNDANCY_TYPE, "ServerRedundancyType"),
         (ids::OPERATION_LIMITS_TYPE, "OperationLimitsType"),
+        (ids::HISTORY_SERVER_CAPABILITIES_TYPE, "HistoryServerCapabilitiesType"),
     ] {
         b.ns0(id, name, NodeKind::ObjectType { is_abstract: false });
     }
@@ -515,6 +516,7 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
         ids::VENDOR_SERVER_INFO_TYPE,
         ids::SERVER_REDUNDANCY_TYPE,
         ids::OPERATION_LIMITS_TYPE,
+        ids::HISTORY_SERVER_CAPABILITIES_TYPE,
     ] {
         b.subtype(ids::BASE_OBJECT_TYPE, t);
     }
@@ -706,6 +708,37 @@ fn build_server_details(b: &mut Builder, info: &ServerInfo) {
         b.property(id, name, ops, 7, -1, fixed(per_call.clone()));
     }
     b.property(11713, "MaxNodesPerNodeManagement", ops, 7, -1, fixed(Variant::UInt32(0)));
+    for (id, name) in [(12165, "MaxNodesPerHistoryReadData"), (12167, "MaxNodesPerHistoryUpdateData")] {
+        b.property(id, name, ops, 7, -1, fixed(per_call.clone()));
+    }
+    for (id, name) in [(12166, "MaxNodesPerHistoryReadEvents"), (12168, "MaxNodesPerHistoryUpdateEvents")] {
+        b.property(id, name, ops, 7, -1, fixed(Variant::UInt32(0)));
+    }
+
+    // Historical access (Part 11 §5.4.2).
+    let hist = ids::HISTORY_SERVER_CAPABILITIES;
+    b.object(hist, "HistoryServerCapabilities", caps, ids::HISTORY_SERVER_CAPABILITIES_TYPE);
+    for (id, name, value) in [
+        (11193, "AccessHistoryDataCapability", true),
+        (11242, "AccessHistoryEventsCapability", false),
+        (11196, "InsertDataCapability", true),
+        (11197, "ReplaceDataCapability", true),
+        (11198, "UpdateDataCapability", true),
+        (11199, "DeleteRawCapability", true),
+        (11200, "DeleteAtTimeCapability", true),
+        (11275, "InsertAnnotationCapability", false),
+        (11281, "InsertEventCapability", false),
+        (11282, "ReplaceEventCapability", false),
+        (11283, "UpdateEventCapability", false),
+        (11502, "DeleteEventCapability", false),
+        (19091, "ServerTimestampSupported", true),
+    ] {
+        b.property(id, name, hist, 1, -1, fixed(Variant::Boolean(value)));
+    }
+    let max_values = crate::history::MAX_RETURN_VALUES as u32;
+    b.property(11273, "MaxReturnDataValues", hist, 7, -1, fixed(Variant::UInt32(max_values)));
+    b.property(11274, "MaxReturnEventValues", hist, 7, -1, fixed(Variant::UInt32(0)));
+    b.object(ids::HISTORY_AGGREGATE_FUNCTIONS, "AggregateFunctions", hist, ids::FOLDER_TYPE);
     b.folder(2996, "ModellingRules", ids::SERVER_SERVER_CAPABILITIES);
     b.folder(2997, "AggregateFunctions", ids::SERVER_SERVER_CAPABILITIES);
     // `folder` links with Organizes; capabilities hold them as components.
@@ -820,6 +853,7 @@ pub fn build(
     let created = now_ticks();
     let mut fresh = 0usize;
     let mut stamp = None;
+    let mut history: Vec<(Arc<ValueCell>, Option<usize>)> = Vec::new();
 
     for (c, &ns) in configs.iter().zip(&assigned) {
         let folder_id = |path: &str| NodeId::String(ns, format!("__folder/{path}").into());
@@ -855,7 +889,14 @@ pub fn build(
                             Arc::new(ValueCell::with_stamp(it.data_type, created, stamp.unwrap(), lane))
                         },
                     );
-                let access = if it.writable { ACCESS_READ | ACCESS_WRITE } else { ACCESS_READ };
+                let mut access = if it.writable { ACCESS_READ | ACCESS_WRITE } else { ACCESS_READ };
+                if it.history.is_some() {
+                    use crate::history::{ACCESS_HISTORY_READ, ACCESS_HISTORY_WRITE};
+                    access |= ACCESS_HISTORY_READ | if it.writable { ACCESS_HISTORY_WRITE } else { 0 };
+                }
+                // Applied once the whole build succeeded (a failed reload
+                // must leave the live cells untouched).
+                history.push((cell.clone(), it.history));
                 let var = b
                     .add(Node {
                         id,
@@ -898,6 +939,9 @@ pub fn build(
         }
     }
 
+    for (cell, capacity) in history {
+        cell.set_history(capacity);
+    }
     let dense = dense_tables(&b.nodes, namespaces.len());
     let events = previous.map(|p| p.events.clone()).unwrap_or_default();
     Ok(AddressSpace { nodes: b.nodes, index: b.index, dense, namespaces, generation, info, events })
@@ -981,6 +1025,7 @@ mod tests {
                         data_type: *t,
                         writable: true,
                         eu_range: None,
+                        history: None,
                     })
                     .collect(),
             }],

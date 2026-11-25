@@ -9,14 +9,18 @@
 //! configuration reload, a node that keeps the same NodeId and data type keeps
 //! the very same cell, so its value survives and in-flight writes are not lost.
 
+use crate::history::History;
 use crate::types::{builtin, status, DataValue, Variant};
-use std::sync::atomic::{fence, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{fence, AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 pub struct ValueCell {
     kind: u8,
     /// Encoded size of an inline kind, 0 for String / ByteString / Guid.
     size: u8,
+    /// Writes are recorded in `history` (Historizing variables). Next to
+    /// `kind`: in padding, on the cache line every write touches anyway.
+    historize: AtomicBool,
     seq: AtomicU32,
     bits: AtomicU64,
     status: AtomicU32,
@@ -29,6 +33,9 @@ pub struct ValueCell {
     stamp: &'static AtomicU32,
     /// Position in the block (top 6 bits of every stamp this cell stores).
     lane: u32,
+    /// Kept when historizing is switched off, so data survives a reload
+    /// that switches it back on.
+    history: OnceLock<Box<History>>,
 }
 
 /// Cells per change stamp.
@@ -181,6 +188,26 @@ pub fn variant_as_f64(v: &Variant) -> Option<f64> {
     is_inline(k).then(|| bits_as_f64(k, to_bits(v))).flatten()
 }
 
+/// A numeric value of type `kind` from f64 (interpolation, aggregates);
+/// integers are rounded and saturated.
+pub fn variant_from_f64(kind: u8, f: f64) -> Option<Variant> {
+    use builtin::*;
+    let r = f.round();
+    Some(match kind {
+        SBYTE => Variant::SByte(r as i8),
+        BYTE => Variant::Byte(r as u8),
+        INT16 => Variant::Int16(r as i16),
+        UINT16 => Variant::UInt16(r as u16),
+        INT32 => Variant::Int32(r as i32),
+        UINT32 => Variant::UInt32(r as u32),
+        INT64 => Variant::Int64(r as i64),
+        UINT64 => Variant::UInt64(r as u64),
+        FLOAT => Variant::Float(f as f32),
+        DOUBLE => Variant::Double(f),
+        _ => return None,
+    })
+}
+
 /// Default (zero) value of a built-in type.
 pub fn default_value(kind: u8) -> Variant {
     match kind {
@@ -213,6 +240,37 @@ impl ValueCell {
             source_ts: AtomicI64::new(created),
             server_ts: AtomicI64::new(created),
             blob: Mutex::new(default_value(kind)),
+            historize: AtomicBool::new(false),
+            history: OnceLock::new(),
+        }
+    }
+
+    /// Starts (`Some(capacity)`) or stops recording writes.
+    #[cold]
+    pub fn set_history(&self, capacity: Option<usize>) {
+        match capacity {
+            Some(cap) => {
+                self.history.get_or_init(|| Box::new(History::new(self.kind, cap))).set_capacity(cap);
+                self.historize.store(true, Ordering::Release);
+            }
+            None => self.historize.store(false, Ordering::Release),
+        }
+    }
+
+    /// History of a historizing cell.
+    pub fn history(&self) -> Option<&History> {
+        if self.historize.load(Ordering::Acquire) {
+            self.history.get().map(|h| &**h)
+        } else {
+            None
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn record(&self, value: &Variant, status: u32, source_ts: i64, server_ts: i64) {
+        if let Some(h) = self.history.get() {
+            h.record(Sample { value: value.clone(), status, source_ts, server_ts });
         }
     }
 
@@ -331,6 +389,9 @@ impl ValueCell {
             let seq = self.seq.fetch_add(2, Ordering::Release).wrapping_add(2);
             drop(blob);
             self.publish(seq);
+            if self.historize.load(Ordering::Relaxed) {
+                self.record(value, status, source_ts, server_ts);
+            }
             return;
         }
         // Writers serialise on the odd sequence number.
@@ -353,6 +414,9 @@ impl ValueCell {
         self.server_ts.store(server_ts, Ordering::Relaxed);
         self.seq.store(s.wrapping_add(2), Ordering::Release);
         self.publish(s.wrapping_add(2));
+        if self.historize.load(Ordering::Relaxed) {
+            self.record(value, status, source_ts, server_ts);
+        }
     }
 
     pub fn to_data_value(&self) -> DataValue {

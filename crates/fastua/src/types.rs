@@ -594,11 +594,56 @@ pub mod ids {
     pub const AGGREGATE_FILTER_ENCODING: u32 = 730;
     pub const DATA_CHANGE_NOTIFICATION_ENCODING: u32 = 811;
     pub const STATUS_CHANGE_NOTIFICATION_ENCODING: u32 = 820;
+
+    // Historical access (Part 11)
+    pub const HISTORY_READ_REQUEST: u32 = 664;
+    pub const HISTORY_READ_RESPONSE: u32 = 667;
+    pub const HISTORY_UPDATE_REQUEST: u32 = 700;
+    pub const HISTORY_UPDATE_RESPONSE: u32 = 703;
+    pub const READ_EVENT_DETAILS_ENCODING: u32 = 646;
+    pub const READ_RAW_MODIFIED_DETAILS_ENCODING: u32 = 649;
+    pub const READ_PROCESSED_DETAILS_ENCODING: u32 = 652;
+    pub const READ_AT_TIME_DETAILS_ENCODING: u32 = 655;
+    pub const HISTORY_DATA_ENCODING: u32 = 658;
+    pub const HISTORY_EVENT_ENCODING: u32 = 661;
+    pub const HISTORY_MODIFIED_DATA_ENCODING: u32 = 11227;
+    pub const UPDATE_DATA_DETAILS_ENCODING: u32 = 682;
+    pub const UPDATE_EVENT_DETAILS_ENCODING: u32 = 685;
+    pub const DELETE_RAW_MODIFIED_DETAILS_ENCODING: u32 = 688;
+    pub const DELETE_AT_TIME_DETAILS_ENCODING: u32 = 691;
+    pub const DELETE_EVENT_DETAILS_ENCODING: u32 = 694;
+    pub const HISTORY_SERVER_CAPABILITIES_TYPE: u32 = 2330;
+    pub const HISTORY_SERVER_CAPABILITIES: u32 = 11192;
+    pub const HISTORY_AGGREGATE_FUNCTIONS: u32 = 11201;
 }
 
 /// Status codes (Part 4, §7.39 and Part 6 annex).
 pub mod status {
     pub const GOOD: u32 = 0;
+
+    /// Severity Good (top two bits 00).
+    #[inline]
+    pub fn is_good(code: u32) -> bool {
+        code & 0xC000_0000 == 0
+    }
+
+    // Historical access (Part 11)
+    pub const GOOD_NO_DATA: u32 = 0x00A5_0000;
+    pub const GOOD_MORE_DATA: u32 = 0x00A6_0000;
+    pub const GOOD_ENTRY_INSERTED: u32 = 0x00A2_0000;
+    pub const GOOD_ENTRY_REPLACED: u32 = 0x00A3_0000;
+    pub const UNCERTAIN_DATA_SUB_NORMAL: u32 = 0x40A4_0000;
+    pub const BAD_HISTORY_OPERATION_INVALID: u32 = 0x8071_0000;
+    pub const BAD_HISTORY_OPERATION_UNSUPPORTED: u32 = 0x8072_0000;
+    pub const BAD_NO_DATA: u32 = 0x809B_0000;
+    pub const BAD_BOUND_NOT_FOUND: u32 = 0x80D7_0000;
+    pub const BAD_ENTRY_EXISTS: u32 = 0x809F_0000;
+    pub const BAD_NO_ENTRY_EXISTS: u32 = 0x80A0_0000;
+    pub const BAD_INVALID_TIMESTAMP_ARGUMENT: u32 = 0x80BD_0000;
+    pub const BAD_AGGREGATE_LIST_MISMATCH: u32 = 0x80D4_0000;
+    pub const BAD_AGGREGATE_NOT_SUPPORTED: u32 = 0x80D5_0000;
+    pub const BAD_AGGREGATE_INVALID_INPUTS: u32 = 0x80D6_0000;
+    pub const BAD_AGGREGATE_CONFIGURATION_REJECTED: u32 = 0x80DA_0000;
     pub const UNCERTAIN_INITIAL_VALUE: u32 = 0x4092_0000;
     pub const BAD_UNEXPECTED_ERROR: u32 = 0x8001_0000;
     pub const BAD_INTERNAL_ERROR: u32 = 0x8002_0000;
