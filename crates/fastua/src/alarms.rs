@@ -56,6 +56,18 @@ pub mod types {
     pub const ALARM_UNSHELVE: u32 = 9211;
     pub const ALARM_ONE_SHOT_SHELVE: u32 = 9212;
     pub const ALARM_TIMED_SHELVE: u32 = 9213;
+    /// AlarmConditionType methods (Part 9 §5.8.2, 1.04+).
+    pub const SILENCE: u32 = 16402;
+    pub const SUPPRESS: u32 = 16403;
+    pub const SUPPRESS2: u32 = 24316;
+    pub const UNSUPPRESS: u32 = 17868;
+    pub const UNSUPPRESS2: u32 = 24318;
+    pub const REMOVE_FROM_SERVICE: u32 = 17869;
+    pub const REMOVE_FROM_SERVICE2: u32 = 24320;
+    pub const PLACE_IN_SERVICE: u32 = 17870;
+    pub const PLACE_IN_SERVICE2: u32 = 24322;
+    pub const RESET: u32 = 18199;
+    pub const RESET2: u32 = 24324;
 
     /// States of ExclusiveLimitStateMachineType.
     pub const HIGH_HIGH: u32 = 9329;
@@ -79,6 +91,7 @@ pub mod codes {
     pub const BAD_CONDITION_ALREADY_SHELVED: u32 = 0x80D1_0000;
     pub const BAD_CONDITION_NOT_SHELVED: u32 = 0x80D2_0000;
     pub const BAD_SHELVING_TIME_OUT_OF_RANGE: u32 = 0x80D3_0000;
+    pub const BAD_INVALID_STATE: u32 = 0x80AF_0000;
 }
 use codes::*;
 
@@ -102,6 +115,8 @@ pub struct AlarmConfig {
     pub deadband: f64,
     /// Longest TimedShelve (ms), `None` = no limit (MaxTimeShelved).
     pub max_time_shelved_ms: Option<f64>,
+    /// Stays active once triggered until Reset (LatchedState).
+    pub latching: bool,
 }
 
 impl AlarmConfig {
@@ -214,6 +229,12 @@ struct State {
     event_id: Box<[u8]>,
     message: String,
     shelving: Shelving,
+    /// SuppressedState, OutOfServiceState, SilenceState, LatchedState:
+    /// (value, transition time).
+    suppressed: (bool, i64),
+    out_of_service: (bool, i64),
+    silenced: (bool, i64),
+    latched: (bool, i64),
     /// Last shelving transition (id, name, time); id 0 = none yet.
     shelving_transition: (u32, &'static str, i64),
     branches: Vec<Branch>,
@@ -221,7 +242,12 @@ struct State {
 
 impl State {
     fn active(&self) -> bool {
-        self.level != Level::Normal
+        self.level != Level::Normal || self.latched.0
+    }
+
+    /// SuppressedOrShelved (Part 9 §5.8.2).
+    fn suppressed_or_shelved(&self) -> bool {
+        self.shelving != Shelving::Unshelved || self.suppressed.0 || self.out_of_service.0
     }
 
     fn retain(&self) -> bool {
@@ -279,6 +305,10 @@ impl Condition {
             event_id: Box::new([]),
             message: String::new(),
             shelving: Shelving::Unshelved,
+            suppressed: (false, now),
+            out_of_service: (false, now),
+            silenced: (false, now),
+            latched: (false, now),
             shelving_transition: (0, "", now),
             branches: Vec::new(),
         };
@@ -346,7 +376,23 @@ impl Condition {
             .with(ACTIVE_STATE_ID, Variant::Boolean(active))
             .with(ACTIVE_STATE_TRANSITION_TIME, Variant::DateTime(st.active_ts))
             .with(INPUT_NODE, Variant::NodeId(Box::new(self.source.clone())))
-            .with(SUPPRESSED_OR_SHELVED, Variant::Boolean(st.shelving != Shelving::Unshelved));
+            .with(SUPPRESSED_OR_SHELVED, Variant::Boolean(st.suppressed_or_shelved()))
+            .with(SUPPRESSED_STATE, two_state(st.suppressed.0, "Suppressed", "Unsuppressed"))
+            .with(SUPPRESSED_STATE_ID, Variant::Boolean(st.suppressed.0))
+            .with(SUPPRESSED_STATE_TRANSITION_TIME, Variant::DateTime(st.suppressed.1))
+            .with(OUT_OF_SERVICE_STATE, two_state(st.out_of_service.0, "Out of Service", "In Service"))
+            .with(OUT_OF_SERVICE_STATE_ID, Variant::Boolean(st.out_of_service.0))
+            .with(OUT_OF_SERVICE_STATE_TRANSITION_TIME, Variant::DateTime(st.out_of_service.1))
+            .with(SILENCE_STATE, two_state(st.silenced.0, "Silenced", "Not Silenced"))
+            .with(SILENCE_STATE_ID, Variant::Boolean(st.silenced.0))
+            .with(SILENCE_STATE_TRANSITION_TIME, Variant::DateTime(st.silenced.1));
+        let ev = if cfg.latching {
+            ev.with(LATCHED_STATE, two_state(st.latched.0, "Latched", "Unlatched"))
+                .with(LATCHED_STATE_ID, Variant::Boolean(st.latched.0))
+                .with(LATCHED_STATE_TRANSITION_TIME, Variant::DateTime(st.latched.1))
+        } else {
+            ev
+        };
         let (state_id, state_name) = st.shelving.state();
         let unshelve_ms = match st.shelving {
             Shelving::Timed(until) => (until - now_ticks()).max(0) as f64 / 10_000.0,
@@ -473,6 +519,13 @@ impl Condition {
             self.branch(&mut st, &cfg);
         }
         st.level = level;
+        if new_occurrence {
+            // A new occurrence sounds again.
+            st.silenced = (false, now);
+            if cfg.latching && !st.latched.0 {
+                st.latched = (true, now);
+            }
+        }
         if level == Level::Normal && was != Level::Normal && st.shelving == Shelving::OneShot {
             // A one-shot shelve lasts until the alarm returns to normal.
             st.set_shelving(Shelving::Unshelved, now);
@@ -601,6 +654,55 @@ impl Condition {
         };
         self.emit(&mut st, &cfg);
         Ok(())
+    }
+
+    /// Suppress / Unsuppress, RemoveFromService / PlaceInService, Silence
+    /// and Reset (Part 9 §5.8.2). Setting a state it is already in changes
+    /// nothing and reports nothing.
+    pub fn set_state(&self, method: u32, comment: &str, user: &str) -> Result<(), u32> {
+        let cfg = self.config();
+        let mut st = self.lock();
+        if !st.enabled {
+            return Err(BAD_CONDITION_DISABLED);
+        }
+        let now = now_ticks();
+        let name = &self.source_name;
+        let (slot, on, message) = match method {
+            SUPPRESS | SUPPRESS2 => (&mut st.suppressed, true, format!("{name}Alarm suppressed")),
+            UNSUPPRESS | UNSUPPRESS2 => (&mut st.suppressed, false, format!("{name}Alarm unsuppressed")),
+            REMOVE_FROM_SERVICE | REMOVE_FROM_SERVICE2 => {
+                (&mut st.out_of_service, true, format!("{name}Alarm removed from service"))
+            }
+            PLACE_IN_SERVICE | PLACE_IN_SERVICE2 => {
+                (&mut st.out_of_service, false, format!("{name}Alarm placed in service"))
+            }
+            SILENCE => (&mut st.silenced, true, format!("{name}Alarm silenced")),
+            _ => {
+                // Reset: only a latched alarm whose cause has cleared.
+                if !st.latched.0 || st.level != Level::Normal {
+                    return Err(BAD_INVALID_STATE);
+                }
+                (&mut st.latched, false, format!("{name}Alarm reset"))
+            }
+        };
+        if slot.0 == on {
+            return Ok(());
+        }
+        *slot = (on, now);
+        st.message = message;
+        st.user = user.to_string();
+        if !comment.is_empty() {
+            st.comment = comment.to_string();
+            st.comment_ts = now;
+        }
+        self.emit(&mut st, &cfg);
+        Ok(())
+    }
+
+    /// (suppressed, out of service, silenced, latched) for tests.
+    pub fn states(&self) -> (bool, bool, bool, bool) {
+        let st = self.lock();
+        (st.suppressed.0, st.out_of_service.0, st.silenced.0, st.latched.0)
     }
 
     /// Ends an expired TimedShelve.
@@ -805,8 +907,22 @@ pub fn call(
         ALARM_ONE_SHOT_SHELVE,
         ALARM_UNSHELVE,
     ];
+    let states = [
+        SILENCE,
+        SUPPRESS,
+        SUPPRESS2,
+        UNSUPPRESS,
+        UNSUPPRESS2,
+        REMOVE_FROM_SERVICE,
+        REMOVE_FROM_SERVICE2,
+        PLACE_IN_SERVICE,
+        PLACE_IN_SERVICE2,
+        RESET,
+        RESET2,
+    ];
     if ![ENABLE, DISABLE, ADD_COMMENT, ACKNOWLEDGE, CONFIRM, CONDITION_REFRESH, CONDITION_REFRESH2].contains(&m)
         && !shelving.contains(&m)
+        && !states.contains(&m)
     {
         return None;
     }
@@ -895,6 +1011,26 @@ pub fn call(
     let Some(c) = alarms.get(object) else {
         return fail(if object.as_ns0().is_some() { BAD_METHOD_INVALID } else { status::BAD_NODE_ID_UNKNOWN });
     };
+    if states.contains(&m) {
+        let with_comment = matches!(m, SUPPRESS2 | UNSUPPRESS2 | REMOVE_FROM_SERVICE2 | PLACE_IN_SERVICE2 | RESET2);
+        let want = with_comment as usize;
+        if args.len() < want {
+            return fail(BAD_ARGUMENTS_MISSING);
+        }
+        if args.len() > want {
+            return fail(BAD_TOO_MANY_ARGUMENTS);
+        }
+        let comment = match args.first() {
+            None | Some(Variant::Empty) => "",
+            Some(Variant::LocalizedText(t)) => t.text.as_deref().unwrap_or(""),
+            Some(_) => return Some(Err((BAD_INVALID_ARGUMENT, vec![status::BAD_TYPE_MISMATCH]))),
+        };
+        // Taking an alarm out of the operator's view needs write rights.
+        if !matches!(m, SILENCE | RESET | RESET2) && !can_write {
+            return fail(status::BAD_USER_ACCESS_DENIED);
+        }
+        return Some(c.set_state(m, comment, user).map(|_| Vec::new()).map_err(|code| (code, Vec::new())));
+    }
     let result = match m {
         ENABLE | DISABLE => {
             if !args.is_empty() {
@@ -942,6 +1078,7 @@ mod tests {
             message: None,
             deadband: 2.0,
             max_time_shelved_ms: Some(60_000.0),
+            latching: false,
         }
     }
 
@@ -1049,5 +1186,32 @@ mod tests {
         assert_ne!(evs[1].get(BRANCH_ID), Some(&Variant::NodeId(Box::new(NodeId::NULL))));
         assert_eq!(c.enable(false, "bob"), Ok(()));
         assert_eq!(c.branch_count(), 0);
+    }
+
+    #[test]
+    fn suppression_service_silence_latch() {
+        let bus = Arc::new(EventBus::default());
+        let cfg = AlarmConfig { latching: true, ..limits() };
+        let c = Condition::new(NodeId::Numeric(2, 1000), NodeId::Numeric(2, 1), "Temp", cfg, bus);
+        assert_eq!(c.set_state(SUPPRESS2, "night", "bob"), Ok(()));
+        assert_eq!(c.set_state(REMOVE_FROM_SERVICE, "", "bob"), Ok(()));
+        assert_eq!(c.states(), (true, true, false, false));
+        assert!(c.lock().suppressed_or_shelved());
+        assert_eq!(c.set_state(UNSUPPRESS, "", "bob"), Ok(()));
+        assert_eq!(c.set_state(PLACE_IN_SERVICE2, "", "bob"), Ok(()));
+        assert!(!c.lock().suppressed_or_shelved());
+        // Latched: stays active after the value returns to normal, until Reset.
+        c.evaluate(&Variant::Double(90.0), status::GOOD, 1);
+        assert_eq!(c.set_state(SILENCE, "", "bob"), Ok(()));
+        assert_eq!(c.states(), (false, false, true, true));
+        assert_eq!(c.set_state(RESET, "", "bob"), Err(BAD_INVALID_STATE)); // still high
+        c.evaluate(&Variant::Double(50.0), status::GOOD, 2);
+        assert!(c.summary().0);
+        assert_eq!(c.set_state(RESET2, "ok", "bob"), Ok(()));
+        assert!(!c.summary().0);
+        assert_eq!(c.set_state(RESET, "", "bob"), Err(BAD_INVALID_STATE));
+        // A new occurrence is no longer silenced.
+        c.evaluate(&Variant::Double(90.0), status::GOOD, 3);
+        assert_eq!(c.states(), (false, false, false, true));
     }
 }

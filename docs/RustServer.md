@@ -378,6 +378,15 @@ An item with an `Alarm` gets a condition object `<Name>Alarm`
   LastTransition (Id, TransitionTime), UnshelveTime (ms left),
   SuppressedOrShelved and MaxTimeShelved. A shelved alarm still raises its
   events: clients hide it on SuppressedOrShelved.
+- **Suppression, service, silence, latch (Part 9 §5.8.2):** Suppress /
+  Unsuppress and RemoveFromService / PlaceInService (write rights) set
+  SuppressedState and OutOfServiceState; Silence sets SilenceState until the
+  next occurrence; with `"Latching": true` LatchedState is set when the
+  alarm becomes active and keeps it active until Reset, which needs the
+  value back to normal (`BadInvalidState` otherwise). The 1.05 variants
+  (Suppress2, ..., Reset2) take a comment. A call that changes nothing
+  reports nothing. SuppressedOrShelved is true when shelved, suppressed or
+  out of service; the events still go out.
 - **Branches (Part 9 §4.4):** an alarm that becomes active again while its
   previous occurrence is not yet acknowledged and confirmed keeps that
   occurrence as a branch (a more severe limit is the same occurrence). The
@@ -389,7 +398,7 @@ An item with an `Alarm` gets a condition object `<Name>Alarm`
 - **Reloads:** condition states survive reloads; new limits or severity
   apply at the next evaluation; a removed alarm disappears.
 
-Not yet: suppression, dialog conditions and the
+Not yet: dialog conditions and the
 condition's state variables as browsable nodes (their values travel in the
 events).
 

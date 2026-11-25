@@ -44,6 +44,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Every write of the variable evaluates its condition; state changes raise condition events with the Active, Acked, Confirmed, Enabled and LimitState fields.
   - Methods Acknowledge, Confirm, AddComment, Enable, Disable, ConditionRefresh and ConditionRefresh2, through Call.
   - Shelving: TimedShelve, OneShotShelve and Unshelve (and their 1.05 variants with a comment) on the condition's ShelvingState; a timed shelve ends on its own, a one-shot shelve when the alarm returns to normal. Events carry ShelvingState and SuppressedOrShelved.
+  - Suppress / Unsuppress, RemoveFromService / PlaceInService (write rights), Silence and Reset (with `"Latching": true` an alarm stays active until reset), each with its 1.05 variant taking a comment. SuppressedOrShelved covers shelving, suppression and out of service.
   - Branches: an alarm active again while its previous occurrence is not acknowledged and confirmed keeps that occurrence as a branch, with its own BranchId and EventId, acknowledged and confirmed on its own and reported by ConditionRefresh.
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
@@ -105,7 +106,7 @@ Every `*.json` file in the directory, searched recursively, is one namespace:
 }
 ```
 
-Variables appear under `Objects/<Name>/<group>/<item>`. Supported types are Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float, Double, String, DateTime, Guid and ByteString. A numeric item with an `EURange` (`{"Low": .., "High": ..}` or `[low, high]`) becomes an AnalogItemType variable with an EURange property, which percent deadbands use. `Historizing: true` records every write of the item for HistoryRead; `HistoryCapacity` (default 10 000) bounds the values kept. `Alarm` adds a limit alarm (any of `LowLow`, `Low`, `High`, `HighHigh`, ordered, with an optional `Deadband`) or an off-normal alarm (`Normal`), with a `Severity` (default 500), a `Message` and an optional `MaxTimeShelved` (ms) bounding TimedShelve. Adding, removing or editing a file takes effect about 50 ms later, without a restart.
+Variables appear under `Objects/<Name>/<group>/<item>`. Supported types are Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float, Double, String, DateTime, Guid and ByteString. A numeric item with an `EURange` (`{"Low": .., "High": ..}` or `[low, high]`) becomes an AnalogItemType variable with an EURange property, which percent deadbands use. `Historizing: true` records every write of the item for HistoryRead; `HistoryCapacity` (default 10 000) bounds the values kept. `Alarm` adds a limit alarm (any of `LowLow`, `Low`, `High`, `HighHigh`, ordered, with an optional `Deadband`) or an off-normal alarm (`Normal`), with a `Severity` (default 500), a `Message`, an optional `MaxTimeShelved` (ms) bounding TimedShelve and `Latching`. Adding, removing or editing a file takes effect about 50 ms later, without a restart.
 
 ## Performance
 

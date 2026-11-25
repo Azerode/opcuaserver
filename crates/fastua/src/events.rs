@@ -106,6 +106,18 @@ pub mod types {
     pub const INPUT_NODE: u32 = 11120;
     pub const SUPPRESSED_OR_SHELVED: u32 = 9215;
     pub const MAX_TIME_SHELVED: u32 = 9216;
+    pub const SUPPRESSED_STATE: u32 = 9169;
+    pub const SUPPRESSED_STATE_ID: u32 = 9170;
+    pub const SUPPRESSED_STATE_TRANSITION_TIME: u32 = 9174;
+    pub const OUT_OF_SERVICE_STATE: u32 = 16371;
+    pub const OUT_OF_SERVICE_STATE_ID: u32 = 16372;
+    pub const OUT_OF_SERVICE_STATE_TRANSITION_TIME: u32 = 16376;
+    pub const SILENCE_STATE: u32 = 16380;
+    pub const SILENCE_STATE_ID: u32 = 16381;
+    pub const SILENCE_STATE_TRANSITION_TIME: u32 = 16385;
+    pub const LATCHED_STATE: u32 = 18190;
+    pub const LATCHED_STATE_ID: u32 = 18191;
+    pub const LATCHED_STATE_TRANSITION_TIME: u32 = 18195;
     pub const SHELVING_STATE: u32 = 9178;
     pub const SHELVING_STATE_CURRENT_STATE: u32 = 9179;
     pub const SHELVING_STATE_CURRENT_STATE_ID: u32 = 9180;
@@ -359,6 +371,18 @@ pub const EVENT_TYPES: &[EventTypeDef] = &[
             (SHELVING_STATE_UNSHELVE_TIME, "ShelvingState/UnshelveTime", 290, -1),
             (SUPPRESSED_OR_SHELVED, "SuppressedOrShelved", 1, -1),
             (MAX_TIME_SHELVED, "MaxTimeShelved", 290, -1),
+            (SUPPRESSED_STATE, "SuppressedState", 21, -1),
+            (SUPPRESSED_STATE_ID, "SuppressedState/Id", 1, -1),
+            (SUPPRESSED_STATE_TRANSITION_TIME, "SuppressedState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (OUT_OF_SERVICE_STATE, "OutOfServiceState", 21, -1),
+            (OUT_OF_SERVICE_STATE_ID, "OutOfServiceState/Id", 1, -1),
+            (OUT_OF_SERVICE_STATE_TRANSITION_TIME, "OutOfServiceState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (SILENCE_STATE, "SilenceState", 21, -1),
+            (SILENCE_STATE_ID, "SilenceState/Id", 1, -1),
+            (SILENCE_STATE_TRANSITION_TIME, "SilenceState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (LATCHED_STATE, "LatchedState", 21, -1),
+            (LATCHED_STATE_ID, "LatchedState/Id", 1, -1),
+            (LATCHED_STATE_TRANSITION_TIME, "LatchedState/TransitionTime", crate::types::ids::UTC_TIME, -1),
         ],
     },
     EventTypeDef {

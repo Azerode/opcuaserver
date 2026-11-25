@@ -651,6 +651,14 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
                 name,
                 "ShelvingState"
                     | "MaxTimeShelved"
+                    | "SuppressedState"
+                    | "OutOfServiceState"
+                    | "SilenceState"
+                    | "LatchedState"
+                    | "SuppressedState/TransitionTime"
+                    | "OutOfServiceState/TransitionTime"
+                    | "SilenceState/TransitionTime"
+                    | "LatchedState/TransitionTime"
                     | "ShelvingState/LastTransition"
                     | "ShelvingState/LastTransition/TransitionTime"
             );

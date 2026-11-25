@@ -293,3 +293,29 @@ fn shelving_and_branches() {
     assert_eq!((&ev[0][1], &ev[0][2]), (&branch[1], &Variant::Boolean(false)));
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn suppression_and_out_of_service() {
+    let (addr, dir) = start("suppress");
+    let mut c = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
+    c.create_session("operator").unwrap();
+    let temp_alarm = NodeId::String(2, "__alarm/i=1".into());
+    let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
+    let fields = ["SuppressedOrShelved", "SuppressedState/Id", "OutOfServiceState", "SilenceState/Id"];
+    let mut spec = MonitorSpec::events(SERVER, 1, &fields);
+    spec.event_where =
+        vec![(14, vec![FilterOperand::Literal(Variant::NodeId(Box::new(NodeId::ns0(ALARM_CONDITION_TYPE))))])];
+    assert_eq!(c.monitor(sub, &[spec]).unwrap()[0].0, status::GOOD);
+
+    assert_eq!(call(&mut c, &temp_alarm, SUPPRESS2, &[comment("night shift")]).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][0], &ev[0][1]), (&Variant::Boolean(true), &Variant::Boolean(true)));
+    assert_eq!(call(&mut c, &temp_alarm, UNSUPPRESS, &[]).0, status::GOOD);
+    assert_eq!(collect(&mut c, 1)[0][0], Variant::Boolean(false));
+    assert_eq!(call(&mut c, &temp_alarm, REMOVE_FROM_SERVICE, &[]).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][0], text(&ev[0][2]).as_str()), (&Variant::Boolean(true), "Out of Service"));
+    assert_eq!(call(&mut c, &temp_alarm, SUPPRESS, &[comment("x")]).0, BAD_TOO_MANY_ARGUMENTS);
+    assert_eq!(call(&mut c, &temp_alarm, RESET, &[]).0, BAD_INVALID_STATE);
+    let _ = std::fs::remove_dir_all(dir);
+}

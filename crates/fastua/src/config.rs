@@ -83,6 +83,8 @@ struct RawAlarm {
     /// Longest TimedShelve, in milliseconds.
     #[serde(rename = "MaxTimeShelved")]
     max_time_shelved: Option<f64>,
+    #[serde(rename = "Latching", default)]
+    latching: bool,
 }
 
 /// `{"Low": 0, "High": 100}` or `[0, 100]`.
@@ -255,6 +257,7 @@ fn parse_alarm(a: RawAlarm, data_type: u8) -> Result<crate::alarms::AlarmConfig,
         message: a.message,
         deadband: a.deadband,
         max_time_shelved_ms: a.max_time_shelved,
+        latching: a.latching,
     })
 }
 
