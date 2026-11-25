@@ -49,6 +49,7 @@ pub enum NodeKind {
     VariableType { is_abstract: bool, data_type: NodeId, value_rank: i32 },
     ReferenceType { is_abstract: bool, symmetric: bool, inverse_name: Option<LocalizedText> },
     DataType { is_abstract: bool },
+    Method { executable: bool },
 }
 
 pub struct Node {
@@ -70,7 +71,32 @@ impl Node {
             NodeKind::VariableType { .. } => NodeClass::VariableType,
             NodeKind::ReferenceType { .. } => NodeClass::ReferenceType,
             NodeKind::DataType { .. } => NodeClass::DataType,
+            NodeKind::Method { .. } => NodeClass::Method,
         }
+    }
+
+    /// Target of the forward HasProperty reference named `name`.
+    pub fn property<'a>(&self, space: &'a AddressSpace, name: &str) -> Option<&'a Node> {
+        self.refs
+            .iter()
+            .filter(|r| r.forward && r.type_id == ids::HAS_PROPERTY)
+            .map(|r| space.node(r.target))
+            .find(|n| n.browse_name.ns == 0 && &*n.browse_name.name == name)
+    }
+
+    /// EURange (low, high) of an AnalogItem.
+    pub fn eu_range(&self, space: &AddressSpace) -> Option<(f64, f64)> {
+        let NodeKind::Variable { value: ValueSource::Static(Variant::ExtensionObject(x)), .. } =
+            &self.property(space, "EURange")?.kind
+        else {
+            return None;
+        };
+        if x.type_id != NodeId::ns0(ids::RANGE_ENCODING) || x.encoding != 1 || x.body.len() != 16 {
+            return None;
+        }
+        let low = f64::from_le_bytes(x.body[..8].try_into().unwrap());
+        let high = f64::from_le_bytes(x.body[8..].try_into().unwrap());
+        Some((low, high))
     }
 
     /// Target of the HasTypeDefinition reference, if any.
@@ -91,6 +117,8 @@ pub struct ServerInfo {
     pub build_number: String,
     pub build_date: i64,
     pub start_time: i64,
+    /// Published in Server/ServerCapabilities.
+    pub limits: crate::server::Limits,
 }
 
 impl Default for ServerInfo {
@@ -106,6 +134,7 @@ impl Default for ServerInfo {
             build_number: env!("CARGO_PKG_VERSION").into(),
             build_date: 0,
             start_time: now_ticks(),
+            limits: Default::default(),
         }
     }
 }
@@ -120,6 +149,8 @@ pub struct AddressSpace {
     pub namespaces: Vec<Arc<str>>,
     pub generation: u64,
     pub info: Arc<ServerInfo>,
+    /// Shared by every snapshot: events outlive reloads.
+    pub events: Arc<crate::events::EventBus>,
 }
 
 impl AddressSpace {
@@ -304,6 +335,29 @@ impl Builder {
         self.link(p, ids::HAS_PROPERTY, n);
     }
 
+    fn object(&mut self, id: u32, name: &str, parent: u32, type_def: u32) -> u32 {
+        let n = self.ns0(id, name, NodeKind::Object { event_notifier: 0 });
+        let td = self.idx(type_def);
+        self.link(n, ids::HAS_TYPE_DEFINITION, td);
+        let p = self.idx(parent);
+        self.link(p, ids::HAS_COMPONENT, n);
+        n
+    }
+
+    fn method(&mut self, id: u32, name: &str, parent: u32, inputs: &[Argument], outputs: &[Argument]) {
+        let n = self.ns0(id, name, NodeKind::Method { executable: true });
+        let p = self.idx(parent);
+        self.link(p, ids::HAS_COMPONENT, n);
+        for (args, name, prop) in [(inputs, "InputArguments", id + 1), (outputs, "OutputArguments", id + 2)] {
+            if args.is_empty() {
+                continue;
+            }
+            let items = args.iter().map(Argument::encode).collect();
+            let value = Variant::Array(Box::new(VariantArray { type_id: builtin::EXTENSIONOBJECT, items, dims: None }));
+            self.property(prop, name, id, ids::ARGUMENT, 1, ValueSource::Static(value));
+        }
+    }
+
     fn component_var(&mut self, id: u32, name: &str, parent: u32, data_type: u32, type_def: u32, value: ValueSource) {
         let n = self.ns0(
             id,
@@ -314,6 +368,36 @@ impl Builder {
         self.link(n, ids::HAS_TYPE_DEFINITION, td);
         let p = self.idx(parent);
         self.link(p, ids::HAS_COMPONENT, n);
+    }
+}
+
+/// A method argument description (Argument structure).
+pub struct Argument {
+    pub name: &'static str,
+    pub data_type: u32,
+    pub value_rank: i32,
+}
+
+impl Argument {
+    fn encode(&self) -> Variant {
+        use crate::codec::Writer;
+        let mut body = Vec::new();
+        let mut w = Writer::new(&mut body);
+        w.string(self.name);
+        w.node_id(&NodeId::ns0(self.data_type));
+        w.i32(self.value_rank);
+        if self.value_rank > 0 {
+            w.i32(1);
+            w.u32(0);
+        } else {
+            w.null_array();
+        }
+        w.u8(0); // description
+        Variant::ExtensionObject(Box::new(ExtensionObject {
+            type_id: NodeId::ns0(ids::ARGUMENT_ENCODING),
+            encoding: 1,
+            body: body.into(),
+        }))
     }
 }
 
@@ -337,6 +421,8 @@ const DATA_TYPES: &[(u32, &str, u32, bool)] = &[
     (12, "String", ids::BASE_DATA_TYPE, false),
     (13, "DateTime", ids::BASE_DATA_TYPE, false),
     (ids::UTC_TIME, "UtcTime", 13, false),
+    (crate::events::types::DURATION, "Duration", 11, false),
+    (295, "LocaleId", 12, false),
     (14, "Guid", ids::BASE_DATA_TYPE, false),
     (15, "ByteString", ids::BASE_DATA_TYPE, false),
     (16, "XmlElement", ids::BASE_DATA_TYPE, false),
@@ -352,6 +438,10 @@ const DATA_TYPES: &[(u32, &str, u32, bool)] = &[
     (ids::SERVER_STATE, "ServerState", ids::ENUMERATION, false),
     (ids::BUILD_INFO, "BuildInfo", ids::STRUCTURE, false),
     (ids::SERVER_STATUS_DATA_TYPE, "ServerStatusDataType", ids::STRUCTURE, false),
+    (ids::RANGE, "Range", ids::STRUCTURE, false),
+    (ids::ARGUMENT, "Argument", ids::STRUCTURE, false),
+    (ids::SIGNED_SOFTWARE_CERTIFICATE, "SignedSoftwareCertificate", ids::STRUCTURE, false),
+    (ids::REDUNDANCY_SUPPORT, "RedundancySupport", ids::ENUMERATION, false),
 ];
 
 const REF_TYPES: &[(u32, &str, Option<&str>, bool, bool)] = &[
@@ -390,6 +480,18 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     b.ns0(ids::BASE_DATA_VARIABLE_TYPE, "BaseDataVariableType", vt(ids::BASE_DATA_TYPE, -2, false));
     b.ns0(ids::PROPERTY_TYPE, "PropertyType", vt(ids::BASE_DATA_TYPE, -2, false));
     b.ns0(ids::SERVER_STATUS_TYPE, "ServerStatusType", vt(ids::SERVER_STATUS_DATA_TYPE, -1, false));
+    b.ns0(ids::DATA_ITEM_TYPE, "DataItemType", vt(ids::BASE_DATA_TYPE, -2, false));
+    b.ns0(ids::BUILD_INFO_TYPE, "BuildInfoType", vt(ids::BUILD_INFO, -1, false));
+    for (id, name) in [
+        (ids::SERVER_CAPABILITIES_TYPE, "ServerCapabilitiesType"),
+        (ids::SERVER_DIAGNOSTICS_TYPE, "ServerDiagnosticsType"),
+        (ids::VENDOR_SERVER_INFO_TYPE, "VendorServerInfoType"),
+        (ids::SERVER_REDUNDANCY_TYPE, "ServerRedundancyType"),
+        (ids::OPERATION_LIMITS_TYPE, "OperationLimitsType"),
+    ] {
+        b.ns0(id, name, NodeKind::ObjectType { is_abstract: false });
+    }
+    b.ns0(ids::ANALOG_ITEM_TYPE, "AnalogItemType", vt(ids::NUMBER, -2, false));
 
     let root = b.idx(ids::ROOT_FOLDER);
     let ft = b.idx(ids::FOLDER_TYPE);
@@ -407,6 +509,15 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     b.link(otf, ids::ORGANIZES, bot);
     b.subtype(ids::BASE_OBJECT_TYPE, ids::FOLDER_TYPE);
     b.subtype(ids::BASE_OBJECT_TYPE, ids::SERVER_TYPE);
+    for t in [
+        ids::SERVER_CAPABILITIES_TYPE,
+        ids::SERVER_DIAGNOSTICS_TYPE,
+        ids::VENDOR_SERVER_INFO_TYPE,
+        ids::SERVER_REDUNDANCY_TYPE,
+        ids::OPERATION_LIMITS_TYPE,
+    ] {
+        b.subtype(ids::BASE_OBJECT_TYPE, t);
+    }
 
     // Variable types
     let (vtf, bvt) = (b.idx(ids::VARIABLE_TYPES_FOLDER), b.idx(ids::BASE_VARIABLE_TYPE));
@@ -414,6 +525,9 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     b.subtype(ids::BASE_VARIABLE_TYPE, ids::BASE_DATA_VARIABLE_TYPE);
     b.subtype(ids::BASE_VARIABLE_TYPE, ids::PROPERTY_TYPE);
     b.subtype(ids::BASE_DATA_VARIABLE_TYPE, ids::SERVER_STATUS_TYPE);
+    b.subtype(ids::BASE_DATA_VARIABLE_TYPE, ids::DATA_ITEM_TYPE);
+    b.subtype(ids::BASE_DATA_VARIABLE_TYPE, ids::BUILD_INFO_TYPE);
+    b.subtype(ids::DATA_ITEM_TYPE, ids::ANALOG_ITEM_TYPE);
 
     // Data types
     for &(id, name, parent, abs) in DATA_TYPES {
@@ -439,8 +553,29 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     let (rtf, refs) = (b.idx(ids::REFERENCE_TYPES_FOLDER), b.idx(ids::REFERENCES));
     b.link(rtf, ids::ORGANIZES, refs);
 
-    // Server object
-    let server = b.ns0(ids::SERVER, "Server", NodeKind::Object { event_notifier: 0 });
+    // Modelling rules (instance declarations of the event types use them).
+    b.ns0(ids::MODELLING_RULE_TYPE, "ModellingRuleType", NodeKind::ObjectType { is_abstract: false });
+    b.subtype(ids::BASE_OBJECT_TYPE, ids::MODELLING_RULE_TYPE);
+    let mrt = b.idx(ids::MODELLING_RULE_TYPE);
+    for (id, name) in [(ids::MODELLING_RULE_MANDATORY, "Mandatory"), (ids::MODELLING_RULE_OPTIONAL, "Optional")] {
+        let n = b.ns0(id, name, NodeKind::Object { event_notifier: 0 });
+        b.link(n, ids::HAS_TYPE_DEFINITION, mrt);
+    }
+    let mandatory = b.idx(ids::MODELLING_RULE_MANDATORY);
+
+    // Event types and their fields.
+    for t in crate::events::EVENT_TYPES {
+        b.ns0(t.id, t.name, NodeKind::ObjectType { is_abstract: t.is_abstract });
+        b.subtype(t.parent, t.id);
+        for &(decl, name, data_type, rank) in t.fields {
+            b.property(decl, name, t.id, data_type, rank, ValueSource::Static(Variant::Empty));
+            let d = b.idx(decl);
+            b.link(d, ids::HAS_MODELLING_RULE, mandatory);
+        }
+    }
+
+    // Server object: the root notifier of every event.
+    let server = b.ns0(ids::SERVER, "Server", NodeKind::Object { event_notifier: 1 });
     let (objects, st) = (b.idx(ids::OBJECTS_FOLDER), b.idx(ids::SERVER_TYPE));
     b.link(objects, ids::ORGANIZES, server);
     b.link(server, ids::HAS_TYPE_DEFINITION, st);
@@ -498,6 +633,150 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
         ids::BASE_DATA_VARIABLE_TYPE,
         ValueSource::Static(Variant::Int32(0)),
     );
+    build_server_details(b, info);
+}
+
+/// ServerStatus/BuildInfo, ServerCapabilities, diagnostics, redundancy,
+/// auditing and the Server methods (Part 5 §6.3.1, §8.3.2).
+fn build_server_details(b: &mut Builder, info: &ServerInfo) {
+    let bdv = ids::BASE_DATA_VARIABLE_TYPE;
+    let status = ids::SERVER_SERVER_STATUS;
+    b.component_var(
+        ids::SERVER_SERVER_STATUS_BUILD_INFO,
+        "BuildInfo",
+        status,
+        ids::BUILD_INFO,
+        ids::BUILD_INFO_TYPE,
+        ValueSource::Static(encode_build_info(info)),
+    );
+    let bi = ids::SERVER_SERVER_STATUS_BUILD_INFO;
+    let s = |v: &str| ValueSource::Static(Variant::string(v));
+    b.component_var(2262, "ProductUri", bi, 12, bdv, s(&info.product_uri));
+    b.component_var(2263, "ManufacturerName", bi, 12, bdv, s(&info.manufacturer_name));
+    b.component_var(2261, "ProductName", bi, 12, bdv, s(&info.product_name));
+    b.component_var(2264, "SoftwareVersion", bi, 12, bdv, s(&info.software_version));
+    b.component_var(2265, "BuildNumber", bi, 12, bdv, s(&info.build_number));
+    b.component_var(2266, "BuildDate", bi, ids::UTC_TIME, bdv, ValueSource::Static(Variant::DateTime(info.build_date)));
+    b.component_var(2992, "SecondsTillShutdown", status, 7, bdv, ValueSource::Static(Variant::UInt32(0)));
+    b.component_var(
+        2993,
+        "ShutdownReason",
+        status,
+        21,
+        bdv,
+        ValueSource::Static(Variant::LocalizedText(Box::default())),
+    );
+
+    let l = &info.limits;
+    let caps = ids::SERVER_SERVER_CAPABILITIES;
+    b.object(caps, "ServerCapabilities", ids::SERVER, ids::SERVER_CAPABILITIES_TYPE);
+    let fixed = |v: Variant| ValueSource::Static(v);
+    b.property(
+        2269,
+        "ServerProfileArray",
+        caps,
+        12,
+        1,
+        fixed(Variant::string_array(&["http://opcfoundation.org/UA-Profile/Server/EmbeddedUA2017"])),
+    );
+    b.property(2271, "LocaleIdArray", caps, 295, 1, fixed(Variant::string_array(&[])));
+    b.property(2272, "MinSupportedSampleRate", caps, 290, -1, fixed(Variant::Double(l.min_sampling_interval_ms)));
+    let cps = l.max_browse_continuation_points.min(u16::MAX as usize) as u16;
+    b.property(2735, "MaxBrowseContinuationPoints", caps, 5, -1, fixed(Variant::UInt16(cps)));
+    b.property(2736, "MaxQueryContinuationPoints", caps, 5, -1, fixed(Variant::UInt16(0)));
+    b.property(2737, "MaxHistoryContinuationPoints", caps, 5, -1, fixed(Variant::UInt16(0)));
+    let no_certs =
+        Variant::Array(Box::new(VariantArray { type_id: builtin::EXTENSIONOBJECT, items: vec![], dims: None }));
+    b.property(3704, "SoftwareCertificates", caps, ids::SIGNED_SOFTWARE_CERTIFICATE, 1, fixed(no_certs));
+    b.property(11702, "MaxArrayLength", caps, 7, -1, fixed(Variant::UInt32(l.max_message_size)));
+    b.property(11703, "MaxStringLength", caps, 7, -1, fixed(Variant::UInt32(l.max_message_size)));
+    b.property(12911, "MaxByteStringLength", caps, 7, -1, fixed(Variant::UInt32(l.max_message_size)));
+    let ops = ids::OPERATION_LIMITS;
+    b.object(ops, "OperationLimits", caps, ids::OPERATION_LIMITS_TYPE);
+    let per_call = Variant::UInt32(l.max_operations_per_request.min(u32::MAX as usize) as u32);
+    for (id, name) in [
+        (11705, "MaxNodesPerRead"),
+        (11707, "MaxNodesPerWrite"),
+        (11709, "MaxNodesPerMethodCall"),
+        (11710, "MaxNodesPerBrowse"),
+        (11711, "MaxNodesPerRegisterNodes"),
+        (11712, "MaxNodesPerTranslateBrowsePathsToNodeIds"),
+        (11714, "MaxMonitoredItemsPerCall"),
+    ] {
+        b.property(id, name, ops, 7, -1, fixed(per_call.clone()));
+    }
+    b.property(11713, "MaxNodesPerNodeManagement", ops, 7, -1, fixed(Variant::UInt32(0)));
+    b.folder(2996, "ModellingRules", ids::SERVER_SERVER_CAPABILITIES);
+    b.folder(2997, "AggregateFunctions", ids::SERVER_SERVER_CAPABILITIES);
+    // `folder` links with Organizes; capabilities hold them as components.
+    for f in [2996, 2997] {
+        let (c, n) = (b.idx(caps), b.idx(f));
+        let r = b.nodes[c as usize].refs.iter_mut().find(|r| r.forward && r.target == n).unwrap();
+        r.type_id = ids::HAS_COMPONENT;
+        let r = b.nodes[n as usize].refs.iter_mut().find(|r| !r.forward && r.target == c).unwrap();
+        r.type_id = ids::HAS_COMPONENT;
+    }
+    for rule in [ids::MODELLING_RULE_MANDATORY, ids::MODELLING_RULE_OPTIONAL] {
+        let (f, r) = (b.idx(2996), b.idx(rule));
+        b.link(f, ids::ORGANIZES, r);
+    }
+
+    let diag = 2274;
+    b.object(diag, "ServerDiagnostics", ids::SERVER, ids::SERVER_DIAGNOSTICS_TYPE);
+    b.property(2294, "EnabledFlag", diag, 1, -1, fixed(Variant::Boolean(false)));
+    b.object(2295, "VendorServerInfo", ids::SERVER, ids::VENDOR_SERVER_INFO_TYPE);
+    b.object(2296, "ServerRedundancy", ids::SERVER, ids::SERVER_REDUNDANCY_TYPE);
+    b.property(3709, "RedundancySupport", 2296, ids::REDUNDANCY_SUPPORT, -1, fixed(Variant::Int32(0)));
+    b.property(2994, "Auditing", ids::SERVER, 1, -1, fixed(Variant::Boolean(true)));
+
+    let sub_id = Argument { name: "SubscriptionId", data_type: 7, value_rank: -1 };
+    b.method(
+        ids::SERVER_GET_MONITORED_ITEMS,
+        "GetMonitoredItems",
+        ids::SERVER,
+        &[sub_id],
+        &[
+            Argument { name: "ServerHandles", data_type: 7, value_rank: 1 },
+            Argument { name: "ClientHandles", data_type: 7, value_rank: 1 },
+        ],
+    );
+    b.method(
+        ids::SERVER_RESEND_DATA,
+        "ResendData",
+        ids::SERVER,
+        &[Argument { name: "SubscriptionId", data_type: 7, value_rank: -1 }],
+        &[],
+    );
+}
+
+/// The BuildInfo structure.
+fn encode_build_info(info: &ServerInfo) -> Variant {
+    use crate::codec::Writer;
+    let mut body = Vec::new();
+    let mut w = Writer::new(&mut body);
+    w.string(&info.product_uri);
+    w.string(&info.manufacturer_name);
+    w.string(&info.product_name);
+    w.string(&info.software_version);
+    w.string(&info.build_number);
+    w.i64(info.build_date);
+    Variant::ExtensionObject(Box::new(ExtensionObject {
+        type_id: NodeId::ns0(ids::BUILD_INFO_ENCODING),
+        encoding: 1,
+        body: body.into(),
+    }))
+}
+
+/// A `Range` structure value.
+pub fn range_value(low: f64, high: f64) -> Variant {
+    let mut body = [0u8; 16];
+    body[..8].copy_from_slice(&low.to_le_bytes());
+    body[8..].copy_from_slice(&high.to_le_bytes());
+    Variant::ExtensionObject(Box::new(ExtensionObject {
+        type_id: NodeId::ns0(ids::RANGE_ENCODING),
+        encoding: 1,
+        body: body.into(),
+    }))
 }
 
 /// Builds a new snapshot. Cells of variables that still exist with the same
@@ -516,8 +795,17 @@ pub fn build(
     }
     let namespaces = registry.uris().to_vec();
 
-    let capacity =
-        128 + configs.iter().map(|c| 1 + c.groups.iter().map(|g| 1 + g.items.len()).sum::<usize>()).sum::<usize>();
+    let capacity = 128
+        + configs
+            .iter()
+            .map(|c| {
+                1 + c
+                    .groups
+                    .iter()
+                    .map(|g| 1 + g.items.iter().map(|i| 1 + i.eu_range.is_some() as usize).sum::<usize>())
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
     let mut b = Builder {
         nodes: Vec::with_capacity(capacity),
         index: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
@@ -527,6 +815,8 @@ pub fn build(
     let objects = b.idx(ids::OBJECTS_FOLDER);
     let folder_type = b.idx(ids::FOLDER_TYPE);
     let bdv_type = b.idx(ids::BASE_DATA_VARIABLE_TYPE);
+    let analog_type = b.idx(ids::ANALOG_ITEM_TYPE);
+    let property_type = b.idx(ids::PROPERTY_TYPE);
     let created = now_ticks();
 
     for (c, &ns) in configs.iter().zip(&assigned) {
@@ -573,13 +863,35 @@ pub fn build(
                     })
                     .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
                 b.link(group, ids::HAS_COMPONENT, var);
-                b.link(var, ids::HAS_TYPE_DEFINITION, bdv_type);
+                let Some((low, high)) = it.eu_range else {
+                    b.link(var, ids::HAS_TYPE_DEFINITION, bdv_type);
+                    continue;
+                };
+                b.link(var, ids::HAS_TYPE_DEFINITION, analog_type);
+                let prop = b
+                    .add(Node {
+                        id: NodeId::String(ns, format!("__prop/{}/EURange", it.node_id).into()),
+                        browse_name: QualifiedName { ns: 0, name: "EURange".into() },
+                        display_name: LocalizedText::new("EURange"),
+                        description: None,
+                        refs: Vec::with_capacity(2),
+                        kind: NodeKind::Variable {
+                            data_type: NodeId::ns0(ids::RANGE),
+                            value_rank: -1,
+                            access: ACCESS_READ,
+                            value: ValueSource::Static(range_value(low, high)),
+                        },
+                    })
+                    .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
+                b.link(var, ids::HAS_PROPERTY, prop);
+                b.link(prop, ids::HAS_TYPE_DEFINITION, property_type);
             }
         }
     }
 
     let dense = dense_tables(&b.nodes, namespaces.len());
-    Ok(AddressSpace { nodes: b.nodes, index: b.index, dense, namespaces, generation, info })
+    let events = previous.map(|p| p.events.clone()).unwrap_or_default();
+    Ok(AddressSpace { nodes: b.nodes, index: b.index, dense, namespaces, generation, info, events })
 }
 
 /// Builds the direct lookup tables of [`AddressSpace::dense`]. A namespace
@@ -659,6 +971,7 @@ mod tests {
                         node_id: NodeId::Numeric(0, *i),
                         data_type: *t,
                         writable: true,
+                        eu_range: None,
                     })
                     .collect(),
             }],

@@ -13,17 +13,22 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - A PKI with chain, CRL and ApplicationUri validation.
   - Cryptography: aws-lc-rs.
 - **Users:** anonymous, user name / password (PBKDF2 hashes) and X.509 certificates, with read or read/write rights per user.
-- **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession, Read, Write, Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, ServerStatus, NamespaceArray.
+- **Services:** GetEndpoints, FindServers, CreateSession / ActivateSession / CloseSession / Cancel, Read (with index ranges), Write, Browse, BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes / UnregisterNodes, Call.
+- **Server object:** ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities with OperationLimits from the configured limits, ServerDiagnostics, ServerRedundancy, Auditing, and the GetMonitoredItems and ResendData methods.
 - **Subscriptions:** every Subscription and MonitoredItem service.
   - Create / Modify / Delete, SetPublishingMode, Publish, Republish, TransferSubscriptions.
   - SetMonitoringMode and SetTriggering.
-  - DataChangeFilter with triggers and an absolute deadband.
+  - DataChangeFilter with triggers, an absolute deadband, and a percent deadband on items that declare an EURange (AnalogItemType).
   - Queues with both overflow policies.
   - Keep-alive, lifetime and retransmission handling.
   - The steady-state hot path allocates nothing.
+- **Events:** the Server object is an event notifier.
+  - EventFilter select clauses and where clauses (comparisons, Like, Between, InList, And / Or / Not, OfType, bitwise operators), with per clause results.
+  - Event queues with both overflow policies and EventQueueOverflow events.
+  - Server events: session audit (create, activate, close, timeout), configuration reloaded (BaseModelChangeEventType) and configuration rejected (SystemEventType).
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: Call, events (EventFilter), percent deadbands, the full namespace 0 nodeset, index ranges, ECC policies, the HTTPS transport (`opc.https`).
+Not yet: the full namespace 0 nodeset, conditions and alarms, index ranges on MonitoredItems and in writes, history, aggregates, ECC policies, the HTTPS transport (`opc.https`).
 
 ## Build and run
 
@@ -65,12 +70,14 @@ Every `*.json` file in the directory, searched recursively, is one namespace:
   "Namespace": "Machine1",
   "Subscriptions": [
     { "Name": "FLAGS",
-      "Items": [ { "Name": "PC", "NodeId": "ns=5;i=1000", "Type": "System.Int16", "Writable": true } ] }
+      "Items": [
+        { "Name": "PC", "NodeId": "ns=5;i=1000", "Type": "System.Int16", "Writable": true },
+        { "Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": { "Low": 0, "High": 200 } } ] }
   ]
 }
 ```
 
-Variables appear under `Objects/<Name>/<group>/<item>`. Supported types are Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float, Double, String, DateTime, Guid and ByteString. Adding, removing or editing a file takes effect about 50 ms later, without a restart.
+Variables appear under `Objects/<Name>/<group>/<item>`. Supported types are Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float, Double, String, DateTime, Guid and ByteString. A numeric item with an `EURange` (`{"Low": .., "High": ..}` or `[low, high]`) becomes an AnalogItemType variable with an EURange property, which percent deadbands use. Adding, removing or editing a file takes effect about 50 ms later, without a restart.
 
 ## Performance
 
@@ -89,6 +96,7 @@ The numbers below were measured by CI on GitHub runners. Run `cargo run --releas
 | Subscription changed value (sample + queue + encode) | 21 ns/item | 24 ns/item |
 | Write → notification p50 / p99, 1 ms intervals | 0.53 / 1.03 ms | 0.52 / 1.05 ms |
 | Write → notification p50 / p99, 0.1 ms intervals, `--busy-poll` | 64 / 114 µs | 64 / 113 µs |
+| Server event → EventFieldList (where clause, 6 fields) | ~340 ns | ~490 ns |
 
 How it gets there:
 
@@ -104,6 +112,7 @@ How it gets there:
   - Samples go into fixed 32-byte entries, encoded straight from the value cell.
   - Buffers are recycled, so the steady state allocates nothing (`tests/no_alloc.rs`).
   - A notification leaves at the end of the publishing interval, as the specification requires, so the publishing interval sets the latency.
+- **Events:** event items pull from a shared ring only when their subscription is serviced. Subscriptions without event items never look at it, and raising an event costs one atomic load while nobody subscribes.
 - **Build:** release profile with fat LTO, 1 codegen unit and `panic = "abort"`.
 
 Details: [docs/RustServer.md](docs/RustServer.md).

@@ -4,6 +4,7 @@ use crate::address_space::{AddressSpace, ServerInfo};
 use crate::channel::Security;
 use crate::codec::Writer;
 use crate::crypto::{Mode, Policy};
+use crate::events::Event;
 use crate::pki::Pki;
 use crate::reload::Store;
 use crate::subscription::{SessionSubs, Subscription};
@@ -371,6 +372,7 @@ impl Server {
     /// Drops sessions whose client stopped talking for longer than the timeout.
     pub fn expire_sessions(&self) {
         let now = self.uptime_ms();
+        let mut expired = Vec::new();
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.retain(|_, s| {
             if s.touched.swap(false, Ordering::Relaxed) {
@@ -381,12 +383,42 @@ impl Server {
             if !keep {
                 s.closed.store(true, Ordering::Release);
                 crate::log!("session '{}' ({}) timed out", s.name, s.id);
+                expired.push(s.clone());
             }
             keep
         });
         drop(sessions);
+        for s in expired {
+            self.session_event(crate::events::types::AUDIT_SESSION_EVENT_TYPE, &s, "Session/Timeout", true, |e| e);
+        }
         let mut orphans = self.orphans.lock().unwrap_or_else(|e| e.into_inner());
         orphans.retain(|o| o.expires_ms > now);
+    }
+
+    /// Raises an AuditSessionEventType (or subtype) for `s` when someone
+    /// subscribes to events. `extra` adds the subtype's fields.
+    pub fn session_event(&self, type_id: u32, s: &Session, action: &str, ok: bool, extra: impl FnOnce(Event) -> Event) {
+        use crate::events::types::*;
+        let space = self.store.load();
+        if !space.events.active() {
+            return;
+        }
+        let user = s.identity.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let outcome = if ok { "succeeded" } else { "failed" };
+        let ev = Event::new(
+            type_id,
+            NodeId::ns0(ids::SERVER),
+            action,
+            &format!("{action} of session '{}' {outcome}", s.name),
+            if ok { 100 } else { 500 },
+        )
+        .with(ACTION_TIME_STAMP, Variant::DateTime(now_ticks()))
+        .with(STATUS, Variant::Boolean(ok))
+        .with(SERVER_ID, Variant::string(&self.store.info().application_uri))
+        .with(CLIENT_AUDIT_ENTRY_ID, Variant::String(None))
+        .with(CLIENT_USER_ID, Variant::string(&user))
+        .with(SESSION_ID, Variant::NodeId(Box::new(s.id.clone())));
+        space.events.emit(extra(ev));
     }
 
     /// Every live session (TransferSubscriptions).

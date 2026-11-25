@@ -460,6 +460,11 @@ impl Client {
         r
     }
 
+    /// Request handle of the next request sent.
+    pub fn next_handle(&self) -> u32 {
+        self.handle
+    }
+
     /// Next response: (type id, body starting with the response header).
     pub fn receive(&mut self) -> io::Result<(u32, &[u8])> {
         self.read_response()
@@ -506,6 +511,7 @@ impl Client {
                 w.u32(it.handle);
                 w.f64(it.sampling_ms);
                 match it.filter {
+                    _ if it.event_select.is_some() => it.write_event_filter(w),
                     None => w.null_extension_object(),
                     Some((trigger, db_type, db)) => {
                         let at = w.begin_extension_object(ids::DATA_CHANGE_FILTER_ENCODING);
@@ -695,6 +701,27 @@ pub struct MonitorSpec {
     pub discard_oldest: bool,
     /// DataChangeFilter (trigger, deadband type, deadband value).
     pub filter: Option<(u32, u32, f64)>,
+    /// EventFilter select clauses (BaseEventType field names).
+    pub event_select: Option<Vec<String>>,
+    /// EventFilter where clause: (operator, operands) elements.
+    pub event_where: Vec<(u32, Vec<FilterOperand>)>,
+}
+
+/// Operand of a where clause element.
+#[derive(Clone, Debug)]
+pub enum FilterOperand {
+    Element(u32),
+    Literal(Variant),
+    /// A BaseEventType field, by browse name.
+    Field(String),
+}
+
+fn write_simple_operand(w: &mut Writer, name: &str) {
+    w.node_id(&NodeId::ns0(crate::events::types::BASE_EVENT_TYPE));
+    w.i32(1);
+    w.qualified_name(&QualifiedName { ns: 0, name: name.into() });
+    w.u32(13);
+    w.str(None);
 }
 
 impl MonitorSpec {
@@ -708,7 +735,54 @@ impl MonitorSpec {
             queue_size: 1,
             discard_oldest: true,
             filter: None,
+            event_select: None,
+            event_where: Vec::new(),
         }
+    }
+
+    /// Events of `node` (an event notifier) with the given fields.
+    pub fn events(node: NodeId, handle: u32, fields: &[&str]) -> MonitorSpec {
+        MonitorSpec {
+            attribute: 12,
+            queue_size: 0,
+            event_select: Some(fields.iter().map(|f| f.to_string()).collect()),
+            ..MonitorSpec::value(node, handle)
+        }
+    }
+
+    fn write_event_filter(&self, w: &mut Writer) {
+        let at = w.begin_extension_object(ids::EVENT_FILTER_ENCODING);
+        let select = self.event_select.as_deref().unwrap_or(&[]);
+        w.i32(select.len() as i32);
+        for f in select {
+            write_simple_operand(w, f);
+        }
+        w.i32(self.event_where.len() as i32);
+        for (op, operands) in &self.event_where {
+            w.u32(*op);
+            w.i32(operands.len() as i32);
+            for o in operands {
+                let x = match o {
+                    FilterOperand::Element(i) => {
+                        let x = w.begin_extension_object(crate::events::ELEMENT_OPERAND);
+                        w.u32(*i);
+                        x
+                    }
+                    FilterOperand::Literal(v) => {
+                        let x = w.begin_extension_object(crate::events::LITERAL_OPERAND);
+                        w.variant(v);
+                        x
+                    }
+                    FilterOperand::Field(name) => {
+                        let x = w.begin_extension_object(crate::events::SIMPLE_ATTRIBUTE_OPERAND);
+                        write_simple_operand(w, name);
+                        x
+                    }
+                };
+                w.end_extension_object(x);
+            }
+        }
+        w.end_extension_object(at);
     }
 }
 
@@ -721,11 +795,13 @@ pub struct Message {
     pub data: Vec<(u32, DataValue)>,
     /// StatusChangeNotification code.
     pub status_change: Option<u32>,
+    /// EventNotificationList: (client handle, selected fields).
+    pub events: Vec<(u32, Vec<Variant>)>,
 }
 
 impl Message {
     pub fn is_keep_alive(&self) -> bool {
-        self.data.is_empty() && self.status_change.is_none()
+        self.data.is_empty() && self.status_change.is_none() && self.events.is_empty()
     }
 }
 
@@ -752,6 +828,10 @@ fn parse_message(r: &mut Reader) -> crate::codec::DResult<Message> {
                 m.data.extend(items);
             }
             Some(ids::STATUS_CHANGE_NOTIFICATION_ENCODING) => m.status_change = Some(b.u32()?),
+            Some(crate::events::EVENT_NOTIFICATION_LIST_ENCODING) => {
+                let items = b.array(8, |b| Ok((b.u32()?, b.array(1, |b| b.variant())?)))?;
+                m.events.extend(items);
+            }
             _ => {}
         }
     }

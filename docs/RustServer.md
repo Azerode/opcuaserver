@@ -28,7 +28,9 @@ Every `*.json` file (searched recursively) is one namespace:
   "Namespace": "Machine1",
   "Subscriptions": [
     { "Name": "FLAGS",
-      "Items": [ { "Name": "PC", "NodeId": "ns=5;i=1000", "Type": "System.Int16", "Writable": true } ] }
+      "Items": [
+        { "Name": "PC", "NodeId": "ns=5;i=1000", "Type": "System.Int16", "Writable": true },
+        { "Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": { "Low": 0, "High": 200 } } ] }
   ]
 }
 ```
@@ -40,6 +42,9 @@ Every `*.json` file (searched recursively) is one namespace:
 - `Type`: Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64,
   Float, Double, String, DateTime, Guid, ByteString (`System.` prefix optional).
 - `Writable` (default `true`) controls the AccessLevel.
+- `EURange` (numeric types only, `{"Low": .., "High": ..}` or `[low, high]`)
+  makes the item an AnalogItemType variable with an EURange property (a
+  `Range` structure, browse name `0:EURange`). Percent deadbands use it.
 - Address space: `Objects/<Name>/<group>/<item>`.
 
 ### Hot reload
@@ -95,9 +100,11 @@ SetMonitoringMode, SetTriggering and DeleteMonitoredItems.
   - Queue sizes, `discardOldest` and the Overflow bit follow Part 4 §5.12.1.5.
   - DataChangeFilter supports the Status, StatusValue and
     StatusValueTimestamp triggers and the absolute deadband.
-  - Percent deadbands need an EURange, which the configured variables do not
-    have, so they return `BadMonitoredItemFilterUnsupported`. Event and
-    aggregate filters do too.
+  - Percent deadbands (Part 8 §5.3.2.2) work on items with an EURange: the
+    percentage becomes an absolute deadband of `pct / 100 × (High − Low)`,
+    recomputed when a reload changes the range. Items without an EURange
+    return `BadFilterNotAllowed`. Aggregate filters return
+    `BadMonitoredItemFilterUnsupported`.
 - **Publish state machine:**
   - Keep-alives and lifetime counters run per subscription; when a lifetime
     expires, a StatusChangeNotification `BadTimeout` is sent.
@@ -117,9 +124,46 @@ SetMonitoringMode, SetTriggering and DeleteMonitoredItems.
 - **No allocation:** once queues and buffers have grown to size, nothing is
   allocated for numeric values. `tests/no_alloc.rs` checks this with a counting
   allocator over 1000 publish cycles.
+- **Methods:** `Server.GetMonitoredItems` and `Server.ResendData` are
+  available through Call. Cancel answers the queued Publish requests with the
+  given handle with `BadRequestCancelledByClient`.
 - **Intervals:** the fastest publishing and sampling intervals default to 1 ms.
   `--min-publishing-interval MS` and `--min-sampling-interval MS` lower them (to
   0.05 ms at least), at the cost of more wake-ups per second.
+
+## Events
+
+The Server object (`i=2253`) is an event notifier: a MonitoredItem on its
+EventNotifier attribute with an EventFilter receives every server event.
+
+- **Event types:** BaseEventType, AuditEventType, AuditSecurityEventType,
+  AuditSessionEventType, AuditCreateSessionEventType,
+  AuditActivateSessionEventType, SystemEventType, BaseModelChangeEventType and
+  EventQueueOverflowEventType, with their field declarations, are in
+  namespace 0 so clients can build filters by browsing.
+- **Events raised:**
+  - Session audit: `Session/CreateSession`, `Session/ActivateSession` (also on
+    failure, with `Status = false`), `Session/CloseSession` and
+    `Session/Timeout`, with SessionId, ClientUserId and the subtype's fields.
+  - Configuration reloaded: BaseModelChangeEventType, severity 100.
+  - Configuration rejected: SystemEventType, severity 700, the parse error in
+    the Message.
+- **Select clauses:** BaseEventType fields and the fields of its subtypes. A
+  field the event does not have is a null Variant, as is the ConditionId.
+- **Where clauses:** Equals, IsNull, GreaterThan, LessThan,
+  GreaterThanOrEqual, LessThanOrEqual, Like (`%`, `_`, `[...]`), Not, Between,
+  InList, And, Or, OfType, BitwiseAnd and BitwiseOr, with SQL three-valued
+  logic. Cast, InView and RelatedTo return
+  `BadFilterOperatorUnsupported`. Errors come back in the EventFilterResult
+  with `BadEventFilterInvalid` as the item status.
+- **Queues:** a requested size of 0 gives 1000 events. When a queue overflows,
+  an EventQueueOverflowEventType event takes the oldest position
+  (`discardOldest`) or the newest one.
+- **Cost:** events go through a ring of 4096 shared by all sessions. An event
+  item reads it only when its subscription is serviced, so subscriptions
+  without event items never touch it, and raising an event while nobody
+  subscribes costs one atomic load. A slow reader that falls more than 4096
+  events behind gets an overflow event.
 
 ## Security
 
@@ -170,7 +214,7 @@ On a None or Sign channel the password must be encrypted with the server key, as
 
 ### Interoperability tests
 
-`crates/fastua/tests/interop/asyncua_interop.py` runs the release binary against the Python asyncua client. It checks every policy and mode, a 4096-bit client key, the certificate trust flow, user name and X.509 users, access rights and hot reload. CI runs it on both architectures.
+`crates/fastua/tests/interop/asyncua_interop.py` runs the release binary against the Python asyncua client. It checks every policy and mode, a 4096-bit client key, the certificate trust flow, user name and X.509 users, access rights, hot reload, subscriptions with absolute and percent deadbands, events with a where clause, GetMonitoredItems, ServerCapabilities and index ranges. CI runs it on both architectures.
 
 ```bash
 pip install asyncua cryptography
@@ -184,9 +228,13 @@ SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep and
 Aes256_Sha256_RsaPss in Sign and SignAndEncrypt modes (issue/renew, token
 lifetime, sequence checks), PKI with CRLs, sessions with anonymous, user name
 and X.509 identities, per-user read/write rights, GetEndpoints, FindServers,
-Read, Write, Browse, BrowseNext, TranslateBrowsePathsToNodeIds,
-RegisterNodes/UnregisterNodes, ServerStatus, NamespaceArray, and every
-Subscription and MonitoredItem service (see [Subscriptions](#subscriptions)).
+Read (with index ranges on arrays, Strings and ByteStrings), Write, Browse,
+BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes/UnregisterNodes,
+Cancel, Call, ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities
+with OperationLimits, every Subscription and MonitoredItem service (see
+[Subscriptions](#subscriptions)) and events with session audit (see
+[Events](#events)).
 
-Not yet: Call, events, the full namespace 0
-nodeset, index ranges, ECC policies, audit events.
+Not yet: the full namespace 0 nodeset, conditions and alarms, index ranges on
+MonitoredItems and in writes (`BadWriteNotSupported`), history, aggregates,
+ECC policies.

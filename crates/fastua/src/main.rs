@@ -124,8 +124,16 @@ fn main() {
         .unwrap_or_else(|_| "localhost".into());
     let port = listen.rsplit(':').next().unwrap_or("4840");
     let endpoint = endpoint.unwrap_or_else(|| format!("opc.tcp://{hostname}:{port}"));
+    let mut limits = fastua::server::Limits::default();
+    if let Some(ms) = min_publishing {
+        limits.min_publishing_interval_ms = ms;
+    }
+    if let Some(ms) = min_sampling {
+        limits.min_sampling_interval_ms = ms;
+    }
     let info = ServerInfo {
         application_uri: app_uri.unwrap_or_else(|| format!("urn:{hostname}:fastua")),
+        limits: limits.clone(),
         ..ServerInfo::default()
     };
 
@@ -159,12 +167,7 @@ fn main() {
     config.anonymous = anonymous;
     config.x509_users = x509_users;
     config.busy_poll = busy_poll;
-    if let Some(ms) = min_publishing {
-        config.limits.min_publishing_interval_ms = ms;
-    }
-    if let Some(ms) = min_sampling {
-        config.limits.min_sampling_interval_ms = ms;
-    }
+    config.limits = limits;
     if !busy_poll.is_zero() {
         fastua::log!("busy-polling connections for {} us before sleeping", busy_poll.as_micros());
     }

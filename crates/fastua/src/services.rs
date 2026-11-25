@@ -176,6 +176,8 @@ pub fn dispatch(ctx: &mut Ctx, r: &mut Reader, w: &mut Writer) -> u32 {
         Some(ids::SET_MONITORING_MODE_REQUEST) => sub::set_monitoring_mode(ctx, &header, r, w),
         Some(ids::SET_TRIGGERING_REQUEST) => sub::set_triggering(ctx, &header, r, w),
         Some(ids::DELETE_MONITORED_ITEMS_REQUEST) => sub::delete_monitored_items(ctx, &header, r, w),
+        Some(ids::CALL_REQUEST) => sub::call(ctx, &header, r, w),
+        Some(ids::CANCEL_REQUEST) => sub::cancel(ctx, &header, r, w),
         _ => Err(status::BAD_SERVICE_UNSUPPORTED),
     };
     if let Err(code) = result {
@@ -333,6 +335,21 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
     let mut nonce = vec![0u8; crypto::NONCE_LEN];
     random_bytes(&mut nonce);
     let session = ctx.server.create_session(name, ctx.channel_id, timeout, security.clone(), nonce.clone())?;
+    let thumbprint = client_cert.as_deref().map(|c| crate::pki::hex(&crypto::thumbprint(c)));
+    let channel = ctx.channel_id;
+    ctx.server.session_event(
+        crate::events::types::AUDIT_CREATE_SESSION_EVENT_TYPE,
+        &session,
+        "Session/CreateSession",
+        true,
+        |e| {
+            use crate::events::types::*;
+            e.with(CREATE_SECURE_CHANNEL_ID, Variant::string(&channel.to_string()))
+                .with(CLIENT_CERTIFICATE, Variant::ByteString(client_cert.as_deref().map(Into::into)))
+                .with(CLIENT_CERTIFICATE_THUMBPRINT, Variant::String(thumbprint.map(Into::into)))
+                .with(REVISED_SESSION_TIMEOUT, Variant::Double(timeout))
+        },
+    );
 
     begin(w, ids::CREATE_SESSION_RESPONSE, h);
     w.node_id(&session.id);
@@ -401,7 +418,23 @@ fn decrypt_secret(ctx: &Ctx, data: &[u8], algorithm: Option<&str>, nonce: &[u8])
     Ok(secret.to_vec())
 }
 
+/// ActivateSession, audited (AuditActivateSessionEventType).
 fn activate_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
+    let result = activate_session_inner(ctx, h, r, w);
+    if let Ok(s) = session(ctx, h, false) {
+        let channel = ctx.channel_id.to_string();
+        ctx.server.session_event(
+            crate::events::types::AUDIT_ACTIVATE_SESSION_EVENT_TYPE,
+            &s,
+            "Session/ActivateSession",
+            result.is_ok(),
+            |e| e.with(crate::events::types::ACTIVATE_SECURE_CHANNEL_ID, Variant::string(&channel)),
+        );
+    }
+    result
+}
+
+fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
     let s = session(ctx, h, false)?;
     #[allow(clippy::type_complexity)]
     let mut parse = || -> DResult<(Option<String>, Vec<u8>, NodeId, Vec<u8>, Option<String>, Vec<u8>)> {
@@ -533,6 +566,7 @@ fn close_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Write
     }
     *ctx.session = None;
     crate::log!("session '{}' ({}) closed", s.name, s.id);
+    ctx.server.session_event(crate::events::types::AUDIT_SESSION_EVENT_TYPE, &s, "Session/CloseSession", true, |e| e);
     begin(w, ids::CLOSE_SESSION_RESPONSE, h);
     Ok(())
 }
@@ -560,6 +594,8 @@ pub mod attr {
     pub const USER_ACCESS_LEVEL: u32 = 18;
     pub const MINIMUM_SAMPLING_INTERVAL: u32 = 19;
     pub const HISTORIZING: u32 = 20;
+    pub const EXECUTABLE: u32 = 21;
+    pub const USER_EXECUTABLE: u32 = 22;
     pub const ACCESS_LEVEL_EX: u32 = 27;
 }
 
@@ -656,6 +692,98 @@ fn write_attribute(w: &mut Writer, space: &AddressSpace, node: &Node, attribute:
     }
 }
 
+/// NumericRange (Part 4 §7.27) of one dimension: `i` or `i:j` with i < j.
+/// `Err(true)`: syntax error; `Err(false)`: more dimensions than values have.
+pub fn parse_range(s: &str) -> Result<(usize, usize), bool> {
+    if s.contains(',') {
+        let valid = s.split(',').all(|d| parse_range(d).is_ok());
+        return Err(valid);
+    }
+    let num = |x: &str| -> Result<usize, bool> {
+        if x.is_empty() || !x.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(true);
+        }
+        x.parse().map_err(|_| true)
+    };
+    match s.split_once(':') {
+        None => num(s).map(|i| (i, i)),
+        Some((a, b)) => {
+            let (a, b) = (num(a)?, num(b)?);
+            if a >= b {
+                return Err(true);
+            }
+            Ok((a, b))
+        }
+    }
+}
+
+/// The elements `lo..=hi` of an array, String or ByteString value.
+pub fn apply_range(v: &Variant, (lo, hi): (usize, usize)) -> Result<Variant, u32> {
+    let no_data = status::BAD_INDEX_RANGE_NO_DATA;
+    let span = |len: usize| if lo >= len { Err(no_data) } else { Ok(lo..hi.min(len - 1) + 1) };
+    Ok(match v {
+        Variant::Array(a) => Variant::Array(Box::new(VariantArray {
+            type_id: a.type_id,
+            items: a.items[span(a.items.len())?].to_vec(),
+            dims: None,
+        })),
+        Variant::String(Some(s)) => {
+            let chars: Vec<char> = s.chars().collect();
+            Variant::String(Some(chars[span(chars.len())?].iter().collect::<String>().into()))
+        }
+        Variant::ByteString(Some(b)) => Variant::ByteString(Some(b[span(b.len())?].into())),
+        _ => return Err(no_data),
+    })
+}
+
+/// Read with an index range (rare: kept off the hot path).
+#[cold]
+fn read_range(
+    w: &mut Writer,
+    space: &AddressSpace,
+    node: &Node,
+    attribute: u32,
+    range: &str,
+    ts: Timestamps,
+    can_write: bool,
+) {
+    let range = match parse_range(range) {
+        Ok(r) => r,
+        Err(true) => return write_bad(w, status::BAD_INDEX_RANGE_INVALID),
+        Err(false) => return write_bad(w, status::BAD_INDEX_RANGE_NO_DATA),
+    };
+    let dv = match (attribute, &node.kind) {
+        (attr::VALUE, NodeKind::Variable { value, access, .. }) => {
+            if access & ACCESS_READ == 0 {
+                return write_bad(w, status::BAD_NOT_READABLE);
+            }
+            match value {
+                ValueSource::Cell(c) => c.to_data_value(),
+                ValueSource::Static(v) => DataValue::value(v.clone()),
+                ValueSource::CurrentTime => DataValue::value(Variant::DateTime(now_ticks())),
+                ValueSource::ServerStatus => DataValue::value(encode_server_status(&space.info)),
+            }
+        }
+        _ => match attribute_value(node, attribute, can_write) {
+            Some(v) => DataValue::value(v),
+            None => return write_bad(w, status::BAD_ATTRIBUTE_ID_INVALID),
+        },
+    };
+    let value = match dv.value.as_ref().map(|v| apply_range(v, range)) {
+        Some(Ok(v)) => v,
+        Some(Err(code)) => return write_bad(w, code),
+        None => return write_bad(w, status::BAD_INDEX_RANGE_NO_DATA),
+    };
+    let now = now_ticks();
+    w.data_value(&DataValue {
+        value: Some(value),
+        status: dv.status.filter(|&s| s != status::GOOD),
+        source_timestamp: if ts.source { dv.source_timestamp } else { None },
+        server_timestamp: if ts.server { Some(dv.server_timestamp.unwrap_or(now)) } else { None },
+        ..Default::default()
+    });
+}
+
 /// Value of an attribute other than Value; `None` if the node class does
 /// not have it.
 pub fn attribute_value(node: &Node, attribute: u32, can_write: bool) -> Option<Variant> {
@@ -695,6 +823,9 @@ pub fn attribute_value(node: &Node, attribute: u32, can_write: bool) -> Option<V
         (ACCESS_LEVEL_EX, NodeKind::Variable { access, .. }) => Variant::UInt32(*access as u32),
         (MINIMUM_SAMPLING_INTERVAL, NodeKind::Variable { .. }) => Variant::Double(0.0),
         (HISTORIZING, NodeKind::Variable { .. }) => Variant::Boolean(false),
+        (EXECUTABLE, NodeKind::Method { executable }) | (USER_EXECUTABLE, NodeKind::Method { executable }) => {
+            Variant::Boolean(*executable)
+        }
         _ => return None,
     })
 }
@@ -735,10 +866,8 @@ fn read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SRe
             write_bad(w, status::BAD_NODE_ID_UNKNOWN);
             continue;
         };
-        if range.is_some_and(|s| !s.is_empty()) {
-            // Index ranges are only meaningful on arrays / strings; the
-            // configured variables are scalars.
-            write_bad(w, status::BAD_INDEX_RANGE_INVALID);
+        if let Some(range) = range.filter(|s| !s.is_empty()) {
+            read_range(w, space, node, attribute, range, ts, can_write);
             continue;
         }
         if enc_name.is_some_and(|s| !s.is_empty()) {
@@ -790,8 +919,12 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
             if !can_write {
                 return Err(status::BAD_USER_ACCESS_DENIED);
             }
-            if range.is_some_and(|s| !s.is_empty()) {
-                return Err(status::BAD_INDEX_RANGE_INVALID);
+            if let Some(range) = range.filter(|s| !s.is_empty()) {
+                // Partial writes of the (scalar) configured variables.
+                return Err(match parse_range(range) {
+                    Err(true) => status::BAD_INDEX_RANGE_INVALID,
+                    _ => status::BAD_WRITE_NOT_SUPPORTED,
+                });
             }
             let ValueSource::Cell(cell) = value else {
                 return Err(status::BAD_NOT_WRITABLE);
