@@ -5,10 +5,11 @@
  * usage: open62541_ecc <opc.tcp://host:port> <trusted user certificates dir>
  *
  * For every ECC_* AEAD policy and both secure modes: anonymous session, reads,
- * a browse and a large read (multi-chunk response). Then, per curve, an X.509
- * user token on the same curve (channel-bound user token signature), and a
- * security token renewal (IKM chaining). The server must run with
- * --trust-all-clients. Exits non-zero on failure. */
+ * a browse and a large read (multi-chunk response). Then, per policy, an X.509
+ * user token on the same curve (channel-bound user token signature) and a user
+ * name / password (EccEncryptedSecret), and per curve a security token renewal
+ * (IKM chaining). The server must run with --trust-all-clients and a users file
+ * with operator / s3cret. Exits non-zero on failure. */
 
 #include <open62541/client_config_default.h>
 #include <open62541/client_highlevel.h>
@@ -212,6 +213,34 @@ int main(int argc, char *argv[]) {
         if(res == UA_STATUSCODE_GOOD)
             res = readCurrentTime(client);
         check(label, res == UA_STATUSCODE_GOOD, UA_StatusCode_name(res));
+        if(client) {
+            UA_Client_disconnect(client);
+            UA_Client_delete(client);
+        }
+
+        /* User name / password: an EccEncryptedSecret for the ephemeral key
+         * the server returns in CreateSession. */
+        snprintf(label, sizeof(label), "ECC_%s SignAndEncrypt user name", POLICIES[p].name);
+        client = newClient(p, modes[1], &cert, &key, NULL, NULL, 0);
+        res = client ? UA_ClientConfig_setAuthenticationUsername(UA_Client_getConfig(client), "operator", "s3cret")
+                     : UA_STATUSCODE_BADINTERNALERROR;
+        if(res == UA_STATUSCODE_GOOD)
+            res = UA_Client_connect(client, url);
+        if(res == UA_STATUSCODE_GOOD)
+            res = readCurrentTime(client);
+        check(label, res == UA_STATUSCODE_GOOD, UA_StatusCode_name(res));
+        if(client) {
+            UA_Client_disconnect(client);
+            UA_Client_delete(client);
+        }
+
+        snprintf(label, sizeof(label), "ECC_%s wrong password refused", POLICIES[p].name);
+        client = newClient(p, modes[1], &cert, &key, NULL, NULL, 0);
+        res = client ? UA_ClientConfig_setAuthenticationUsername(UA_Client_getConfig(client), "operator", "nope")
+                     : UA_STATUSCODE_BADINTERNALERROR;
+        if(res == UA_STATUSCODE_GOOD)
+            res = UA_Client_connect(client, url);
+        check(label, res != UA_STATUSCODE_GOOD, UA_StatusCode_name(res));
         if(client) {
             UA_Client_disconnect(client);
             UA_Client_delete(client);

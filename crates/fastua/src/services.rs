@@ -65,6 +65,9 @@ pub struct RequestHeader {
     pub handle: u32,
     pub return_diagnostics: u32,
     pub timeout_hint: u32,
+    /// The AdditionalHeader asks for an ephemeral ECDH key ("ECDHPolicyUri",
+    /// EccEncryptedSecret user tokens).
+    pub ecdh: bool,
     /// Coarse server clock (1-4 ms resolution, a few ns to read) when the
     /// request was decoded: the ResponseHeader timestamp.
     pub now: i64,
@@ -83,6 +86,7 @@ impl RequestHeader {
                     handle: u32_at(27),
                     return_diagnostics: u32_at(31),
                     timeout_hint: u32_at(39),
+                    ecdh: false,
                     now: coarse_now_ticks(),
                 };
                 r.advance(46);
@@ -95,8 +99,9 @@ impl RequestHeader {
         let return_diagnostics = r.u32()?;
         let _audit = r.str()?;
         let timeout_hint = r.u32()?;
-        let _additional = r.extension_object_raw()?;
-        Ok(RequestHeader { auth_token, handle, return_diagnostics, timeout_hint, now: coarse_now_ticks() })
+        let (additional, _, body) = r.extension_object_raw()?;
+        let ecdh = additional.as_ns0() == Some(ADDITIONAL_PARAMETERS_ENCODING) && requests_ecdh(body);
+        Ok(RequestHeader { auth_token, handle, return_diagnostics, timeout_hint, ecdh, now: coarse_now_ticks() })
     }
 }
 
@@ -108,6 +113,126 @@ pub fn write_response_header(w: &mut Writer, now: i64, handle: u32, result: u32)
     w.empty_diagnostic_info();
     w.null_array(); // stringTable
     w.null_extension_object();
+}
+
+const ADDITIONAL_PARAMETERS_ENCODING: u32 = 17537;
+const EPHEMERAL_KEY_ENCODING: u32 = 17549;
+const ECC_ENCRYPTED_SECRET: u32 = 17546;
+
+/// AdditionalParametersType with a ("ECDHPolicyUri", ...) parameter.
+fn requests_ecdh(body: &[u8]) -> bool {
+    let mut r = Reader::new(body);
+    let mut scan = || -> DResult<bool> {
+        let n = r.length(1)?.unwrap_or(0);
+        for _ in 0..n {
+            let (ns, name) = r.qualified_name_ref()?;
+            if ns == 0 && name == Some("ECDHPolicyUri") {
+                return Ok(true);
+            }
+            r.variant()?;
+        }
+        Ok(false)
+    };
+    scan().unwrap_or(false)
+}
+
+/// On an ECC channel, when the client asked for it: a new ephemeral key for
+/// the session's next EccEncryptedSecret, signed with our key, in the
+/// ResponseHeader's AdditionalHeader (written by `begin` as null, replaced).
+fn write_ecdh_key(ctx: &Ctx, h: &RequestHeader, s: &Session, w: &mut Writer) -> Result<(), u32> {
+    let Policy::Ecc(suite) = ctx.security.policy else { return Ok(()) };
+    if !h.ecdh {
+        return Ok(());
+    }
+    let own = ctx.server.pki().ecc_own(suite.curve).ok_or(status::BAD_INTERNAL_ERROR)?;
+    let eph = crate::ecc::Ephemeral::generate(suite).map_err(|_| status::BAD_INTERNAL_ERROR)?;
+    let sig = own.key.sign(&eph.public).map_err(|_| status::BAD_INTERNAL_ERROR)?;
+    let mut tail = Vec::new();
+    {
+        let mut t = Writer::new(&mut tail);
+        let at = t.begin_extension_object(ADDITIONAL_PARAMETERS_ENCODING);
+        t.i32(2);
+        t.u16(0);
+        t.string("ECDHPolicyUri");
+        t.u8(12); // Variant String
+        t.string(suite.uri());
+        t.u16(0);
+        t.string("ECDHKey");
+        t.u8(22); // Variant ExtensionObject
+        let k = t.begin_extension_object(EPHEMERAL_KEY_ENCODING);
+        t.bytes(Some(&eph.public));
+        t.bytes(Some(&sig));
+        t.end_extension_object(k);
+        t.end_extension_object(at);
+    }
+    // The null AdditionalHeader is the last 3 bytes `begin` wrote.
+    let end = w.buf.len() - 3;
+    let body = w.buf.split_off(end);
+    debug_assert_eq!(body, [0, 0, 0]);
+    w.buf.extend_from_slice(&tail);
+    *s.ecdh.lock().unwrap_or_else(|e| e.into_inner()) = Some(eph);
+    Ok(())
+}
+
+/// Decrypts an EccEncryptedSecret (Part 4 §7.41.2.3) with the session's
+/// ephemeral key: signed by the client's application key, AEAD-encrypted
+/// `nonce | secret | padding | padding size`.
+fn decrypt_ecc_secret(ctx: &Ctx, s: &Session, data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, u32> {
+    let bad = status::BAD_IDENTITY_TOKEN_INVALID;
+    let suite = ctx.security.policy.ecc().ok_or(bad)?;
+    let client = ctx.security.client_cert.as_ref().ok_or(status::BAD_SECURITY_CHECKS_FAILED)?;
+    // The ephemeral key is good for one secret.
+    let eph = s.ecdh.lock().unwrap_or_else(|e| e.into_inner()).take().ok_or(bad)?;
+    let mut r = Reader::new(data);
+    let mut header = || -> DResult<(NodeId, u8, usize, Option<String>, u16)> {
+        let ty = r.node_id()?;
+        let enc = r.u8()?;
+        // Length counts the bytes after itself.
+        let end = r.u32()? as usize + r.position();
+        let uri = r.str()?.map(str::to_string);
+        r.bytes()?; // certificate: the channel's, checked by the signature
+        r.i64()?; // signingTime
+        let key_len = r.u16()?;
+        Ok((ty, enc, end, uri, key_len))
+    };
+    let (ty, enc, end, uri, key_len) = header().map_err(|_| bad)?;
+    if ty.as_ns0() != Some(ECC_ENCRYPTED_SECRET) || enc != 1 || uri.as_deref() != Some(suite.uri()) {
+        return Err(bad);
+    }
+    let sig_len = suite.signature_len();
+    if end != data.len() || end < r.position() + sig_len + crate::ecc::TAG_LEN {
+        return Err(bad);
+    }
+    let signed = end - sig_len;
+    suite.verify(&client.rsa_public_key, &data[..signed], &data[signed..]).map_err(|_| bad)?;
+    let keys_at = r.position();
+    let sender = r.bytes().map_err(|_| bad)?.unwrap_or(&[]);
+    let receiver = r.bytes().map_err(|_| bad)?.unwrap_or(&[]);
+    let payload_at = r.position();
+    if payload_at - keys_at != key_len as usize || payload_at + crate::ecc::TAG_LEN > signed {
+        return Err(bad);
+    }
+    if receiver != eph.public.as_slice() {
+        return Err(bad);
+    }
+    let keys = eph.secret_keys(suite, sender, sender, receiver).map_err(|_| bad)?;
+    let tag_at = signed - crate::ecc::TAG_LEN;
+    let mut plain = data[payload_at..tag_at].to_vec();
+    keys.open(0, 0, &data[..payload_at], &mut plain, &data[tag_at..signed]).map_err(|_| bad)?;
+    // nonce | secret | padding (n bytes of n) | n (UInt16)
+    let mut p = Reader::new(&plain);
+    let got_nonce = p.bytes().map_err(|_| bad)?.unwrap_or(&[]);
+    if aws_lc_rs::constant_time::verify_slices_are_equal(got_nonce, nonce).is_err() {
+        return Err(status::BAD_SECURITY_CHECKS_FAILED);
+    }
+    let secret = p.bytes().map_err(|_| bad)?.unwrap_or(&[]).to_vec();
+    let pad_at = p.position();
+    let n = plain.len().checked_sub(2).filter(|&n| n >= pad_at).ok_or(bad)?;
+    let size = u16::from_le_bytes([plain[n], plain[n + 1]]) as usize;
+    if n - pad_at != size || plain[pad_at..n].iter().any(|&b| b != size as u8) {
+        return Err(bad);
+    }
+    Ok(secret)
 }
 
 #[inline]
@@ -375,6 +500,7 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
     );
 
     begin(w, ids::CREATE_SESSION_RESPONSE, h);
+    write_ecdh_key(ctx, h, &session, w)?;
     w.node_id(&session.id);
     w.node_id(&session.token);
     w.f64(timeout);
@@ -539,11 +665,15 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
                 Ok((policy_id, user, password, alg))
             };
             let (policy_id, user, password, alg) = parse().map_err(|_| status::BAD_IDENTITY_TOKEN_INVALID)?;
-            // Not offered on ECC endpoints (needs EccEncryptedSecret).
-            if policy_id != Some(USERNAME_POLICY_ID) || ctx.server.users.is_empty() || ctx.security.policy.is_ecc() {
+            if policy_id != Some(USERNAME_POLICY_ID) || ctx.server.users.is_empty() {
                 return Err(status::BAD_IDENTITY_TOKEN_INVALID);
             }
-            let password = decrypt_secret(ctx, &password, alg.as_deref(), &nonce)?;
+            let password = if ctx.security.policy.is_ecc() {
+                // Always an EccEncryptedSecret (the algorithm field is empty).
+                decrypt_ecc_secret(ctx, &s, &password, &nonce)?
+            } else {
+                decrypt_secret(ctx, &password, alg.as_deref(), &nonce)?
+            };
             match ctx.server.users.authenticate(&user, &password) {
                 Some(a) => (a, Arc::from(format!("user:{user}"))),
                 None => {
@@ -604,6 +734,7 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
     random_bytes(&mut nonce);
     *s.server_nonce.lock().unwrap_or_else(|e| e.into_inner()) = nonce.clone();
     begin(w, ids::ACTIVATE_SESSION_RESPONSE, h);
+    write_ecdh_key(ctx, h, &s, w)?;
     w.bytes(Some(&nonce));
     w.empty_array(); // results
     w.empty_array(); // diagnosticInfos

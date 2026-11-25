@@ -8,7 +8,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
 
 - **Transport:** UA TCP binary (HEL/ACK/ERR, chunking both ways, pipelined requests).
 - **Security:** SecureChannel with SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, in Sign and SignAndEncrypt modes.
-  - ECC policies (OPC UA 1.05.04+): ECC_nistP256, ECC_nistP384 and ECC_curve25519, each with AesGcm and ChaChaPoly. They use ephemeral ECDH / X25519 key agreement, HKDF, ECDSA / Ed25519 signatures and AEAD messages, with the SecureChannelEnhancements (channel-bound session signatures, IKM chaining on renewal). A certificate per curve is created in the PKI. User names are not offered on ECC endpoints yet (EccEncryptedSecret); anonymous and X.509 users are.
+  - ECC policies (OPC UA 1.05.04+): ECC_nistP256, ECC_nistP384 and ECC_curve25519, each with AesGcm and ChaChaPoly. They use ephemeral ECDH / X25519 key agreement, HKDF, ECDSA / Ed25519 signatures and AEAD messages, with the SecureChannelEnhancements (channel-bound session signatures, IKM chaining on renewal). A certificate per curve is created in the PKI. Anonymous, X.509 and user name logins work on ECC endpoints; the password travels as an EccEncryptedSecret for an ephemeral key the server sends in CreateSession / ActivateSession.
   - Mutual certificate authentication.
   - Token renewal and lifetime, sequence checks.
   - A PKI with chain, CRL and ApplicationUri validation.
@@ -41,7 +41,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: the full namespace 0 nodeset, condition branches and shelving, dialog conditions, event history, history persistence across restarts, user name tokens on ECC endpoints (EccEncryptedSecret), the deprecated non-AEAD ECC policies, the HTTPS transport (`opc.https`).
+Not yet: the full namespace 0 nodeset, condition branches and shelving, dialog conditions, event history, history persistence across restarts, the deprecated non-AEAD ECC policies, the HTTPS transport (`opc.https`).
 
 ## Build and run
 
