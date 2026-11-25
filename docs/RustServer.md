@@ -472,9 +472,36 @@ cc crates/fastua/tests/interop/open62541_ecc.c -lopen62541 -lssl -lcrypto -o ope
 crates/fastua/tests/interop/open62541_ecc.sh target/release/fastua config/machines ./open62541_ecc
 ```
 
+### HTTPS transport
+
+`--https-listen ADDR:PORT` adds an `opc.https` endpoint (transport profile
+https-uabinary, Part 6 §7.4), listed by GetEndpoints and CreateSession with
+SecurityPolicy None: TLS (rustls with aws-lc-rs, TLS 1.2 and 1.3) protects
+the messages, with the application certificate and key of the PKI as TLS
+certificate. User tokens are protected as on the unsecured opc.tcp
+endpoint. GetEndpoints filters on the transport profiles a client asks for.
+
+- Each HTTP/1.1 POST carries one binary encoded request (type NodeId and
+  body, no chunk framing) and gets the binary encoded response; keep-alive
+  connections, requests answered in order. A body larger than
+  MaxMessageSize gets 413, a request without Content-Length 411, any other
+  method 405.
+- A TLS connection is a virtual secure channel: a session belongs to the
+  connection that activated it (ActivateSession on another connection moves
+  it, as on opc.tcp).
+- Publish holds its HTTP response until a notification or a keep-alive is
+  due; the connection evaluates its subscriptions meanwhile (clients keep a
+  Publish outstanding, usually on a connection of its own).
+- Cost: a one-value Read round trip on loopback is 41 µs over HTTPS against
+  34 µs over opc.tcp (dev VM, `cargo test --release --test https latency --
+  --ignored --nocapture`). opc.tcp stays the fast path.
+- Not supported: TLS client certificates (X.509 users still work through
+  the X509IdentityToken), chunked request bodies, the JSON encoding.
+
 ## Scope
 
-Implemented: UA TCP (HEL/ACK/ERR, chunking both ways), SecureChannel with
+Implemented: UA TCP (HEL/ACK/ERR, chunking both ways), HTTPS
+(https-uabinary, see [HTTPS transport](#https-transport)), SecureChannel with
 SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep,
 Aes256_Sha256_RsaPss and the six ECC AEAD policies in Sign and SignAndEncrypt
 modes (issue/renew, token

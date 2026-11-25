@@ -371,12 +371,9 @@ fn get_endpoints(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Write
     r.skip_string_array().map_err(decode_err)?;
     let profiles = r.array(4, |r| r.str()).map_err(decode_err)?;
     begin(w, ids::GET_ENDPOINTS_RESPONSE, h);
-    let matches = profiles.is_empty() || profiles.contains(&Some(TRANSPORT_PROFILE_BINARY));
-    if matches {
-        w.raw(ctx.server.endpoints_encoded());
-    } else {
-        w.empty_array();
-    }
+    let tcp = profiles.is_empty() || profiles.contains(&Some(TRANSPORT_PROFILE_BINARY));
+    let https = profiles.is_empty() || profiles.contains(&Some(crate::https::TRANSPORT_PROFILE_HTTPS));
+    ctx.server.write_endpoints(w, tcp, https);
     Ok(())
 }
 
@@ -431,7 +428,7 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
 
     // Part 4 §5.6.2: checks tied to the secure channel.
     let server_signature = if security.policy == Policy::None {
-        if !ctx.server.endpoint_enabled(Policy::None, Mode::None) {
+        if !security.https && !ctx.server.endpoint_enabled(Policy::None, Mode::None) {
             return Err(status::BAD_SECURITY_POLICY_REJECTED);
         }
         None

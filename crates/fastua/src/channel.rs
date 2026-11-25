@@ -38,11 +38,16 @@ pub struct Security {
     /// ECC SecureChannelEnhancements: our signature of the first
     /// OpenSecureChannel response, binding session signatures to the channel.
     pub channel_thumbprint: Option<Arc<[u8]>>,
+    /// A TLS connection of the HTTPS transport (policy None, protected by
+    /// TLS).
+    pub https: bool,
 }
 
 impl Security {
     pub const NONE: Security =
-        Security { policy: Policy::None, mode: Mode::None, client_cert: None, channel_thumbprint: None };
+        Security { policy: Policy::None, mode: Mode::None, client_cert: None, channel_thumbprint: None, https: false };
+    pub const HTTPS: Security =
+        Security { policy: Policy::None, mode: Mode::None, client_cert: None, channel_thumbprint: None, https: true };
 }
 
 /// Symmetric keys of one security token. The RSA keys stay inline (no
@@ -684,7 +689,8 @@ impl<'a> Connection<'a> {
 
         let limits = self.server.limits();
         let lifetime = requested_lifetime.clamp(limits.min_token_lifetime_ms, limits.max_token_lifetime_ms);
-        let security = Security { policy, mode, client_cert: client_cert.clone(), channel_thumbprint: None };
+        let security =
+            Security { policy, mode, client_cert: client_cert.clone(), channel_thumbprint: None, https: false };
         let ch = match (request_type, self.channel.as_mut()) {
             (0, None) => {
                 if channel_id != 0 {

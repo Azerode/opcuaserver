@@ -10,6 +10,7 @@ use crate::server::SECURITY_POLICY_NONE;
 use crate::types::*;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::Arc;
 
 pub struct Client {
     stream: TcpStream,
@@ -28,6 +29,109 @@ pub struct Client {
     /// Ask for an ephemeral ECDH key in the next requests (policy URI).
     ecdh: Option<&'static str>,
     sec: Option<Secure>,
+    /// HTTPS transport (`opc.https`) instead of opc.tcp.
+    https: Option<Box<Https>>,
+}
+
+/// An HTTPS connection: each request is a POST of its binary encoding.
+struct Https {
+    tls: std::io::BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>,
+    host: String,
+    line: String,
+}
+
+/// Accepts exactly one server certificate (the tests pin the server's).
+#[derive(Debug)]
+struct Pinned {
+    cert: Vec<u8>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Pinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if end_entity.as_ref() == self.cert.as_slice() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.provider.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+impl Https {
+    fn post(&mut self, body: &[u8]) -> io::Result<()> {
+        let head = format!(
+            "POST / HTTP/1.1\r\nHost: {}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n\r\n",
+            self.host,
+            body.len()
+        );
+        let s = self.tls.get_mut();
+        s.write_all(head.as_bytes())?;
+        s.write_all(body)?;
+        s.flush()
+    }
+
+    /// Reads one HTTP response into `rx`, after 16 zero bytes standing for
+    /// the security and sequence headers of a MSG chunk.
+    fn read(&mut self, rx: &mut Vec<u8>) -> io::Result<()> {
+        use std::io::BufRead;
+        let mut length = None;
+        let mut status = String::new();
+        loop {
+            self.line.clear();
+            if self.tls.read_line(&mut self.line)? == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            let l = self.line.trim_end();
+            if status.is_empty() {
+                status = l.to_string();
+                continue;
+            }
+            if l.is_empty() {
+                break;
+            }
+            if let Some((n, v)) = l.split_once(':') {
+                if n.eq_ignore_ascii_case("content-length") {
+                    length = v.trim().parse::<usize>().ok();
+                }
+            }
+        }
+        if !status.contains(" 200 ") {
+            return Err(invalid(&format!("HTTP: {status}")));
+        }
+        let n = length.ok_or_else(|| invalid("no Content-Length"))?;
+        rx.clear();
+        rx.resize(16 + n, 0);
+        self.tls.read_exact(&mut rx[16..])
+    }
 }
 
 /// Client side of a secure channel.
@@ -131,6 +235,7 @@ impl Client {
             spin: false,
             ecdh: None,
             sec,
+            https: None,
         };
         let mut w = Writer::new(&mut c.tx);
         w.raw(b"HELF");
@@ -152,7 +257,62 @@ impl Client {
         Ok(c)
     }
 
+    /// Connects over HTTPS (`opc.https`) to `addr`, accepting only the
+    /// server certificate `server_cert` (DER).
+    pub fn connect_https(addr: &str, host: &str, server_cert: &[u8]) -> io::Result<Client> {
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let verifier = Arc::new(Pinned { cert: server_cert.to_vec(), provider: provider.clone() });
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(io::Error::other)?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| invalid("bad host name"))?;
+        let conn = rustls::ClientConnection::new(Arc::new(config), name).map_err(io::Error::other)?;
+        let stream = TcpStream::connect(addr)?;
+        stream.set_nodelay(true)?;
+        let tls = rustls::StreamOwned::new(conn, stream.try_clone()?);
+        Ok(Client {
+            stream,
+            channel_id: 0,
+            token_id: 0,
+            seq: 1,
+            last_rx_seq: 0,
+            request_id: 1,
+            handle: 1,
+            auth_token: NodeId::NULL,
+            tx: Vec::with_capacity(65536),
+            rx: Vec::with_capacity(65536),
+            spin: false,
+            ecdh: None,
+            sec: None,
+            https: Some(Box::new(Https {
+                tls: std::io::BufReader::new(tls),
+                host: host.to_string(),
+                line: String::new(),
+            })),
+        })
+    }
+
+    /// Sends MSG chunks: as they are over opc.tcp, one POST of each body
+    /// over HTTPS.
+    fn transmit(&mut self, tx: &[u8]) -> io::Result<()> {
+        let Some(h) = &mut self.https else { return self.stream.write_all(tx) };
+        let mut at = 0;
+        while at + 24 <= tx.len() {
+            let size = u32::from_le_bytes(tx[at + 4..at + 8].try_into().unwrap()) as usize;
+            h.post(&tx[at + 24..at + size])?;
+            at += size;
+        }
+        Ok(())
+    }
+
     fn read_chunk(&mut self) -> io::Result<([u8; 3], u8)> {
+        if let Some(h) = &mut self.https {
+            h.read(&mut self.rx)?;
+            return Ok((*b"MSG", b'F'));
+        }
         let mut hdr = [0u8; 8];
         if self.spin {
             // Wait for data without sleeping; MSG_PEEK leaves it in the socket.
@@ -412,7 +572,7 @@ impl Client {
         let mut tx = std::mem::take(&mut self.tx);
         tx.clear();
         self.push_request(&mut tx, request_type, body);
-        let r = self.stream.write_all(&tx);
+        let r = self.transmit(&tx);
         self.tx = tx;
         r?;
         self.read_response()
@@ -503,7 +663,7 @@ impl Client {
         for _ in 0..n {
             self.push_request(&mut tx, ids::READ_REQUEST, |w| Self::read_body(w, items));
         }
-        self.stream.write_all(&tx)?;
+        self.transmit(&tx)?;
         (0..n).map(|_| self.parse_read_response()).collect()
     }
 
@@ -675,7 +835,7 @@ impl Client {
         let mut tx = std::mem::take(&mut self.tx);
         tx.clear();
         self.push_request(&mut tx, request_type, body);
-        let r = self.stream.write_all(&tx);
+        let r = self.transmit(&tx);
         self.tx = tx;
         r
     }
@@ -810,7 +970,7 @@ impl Client {
         let mut tx = std::mem::take(&mut self.tx);
         tx.clear();
         self.push_request(&mut tx, ids::READ_REQUEST, |w| Self::read_body(w, items));
-        let r = self.stream.write_all(&tx);
+        let r = self.transmit(&tx);
         self.tx = tx;
         r?;
         self.parse_read_response()

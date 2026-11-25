@@ -15,6 +15,9 @@ const USAGE: &str = "usage: fastua [options]
   --endpoint URL          endpoint URL advertised to clients (default: opc.tcp://<hostname>:<port>)
   --application-uri URI   ApplicationUri of this server (default: urn:<hostname>:fastua)
   --pki DIR               certificate store (default: pki); a self-signed certificate is created if missing
+  --https-listen ADDR:PORT   also serve the HTTPS transport (opc.https, https-uabinary)
+                          with the application certificate as TLS certificate
+  --https-endpoint URL    HTTPS endpoint URL advertised (default: opc.https://<hostname>:<port>)
   --endpoints LIST        comma-separated endpoints to offer (default: all):
                             none, basic256sha256-sign, basic256sha256-encrypt,
                             aes128-sign, aes128-encrypt, aes256-sign, aes256-encrypt,
@@ -99,6 +102,8 @@ fn main() {
     let mut min_sampling: Option<f64> = None;
     let mut event_history = 0usize;
     let mut history_dir: Option<PathBuf> = None;
+    let mut https_listen: Option<String> = None;
+    let mut https_endpoint: Option<String> = None;
 
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("hash-password") {
@@ -147,6 +152,8 @@ fn main() {
                     min_sampling = Some(ms);
                 }
             }
+            "--https-listen" => https_listen = Some(value("--https-listen")),
+            "--https-endpoint" => https_endpoint = Some(value("--https-endpoint")),
             "--history-dir" => history_dir = Some(PathBuf::from(value("--history-dir"))),
             "--event-history" => {
                 let v = value("--event-history");
@@ -219,6 +226,18 @@ fn main() {
     config.busy_poll = busy_poll;
     config.busy_poll_threads = busy_poll_threads;
     config.limits = limits;
+    let https = https_listen.as_ref().map(|addr| {
+        let listener =
+            TcpListener::bind(addr).unwrap_or_else(|e| fail(format!("cannot listen on {addr} (HTTPS): {e}")));
+        let port = addr.rsplit(':').next().unwrap_or("443");
+        let url = https_endpoint.clone().unwrap_or_else(|| format!("opc.https://{hostname}:{port}"));
+        let key = std::fs::read(pki_dir.join("own/private/fastua.pk8"))
+            .unwrap_or_else(|e| fail(format!("cannot read the private key for HTTPS: {e}")));
+        let tls = fastua::https::tls_config(pki.certificate_for(Policy::None), &key)
+            .unwrap_or_else(|e| fail(format!("cannot set up TLS: {e}")));
+        config.https_url = Some(url.clone());
+        (listener, tls, url, addr.clone())
+    });
     if !busy_poll.is_zero() {
         fastua::log!("busy-polling connections for {} us before sleeping", busy_poll.as_micros());
     }
@@ -227,6 +246,12 @@ fn main() {
     }
     fastua::log!("listening on {listen}");
     let server = Server::new(store, config, pki, users);
+    if let Some((listener, tls, url, addr)) = https {
+        fastua::log!("endpoint {url} None None (HTTPS)");
+        fastua::log!("listening on {addr} (HTTPS)");
+        let server = server.clone();
+        std::thread::spawn(move || fastua::https::serve(server, listener, tls));
+    }
     if let Err(e) = server.serve(listener) {
         fail(format!("server stopped: {e}"));
     }

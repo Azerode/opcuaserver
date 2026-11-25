@@ -108,6 +108,9 @@ pub struct ServerConfig {
     /// half the cores). The others sleep in `recv`: spinning on more threads
     /// than free cores steals CPU from the threads doing the work.
     pub busy_poll_threads: usize,
+    /// URL of the HTTPS endpoint (`opc.https://host:port`) when HTTPS is
+    /// served (see [`crate::https`]).
+    pub https_url: Option<String>,
 }
 
 impl ServerConfig {
@@ -128,6 +131,7 @@ impl ServerConfig {
             x509_users: Access::ReadWrite,
             busy_poll: Duration::ZERO,
             busy_poll_threads: 0,
+            https_url: None,
         }
     }
 }
@@ -195,6 +199,9 @@ pub struct Server {
     next_channel: AtomicU32,
     /// GetEndpoints / CreateSession answer, encoded once (array included).
     endpoints_encoded: Vec<u8>,
+    /// Offset of the HTTPS endpoint in `endpoints_encoded` (it comes last;
+    /// the length when there is none).
+    https_at: usize,
     /// FindServers answer, encoded once (array of one ApplicationDescription).
     application_encoded: Vec<u8>,
     next_subscription: AtomicU32,
@@ -308,12 +315,25 @@ impl Server {
             }
             _ => true,
         });
+        // (url, policy, mode, transport profile)
+        let mut offered: Vec<(&str, Policy, Mode, &str)> = config
+            .endpoints
+            .iter()
+            .map(|&(p, m)| (config.endpoint_url.as_str(), p, m, TRANSPORT_PROFILE_BINARY))
+            .collect();
+        if let Some(url) = &config.https_url {
+            offered.push((url, Policy::None, Mode::None, crate::https::TRANSPORT_PROFILE_HTTPS));
+        }
         let mut endpoints_encoded = Vec::new();
+        let mut https_at = None;
         {
             let mut w = Writer::new(&mut endpoints_encoded);
-            w.i32(config.endpoints.len() as i32);
-            for &(policy, mode) in &config.endpoints {
-                w.string(&config.endpoint_url);
+            w.i32(offered.len() as i32);
+            for &(url, policy, mode, profile) in &offered {
+                if profile != TRANSPORT_PROFILE_BINARY {
+                    https_at = Some(w.len());
+                }
+                w.string(url);
                 write_application_description(&mut w, &info, &config.endpoint_url);
                 w.bytes(Some(pki.certificate_for(policy)));
                 w.i32(mode as i32);
@@ -338,10 +358,11 @@ impl Server {
                     w.str(None);
                     w.str(sec);
                 }
-                w.string(TRANSPORT_PROFILE_BINARY);
+                w.string(profile);
                 w.u8(policy.security_level(mode));
             }
         }
+        let https_at = https_at.unwrap_or(endpoints_encoded.len());
         let mut application_encoded = Vec::new();
         {
             let mut w = Writer::new(&mut application_encoded);
@@ -361,6 +382,7 @@ impl Server {
             spin_limit: AtomicUsize::new(spin_cap),
             spin_cap,
             endpoints_encoded,
+            https_at,
             application_encoded,
             next_subscription: AtomicU32::new(1),
             orphans: Mutex::new(Vec::new()),
@@ -394,6 +416,25 @@ impl Server {
 
     pub fn endpoints_encoded(&self) -> &[u8] {
         &self.endpoints_encoded
+    }
+
+    /// Writes the endpoints (array included) with the given transports.
+    pub fn write_endpoints(&self, w: &mut Writer, tcp: bool, https: bool) {
+        let all = &self.endpoints_encoded;
+        let n = i32::from_le_bytes(all[..4].try_into().unwrap());
+        let has_https = self.https_at < all.len();
+        match (tcp, https && has_https) {
+            (true, true) => w.raw(all),
+            (true, false) => {
+                w.i32(n - has_https as i32);
+                w.raw(&all[4..self.https_at]);
+            }
+            (false, true) => {
+                w.i32(1);
+                w.raw(&all[self.https_at..]);
+            }
+            (false, false) => w.empty_array(),
+        }
     }
 
     pub fn application_encoded(&self) -> &[u8] {
