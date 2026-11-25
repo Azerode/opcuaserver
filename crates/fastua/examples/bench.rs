@@ -195,6 +195,7 @@ fn main() {
 
     // ---- 4. subscriptions
     subscription_engine(&store);
+    event_engine(&store);
     let fast_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let fast_addr = fast_listener.local_addr().unwrap().to_string();
     {
@@ -277,6 +278,76 @@ fn subscription_engine(store: &Store) {
         }
         println!("subscription   {label:<34} {:>6.2} ns/item", best as f64 / n as f64);
     }
+}
+
+/// Server event -> EventFieldList: emit, where clause, select clauses and
+/// encoding, per event (batches of 1000 between two publishes).
+fn event_engine(store: &Store) {
+    use fastua::events::{types::*, Event, LITERAL_OPERAND, SIMPLE_ATTRIBUTE_OPERAND};
+    use fastua::server::Limits;
+    use fastua::subscription::{ItemParams, PublishRequest, SessionSubs, SubParams, Subscription};
+    let space = store.load_full();
+    let l = Limits::default();
+    // Select EventId, EventType, SourceName, Time, Message, Severity where Severity >= 100.
+    let mut body = Vec::new();
+    let mut w = Writer::new(&mut body);
+    let field = |w: &mut Writer, name: &str| {
+        w.node_id(&NodeId::ns0(BASE_EVENT_TYPE));
+        w.i32(1);
+        w.qualified_name(&QualifiedName { ns: 0, name: name.into() });
+        w.u32(13);
+        w.str(None);
+    };
+    let fields = ["EventId", "EventType", "SourceName", "Time", "Message", "Severity"];
+    w.i32(fields.len() as i32);
+    for f in fields {
+        field(&mut w, f);
+    }
+    w.i32(1);
+    w.u32(4); // GreaterThanOrEqual
+    w.i32(2);
+    let at = w.begin_extension_object(SIMPLE_ATTRIBUTE_OPERAND);
+    field(&mut w, "Severity");
+    w.end_extension_object(at);
+    let at = w.begin_extension_object(LITERAL_OPERAND);
+    w.variant(&Variant::UInt16(100));
+    w.end_extension_object(at);
+    let (filter, _) = fastua::events::parse_filter(&body).unwrap();
+    let mut st = SessionSubs::default();
+    let mut sub = Subscription::new(1, SubParams::revise(&l, 1.0, 1_000_000, 10, 0, 0), true, 0);
+    let p = ItemParams {
+        client_handle: 1,
+        sampling_ms: 0.0,
+        filter: Default::default(),
+        percent_deadband: false,
+        filter_present: true,
+        queue_size: 10_000,
+        discard_oldest: true,
+    };
+    sub.create_event_item(&l, &space, NodeId::ns0(2253), 2, &p, filter).unwrap();
+    st.subs.push(sub);
+    let n = 1000;
+    let mut out = Vec::with_capacity(1 << 20);
+    let mut best = u64::MAX;
+    let mut now = 0;
+    for _ in 0..50 {
+        let t = Instant::now();
+        for i in 0..n {
+            let ev = Event::new(BASE_MODEL_CHANGE_EVENT_TYPE, NodeId::ns0(2253), "Server", "reloaded", 100 + i as u16);
+            space.events.emit(ev);
+        }
+        let acks = st.ack_buffer();
+        let _ = st.queue(&l, PublishRequest { request_id: 1, channel_id: 1, handle: 1, deadline: u64::MAX, acks });
+        now += 1_000_000;
+        st.tick(now, &space);
+        out.clear();
+        st.write_next(&l, now, 1, 64 << 20, &mut Writer::new(&mut out));
+        best = best.min(t.elapsed().as_nanos() as u64);
+        assert!(out.len() > n * 50);
+        let seq = st.subs[0].sequence().wrapping_sub(1);
+        st.acknowledge(1, seq);
+    }
+    println!("events         {:<34} {:>6.0} ns/event", "emit -> EventFieldList (6 fields)", best as f64 / n as f64);
 }
 
 /// Time from a Write by one client to the DataChangeNotification received by

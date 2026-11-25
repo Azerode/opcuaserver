@@ -764,17 +764,17 @@ impl MonitorSpec {
             for o in operands {
                 let x = match o {
                     FilterOperand::Element(i) => {
-                        let x = w.begin_extension_object(592);
+                        let x = w.begin_extension_object(crate::events::ELEMENT_OPERAND);
                         w.u32(*i);
                         x
                     }
                     FilterOperand::Literal(v) => {
-                        let x = w.begin_extension_object(595);
+                        let x = w.begin_extension_object(crate::events::LITERAL_OPERAND);
                         w.variant(v);
                         x
                     }
                     FilterOperand::Field(name) => {
-                        let x = w.begin_extension_object(601);
+                        let x = w.begin_extension_object(crate::events::SIMPLE_ATTRIBUTE_OPERAND);
                         write_simple_operand(w, name);
                         x
                     }

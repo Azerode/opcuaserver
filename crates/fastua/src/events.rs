@@ -304,10 +304,11 @@ use codes::*;
 
 pub const EVENT_FILTER_RESULT_ENCODING: u32 = 736;
 pub const EVENT_NOTIFICATION_LIST_ENCODING: u32 = 916;
-const ELEMENT_OPERAND: u32 = 592;
-const LITERAL_OPERAND: u32 = 595;
-const ATTRIBUTE_OPERAND: u32 = 598;
-const SIMPLE_ATTRIBUTE_OPERAND: u32 = 601;
+/// Binary encodings of the FilterOperand subtypes.
+pub const ELEMENT_OPERAND: u32 = 594;
+pub const LITERAL_OPERAND: u32 = 597;
+pub const ATTRIBUTE_OPERAND: u32 = 600;
+pub const SIMPLE_ATTRIBUTE_OPERAND: u32 = 603;
 
 /// Filter operators (Part 4 §7.7.3).
 mod op {

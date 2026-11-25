@@ -172,11 +172,72 @@ async def main(work, cfg):
     path = f"{cfg}/Machine/Machine.json"
     d = json.load(open(path))
     d["Subscriptions"][0]["Items"].append({"Name": "NEW", "NodeId": "s=New", "Type": "Double"})
+    d["Subscriptions"][0]["Items"].append(
+        {"Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": {"Low": 0, "High": 200}})
+
+    # Events: the reload raises a model change event, sessions raise audit events.
+    class Events:
+        def __init__(self):
+            self.events = []
+
+        def event_notification(self, event):
+            self.events.append(event)
+
+    he = Events()
+    sub3 = await c.create_subscription(10, he)
+    await sub3.subscribe_events(c.nodes.server, ua.ObjectIds.BaseEventType)
+    hc = Events()
+    sub4 = await c.create_subscription(10, hc)
+    await sub4.subscribe_events(c.nodes.server, ua.ObjectIds.AuditCreateSessionEventType)
+
     json.dump(d, open(path, "w"))
     await asyncio.sleep(0.5)
     dt = await c.get_node(ua.NodeId("New", 2)).read_data_type()
     check("hot reload visible", dt == ua.NodeId(11, 0))
     check("value kept across reload", await c.get_node(machine).read_value() == 7)
+    other = await session(work)
+    await other.disconnect()
+    await asyncio.sleep(0.3)
+    names = [str(e.SourceName) for e in he.events]
+    check("events: reload and session audit", "Server" in names and "Session/CreateSession" in names
+          and "Session/CloseSession" in names, str(names))
+    created = [e for e in hc.events]
+    check("events: where clause (OfType)", len(created) == 1 and created[0].SourceName == "Session/CreateSession"
+          and created[0].RevisedSessionTimeout > 0, str([str(e.SourceName) for e in created]))
+    await sub4.delete()
+    await sub3.delete()
+
+    # Percent deadband on an AnalogItem (EURange 0..200: 10 % = 20).
+    level = c.get_node(ua.NodeId("Level", 2))
+    rng = await (await level.get_child("0:EURange")).read_value()
+    check("EURange property", rng.Low == 0 and rng.High == 200, str(rng))
+    hp = Handler()
+    sub5 = await c.create_subscription(10, hp)
+    await sub5.deadband_monitor(level, 10, 2)
+    await asyncio.sleep(0.2)
+    for v in (5.0, 15.0, 30.0, 45.0, 51.0):
+        await level.write_value(ua.DataValue(ua.Variant(v, ua.VariantType.Double)))
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(0.2)
+    seen = [v for n, v in hp.values]
+    check("percent deadband", seen[-3:] == [5.0, 30.0, 51.0] and 15.0 not in seen, str(seen))
+
+    # Methods: GetMonitoredItems.
+    out = await c.nodes.server.call_method("0:GetMonitoredItems", ua.Variant(sub5.subscription_id, ua.VariantType.UInt32))
+    check("GetMonitoredItems", len(out) == 2 and len(out[0]) == 1 and len(out[1]) == 1, str(out))
+    await sub5.delete()
+
+    # ServerCapabilities and index ranges.
+    limit = await c.get_node(ua.ObjectIds.Server_ServerCapabilities_OperationLimits_MaxNodesPerRead).read_value()
+    check("ServerCapabilities", limit > 0, str(limit))
+    rv = ua.ReadValueId()
+    rv.NodeId = ua.NodeId(ua.ObjectIds.Server_NamespaceArray)
+    rv.AttributeId = ua.AttributeIds.Value
+    rv.IndexRange = "2"
+    params = ua.ReadParameters()
+    params.NodesToRead = [rv]
+    res = await c.uaclient.read(params)
+    check("index range read", res[0].Value.Value == ["Machine1"], str(res[0].Value))
     await c.disconnect()
 
 
