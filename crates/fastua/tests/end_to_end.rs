@@ -194,3 +194,33 @@ fn pipelined_requests_and_busy_poll() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// Mutual certificate authentication on every policy and mode: session,
+/// read, write and a multi-chunk response, through the test client's own
+/// implementation of the secure channel.
+#[test]
+fn secure_channels_end_to_end() {
+    use fastua::crypto::{Mode, Policy};
+    let dir = temp_config("secure", MACHINE);
+    let addr = start(&dir, Limits::default());
+    let (cert, key) = fastua::pki::generate_self_signed("urn:fastua:test-client", "localhost").unwrap();
+    let trusted = dir.join("pki/trusted/certs");
+    std::fs::create_dir_all(&trusted).unwrap();
+    std::fs::write(trusted.join("client.der"), &cert).unwrap();
+    let server_cert = std::fs::read(dir.join("pki/own/certs/fastua.der")).unwrap();
+    let url = format!("opc.tcp://{addr}");
+    for policy in Policy::SECURE {
+        for mode in [Mode::Sign, Mode::SignAndEncrypt] {
+            let mut c = Client::connect_secure(&addr, &url, policy, mode, &cert, &key, &server_cert).unwrap();
+            c.create_session("secure").unwrap();
+            let id = NodeId::Numeric(2, 2);
+            assert_eq!(c.write(&[(id.clone(), Variant::Int32(7))]).unwrap(), vec![status::GOOD], "{policy:?} {mode:?}");
+            assert_eq!(c.read(&[(id.clone(), 13)]).unwrap()[0].value, Some(Variant::Int32(7)));
+            let many = vec![(id.clone(), 13); 3000];
+            assert_eq!(c.read(&many).unwrap().len(), 3000, "multi-chunk {policy:?} {mode:?}");
+            let all = c.read_pipelined(&[(id, 13)], 20).unwrap();
+            assert_eq!(all.len(), 20);
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

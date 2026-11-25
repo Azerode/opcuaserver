@@ -726,7 +726,7 @@ impl<'a> Connection<'a> {
 
 /// Validates and removes `PaddingSize | Padding | [ExtraPaddingSize]` at the
 /// end of `data`; returns the length of what precedes the padding.
-fn strip_padding(data: &[u8], extra: bool) -> Option<usize> {
+pub(crate) fn strip_padding(data: &[u8], extra: bool) -> Option<usize> {
     let n = data.len();
     let tail = extra as usize;
     if n < 1 + tail {
