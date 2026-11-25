@@ -33,9 +33,14 @@ pub const UPDATE_REPLACE: u32 = 2;
 pub const UPDATE_UPDATE: u32 = 3;
 pub const UPDATE_DELETE: u32 = 4;
 
-/// Historian bits of a StatusCode's info bits (Part 11 §5.3.4).
-pub const INTERPOLATED: u32 = 0x02;
-pub const CALCULATED: u32 = 0x01;
+/// Historian bits of a StatusCode (Part 4 §7.39.1, Part 11 §6.3.6), with
+/// the InfoType set to DataValue (0x0400) so that clients read them.
+pub const INFO_DATA_VALUE: u32 = 0x0400;
+pub const CALCULATED: u32 = INFO_DATA_VALUE | 0x01;
+pub const INTERPOLATED: u32 = INFO_DATA_VALUE | 0x02;
+pub const PARTIAL: u32 = INFO_DATA_VALUE | 0x04;
+pub const EXTRA_DATA: u32 = INFO_DATA_VALUE | 0x08;
+pub const MULTI_VALUE: u32 = INFO_DATA_VALUE | 0x10;
 
 /// A change made by HistoryUpdate (HistoryModifiedData).
 #[derive(Clone, Debug, PartialEq)]

@@ -219,7 +219,7 @@ fn update_delete_paging_and_at_time() {
     let r = c.history_read(ids::READ_AT_TIME_DETAILS_ENCODING, &at, 0, false, &[(TEMP, None)]).unwrap().unwrap();
     let v = &r[0].values;
     assert_eq!(v[0].value, Some(Variant::Double(4.0)));
-    assert_eq!((v[1].value.clone(), v[1].status), (Some(Variant::Double(4.5)), Some(0x02)));
+    assert_eq!((v[1].value.clone(), v[1].status), (Some(Variant::Double(4.5)), Some(0x0402)));
     assert_eq!(v[2].status, Some(status::BAD_NO_DATA));
 
     // Delete a range and single times.
