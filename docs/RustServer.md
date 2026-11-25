@@ -238,13 +238,15 @@ SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep and
 Aes256_Sha256_RsaPss in Sign and SignAndEncrypt modes (issue/renew, token
 lifetime, sequence checks), PKI with CRLs, sessions with anonymous, user name
 and X.509 identities, per-user read/write rights, GetEndpoints, FindServers,
-Read (with index ranges on arrays, Strings and ByteStrings), Write, Browse,
+Read (with index ranges on arrays, Strings and ByteStrings), Write (with
+index ranges on String and ByteString variables: the new value must have
+exactly the selected number of elements), Browse,
 BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes/UnregisterNodes,
 Cancel, Call, ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities
 with OperationLimits, every Subscription and MonitoredItem service (see
-[Subscriptions](#subscriptions)) and events with session audit (see
+[Subscriptions](#subscriptions), MonitoredItems accept an index range: only
+those elements are compared and reported, through the Variant path) and events with session audit (see
 [Events](#events)).
 
-Not yet: the full namespace 0 nodeset, conditions and alarms, index ranges on
-MonitoredItems and in writes (`BadWriteNotSupported`), history, aggregates,
+Not yet: the full namespace 0 nodeset, conditions and alarms, history, aggregates,
 ECC policies.

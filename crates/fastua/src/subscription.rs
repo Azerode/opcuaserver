@@ -254,6 +254,8 @@ struct Cold {
     links: Vec<u32>,
     /// Percent deadband (0 = none), recomputed when the EURange changes.
     percent: f64,
+    /// NumericRange of the reported value (`None` = whole value).
+    range: Option<(usize, usize)>,
 }
 
 pub struct Item {
@@ -379,7 +381,13 @@ impl Item {
     }
 
     /// Variable-length / generated values: compare and queue.
-    fn offer(&mut self, v: Variant, st: u32, src: i64, srv: i64) -> bool {
+    fn offer(&mut self, mut v: Variant, mut st: u32, src: i64, srv: i64) -> bool {
+        if let Some(range) = self.cold.range {
+            match crate::services::apply_range(&v, range) {
+                Ok(x) => v = x,
+                Err(code) => (v, st) = (Variant::Empty, code),
+            }
+        }
         if self.sampled {
             let same_status = st == self.last_status;
             let changed = match self.filter.trigger {
@@ -901,13 +909,39 @@ impl Subscription {
         can_write: bool,
         now: u64,
     ) -> Result<(u32, f64, u32), u32> {
+        self.create_item_range(l, space, node, attribute, None, mode, ts, p, can_write, now)
+    }
+
+    /// [`Self::create_item`] with a NumericRange: only those elements of the
+    /// value are compared and reported.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_item_range(
+        &mut self,
+        l: &Limits,
+        space: &AddressSpace,
+        node: NodeId,
+        attribute: u32,
+        range: Option<(usize, usize)>,
+        mode: u32,
+        ts: (bool, bool),
+        p: &ItemParams,
+        can_write: bool,
+        now: u64,
+    ) -> Result<(u32, f64, u32), u32> {
         if mode > MODE_REPORTING {
             return Err(BAD_MONITORING_MODE_INVALID);
         }
         if self.item_count() >= l.max_monitored_items_per_subscription {
             return Err(BAD_TOO_MANY_MONITORED_ITEMS);
         }
-        let (source, kind, size) = resolve(space, &node, attribute, can_write)?;
+        let (source, kind, mut size) = resolve(space, &node, attribute, can_write)?;
+        if range.is_some() {
+            if p.filter.deadband != 0.0 {
+                // Deadbands on ranges apply per element: arrays only.
+                return Err(BAD_FILTER_NOT_ALLOWED);
+            }
+            size = 0; // ranged values take the Variant path
+        }
         let filter = Self::check_filter(space, &node, attribute, kind, &source, p)?;
         let percent = if p.percent_deadband { p.filter.deadband } else { 0.0 };
         let (sampling_ms, queue_size) = Self::revise_item(l, self.params.interval_ms, p);
@@ -918,7 +952,7 @@ impl Subscription {
             id,
             client_handle: p.client_handle,
             mode,
-            cold: Box::new(Cold { node, attribute, can_write, last_var: None, links: Vec::new(), percent }),
+            cold: Box::new(Cold { node, attribute, can_write, last_var: None, links: Vec::new(), percent, range }),
             linked: false,
             source,
             kind,
@@ -972,6 +1006,9 @@ impl Subscription {
     ) -> Result<(f64, u32), u32> {
         let slot = self.slot(id).ok_or(BAD_MONITORED_ITEM_ID_INVALID)?;
         let it = self.items[slot as usize].as_ref().ok_or(BAD_MONITORED_ITEM_ID_INVALID)?;
+        if it.cold.range.is_some() && p.filter.deadband != 0.0 {
+            return Err(BAD_FILTER_NOT_ALLOWED);
+        }
         let filter = Self::check_filter(space, &it.cold.node, it.cold.attribute, it.kind, &it.source, p)?;
         let (sampling_ms, queue_size) = Self::revise_item(l, self.params.interval_ms, p);
         let old_group = it.group;
@@ -1153,7 +1190,7 @@ impl Subscription {
                     if !same {
                         it.source = src;
                         it.kind = kind;
-                        it.size = size;
+                        it.size = if it.cold.range.is_some() { 0 } else { size };
                         // Compare with the last reported value on the next sample.
                         it.last_seq = it.last_seq.wrapping_add(1);
                         if !matches!(it.source, Source::Cell(_)) {
@@ -1730,6 +1767,7 @@ mod tests {
                 last_var: None,
                 links: Vec::new(),
                 percent: 0.0,
+                range: None,
             }),
             linked: false,
             source: Source::Gone,

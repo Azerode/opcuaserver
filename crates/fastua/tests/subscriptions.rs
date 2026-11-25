@@ -495,3 +495,58 @@ fn methods_cancel_index_ranges_and_capabilities() {
     assert!(matches!(&v[1].value, Some(Variant::Array(_))));
     assert_eq!(v[2].value, Some(Variant::string("fastua")));
 }
+
+#[test]
+fn index_ranges_on_write_and_monitored_items() {
+    let (addr, _dir) = start("ranges");
+    let mut c = client(&addr);
+    let label = NodeId::String(2, "Label".into());
+    c.write(&[(label.clone(), Variant::string("Hello"))]).unwrap();
+
+    // Partial writes.
+    let r = c
+        .write_ranges(&[
+            (label.clone(), Some("1:2"), Variant::string("ip")),
+            (label.clone(), Some("1:2"), Variant::string("x")),
+            (label.clone(), Some("4:6"), Variant::string("abc")),
+            (label.clone(), Some("2:1"), Variant::string("ab")),
+            (SPEED, Some("0"), Variant::Double(1.0)),
+            (label.clone(), Some("0"), Variant::Int32(1)),
+        ])
+        .unwrap();
+    assert_eq!(
+        r,
+        vec![
+            status::GOOD,
+            status::BAD_INDEX_RANGE_INVALID,
+            status::BAD_INDEX_RANGE_NO_DATA,
+            status::BAD_INDEX_RANGE_INVALID,
+            status::BAD_INDEX_RANGE_NO_DATA,
+            status::BAD_TYPE_MISMATCH,
+        ]
+    );
+    assert_eq!(c.read(&[(label.clone(), 13)]).unwrap()[0].value, Some(Variant::string("Hiplo")));
+
+    // Monitored ranges: only changes inside the range are reported.
+    let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
+    let spec = |range: &str, handle| MonitorSpec {
+        index_range: Some(range.into()),
+        ..MonitorSpec::value(label.clone(), handle)
+    };
+    let r = c.monitor(sub, &[spec("0:1", 1), spec("9", 2), spec("x", 3), spec("0,1", 4)]).unwrap();
+    let codes: Vec<u32> = r.iter().map(|x| x.0).collect();
+    assert_eq!(codes, vec![status::GOOD, status::GOOD, status::BAD_INDEX_RANGE_INVALID, status::GOOD]);
+    let first = next_data(&mut c, &[]);
+    let by = |p: &Publish, h: u32| p.message.data.iter().find(|(x, _)| *x == h).map(|(_, v)| v.clone());
+    assert_eq!(by(&first, 1).unwrap().value, Some(Variant::string("Hi")));
+    assert_eq!(by(&first, 2).unwrap().status, Some(status::BAD_INDEX_RANGE_NO_DATA));
+    assert_eq!(by(&first, 4).unwrap().status, Some(status::BAD_INDEX_RANGE_NO_DATA));
+
+    // Outside the range: nothing for handle 1. Inside: reported.
+    c.write_ranges(&[(label.clone(), Some("3"), Variant::string("e"))]).unwrap();
+    c.write_ranges(&[(label.clone(), Some("1"), Variant::string("a"))]).unwrap();
+    let next = next_data(&mut c, &[(sub, first.message.seq)]);
+    assert_eq!(by(&next, 1).unwrap().value, Some(Variant::string("Ha")));
+    assert!(next.message.data.iter().filter(|(h, _)| *h == 1).count() == 1);
+    assert!(by(&next, 2).is_none());
+}

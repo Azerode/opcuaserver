@@ -697,7 +697,7 @@ fn write_attribute(w: &mut Writer, space: &AddressSpace, node: &Node, attribute:
 pub fn parse_range(s: &str) -> Result<(usize, usize), bool> {
     if s.contains(',') {
         let valid = s.split(',').all(|d| parse_range(d).is_ok());
-        return Err(valid);
+        return Err(!valid);
     }
     let num = |x: &str| -> Result<usize, bool> {
         if x.is_empty() || !x.bytes().all(|b| b.is_ascii_digit()) {
@@ -734,6 +734,51 @@ pub fn apply_range(v: &Variant, (lo, hi): (usize, usize)) -> Result<Variant, u32
         Variant::ByteString(Some(b)) => Variant::ByteString(Some(b[span(b.len())?].into())),
         _ => return Err(no_data),
     })
+}
+
+/// Write with an index range: replaces the elements `lo..=hi` of a String
+/// or ByteString cell (configured variables are scalars, so these are the
+/// only values with elements). Rare: kept off the hot path.
+#[cold]
+fn write_range(cell: &ValueCell, range: &str, dv: &DataValue, now: i64) -> Result<(), u32> {
+    let (lo, hi) = match parse_range(range) {
+        Ok(r) => r,
+        Err(true) => return Err(status::BAD_INDEX_RANGE_INVALID),
+        Err(false) => return Err(status::BAD_INDEX_RANGE_NO_DATA),
+    };
+    let cur = cell.read().value;
+    let new = dv.value.as_ref().ok_or(status::BAD_TYPE_MISMATCH)?;
+    let value = splice_range(&cur, (lo, hi), new)?;
+    cell.write(&value, dv.status.unwrap_or(status::GOOD), dv.source_timestamp.unwrap_or(now), now);
+    Ok(())
+}
+
+/// `cur` with its elements `lo..=hi` replaced by those of `new`, which must
+/// have exactly that many (Part 4 §5.10.4).
+pub fn splice_range(cur: &Variant, (lo, hi): (usize, usize), new: &Variant) -> Result<Variant, u32> {
+    fn splice<T: Clone>(cur: &[T], lo: usize, hi: usize, new: &[T]) -> Result<Vec<T>, u32> {
+        if hi >= cur.len() {
+            return Err(status::BAD_INDEX_RANGE_NO_DATA);
+        }
+        if new.len() != hi - lo + 1 {
+            return Err(status::BAD_INDEX_RANGE_INVALID);
+        }
+        let mut out = cur.to_vec();
+        out[lo..=hi].clone_from_slice(new);
+        Ok(out)
+    }
+    match (cur, new) {
+        (Variant::String(Some(c)), Variant::String(Some(n))) => {
+            let c: Vec<char> = c.chars().collect();
+            let n: Vec<char> = n.chars().collect();
+            Ok(Variant::String(Some(splice(&c, lo, hi, &n)?.into_iter().collect::<String>().into())))
+        }
+        (Variant::ByteString(Some(c)), Variant::ByteString(Some(n))) => {
+            Ok(Variant::ByteString(Some(splice(c, lo, hi, n)?.into())))
+        }
+        (Variant::String(_) | Variant::ByteString(_), _) => Err(status::BAD_TYPE_MISMATCH),
+        _ => Err(status::BAD_INDEX_RANGE_NO_DATA),
+    }
 }
 
 /// Read with an index range (rare: kept off the hot path).
@@ -919,18 +964,14 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
             if !can_write {
                 return Err(status::BAD_USER_ACCESS_DENIED);
             }
-            if let Some(range) = range.filter(|s| !s.is_empty()) {
-                // Partial writes of the (scalar) configured variables.
-                return Err(match parse_range(range) {
-                    Err(true) => status::BAD_INDEX_RANGE_INVALID,
-                    _ => status::BAD_WRITE_NOT_SUPPORTED,
-                });
-            }
             let ValueSource::Cell(cell) = value else {
                 return Err(status::BAD_NOT_WRITABLE);
             };
             if dv.server_timestamp.is_some() {
                 return Err(status::BAD_WRITE_NOT_SUPPORTED);
+            }
+            if let Some(range) = range.filter(|s| !s.is_empty()) {
+                return write_range(cell, range, &dv, now);
             }
             let v = dv.value.as_ref().ok_or(status::BAD_TYPE_MISMATCH)?;
             if matches!(v, Variant::Array(_)) || v.type_id() != cell.kind() {

@@ -335,9 +335,13 @@ pub(super) fn create_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
                 }
                 return sub.create_event_item(l, space, node, mode, &p, filter).map(|(id, q)| (id, 0.0, q));
             }
-            if range.is_some_and(|x| !x.is_empty()) {
-                return Err(status::BAD_INDEX_RANGE_INVALID);
-            }
+            let range = match range.filter(|x| !x.is_empty()).map(crate::services::parse_range) {
+                None => None,
+                Some(Ok(r)) => Some(r),
+                Some(Err(true)) => return Err(status::BAD_INDEX_RANGE_INVALID),
+                // More dimensions than the (one-dimensional) values have.
+                Some(Err(false)) => Some((usize::MAX, usize::MAX)),
+            };
             if enc_name.is_some_and(|x| !x.is_empty()) {
                 return Err(if attribute == attr::VALUE {
                     status::BAD_DATA_ENCODING_UNSUPPORTED
@@ -345,7 +349,7 @@ pub(super) fn create_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
                     status::BAD_DATA_ENCODING_INVALID
                 });
             }
-            sub.create_item(l, space, node, attribute, mode, ts, &p, can_write, now)
+            sub.create_item_range(l, space, node, attribute, range, mode, ts, &p, can_write, now)
         });
         match result {
             Ok((id, sampling, queue)) => {
