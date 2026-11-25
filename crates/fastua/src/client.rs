@@ -450,6 +450,126 @@ impl Client {
         Ok(())
     }
 
+    /// Sends a request without waiting for its response (see [`Client::receive`]).
+    pub fn send(&mut self, request_type: u32, body: impl FnOnce(&mut Writer)) -> io::Result<()> {
+        let mut tx = std::mem::take(&mut self.tx);
+        tx.clear();
+        self.push_request(&mut tx, request_type, body);
+        let r = self.stream.write_all(&tx);
+        self.tx = tx;
+        r
+    }
+
+    /// Next response: (type id, body starting with the response header).
+    pub fn receive(&mut self) -> io::Result<(u32, &[u8])> {
+        self.read_response()
+    }
+
+    /// CreateSubscription: (id, revised interval, lifetime, keep-alive).
+    pub fn create_subscription(
+        &mut self,
+        interval_ms: f64,
+        lifetime: u32,
+        keepalive: u32,
+    ) -> io::Result<(u32, f64, u32, u32)> {
+        let (ty, body) = self.call(ids::CREATE_SUBSCRIPTION_REQUEST, |w| {
+            w.f64(interval_ms);
+            w.u32(lifetime);
+            w.u32(keepalive);
+            w.u32(0);
+            w.bool(true);
+            w.u8(0);
+        })?;
+        if ty != ids::CREATE_SUBSCRIPTION_RESPONSE {
+            return Err(invalid(&format!("CreateSubscription failed: {:08X}", service_result(body))));
+        }
+        let mut r = Reader::new(body);
+        let bad = |_| invalid("bad CreateSubscription response");
+        skip_response_header(&mut r).map_err(bad)?;
+        Ok((r.u32().map_err(bad)?, r.f64().map_err(bad)?, r.u32().map_err(bad)?, r.u32().map_err(bad)?))
+    }
+
+    /// CreateMonitoredItems on Value attributes in Reporting mode, source and
+    /// server timestamps. Returns (status, item id, revised sampling, revised queue).
+    pub fn monitor(&mut self, sub: u32, items: &[MonitorSpec]) -> io::Result<Vec<(u32, u32, f64, u32)>> {
+        let (ty, body) = self.call(ids::CREATE_MONITORED_ITEMS_REQUEST, |w| {
+            w.u32(sub);
+            w.u32(2);
+            w.i32(items.len() as i32);
+            for it in items {
+                w.node_id(&it.node);
+                w.u32(it.attribute);
+                w.str(None);
+                w.u16(0);
+                w.str(None);
+                w.u32(it.mode);
+                w.u32(it.handle);
+                w.f64(it.sampling_ms);
+                match it.filter {
+                    None => w.null_extension_object(),
+                    Some((trigger, db_type, db)) => {
+                        let at = w.begin_extension_object(ids::DATA_CHANGE_FILTER_ENCODING);
+                        w.u32(trigger);
+                        w.u32(db_type);
+                        w.f64(db);
+                        w.end_extension_object(at);
+                    }
+                }
+                w.u32(it.queue_size);
+                w.bool(it.discard_oldest);
+            }
+        })?;
+        if ty != ids::CREATE_MONITORED_ITEMS_RESPONSE {
+            return Err(invalid(&format!("CreateMonitoredItems failed: {:08X}", service_result(body))));
+        }
+        let mut r = Reader::new(body);
+        let bad = |_| invalid("bad CreateMonitoredItems response");
+        skip_response_header(&mut r).map_err(bad)?;
+        r.array(1, |r| {
+            let v = (r.u32()?, r.u32()?, r.f64()?, r.u32()?);
+            r.extension_object_raw()?;
+            Ok(v)
+        })
+        .map_err(bad)
+    }
+
+    /// Sends a Publish request (acknowledging `acks`) without waiting.
+    pub fn send_publish(&mut self, acks: &[(u32, u32)]) -> io::Result<()> {
+        self.send(ids::PUBLISH_REQUEST, |w| {
+            w.i32(acks.len() as i32);
+            for (s, q) in acks {
+                w.u32(*s);
+                w.u32(*q);
+            }
+        })
+    }
+
+    /// Reads the next response as a PublishResponse.
+    pub fn receive_publish(&mut self) -> io::Result<Publish> {
+        let (ty, body) = self.read_response()?;
+        parse_publish(ty, body)
+    }
+
+    /// Publish and wait for the answer.
+    pub fn publish(&mut self, acks: &[(u32, u32)]) -> io::Result<Publish> {
+        self.send_publish(acks)?;
+        self.receive_publish()
+    }
+
+    /// Republish: the NotificationMessage, or the service fault code.
+    pub fn republish(&mut self, sub: u32, seq: u32) -> io::Result<Result<Message, u32>> {
+        let (ty, body) = self.call(ids::REPUBLISH_REQUEST, |w| {
+            w.u32(sub);
+            w.u32(seq);
+        })?;
+        if ty != ids::REPUBLISH_RESPONSE {
+            return Ok(Err(service_result(body)));
+        }
+        let mut r = Reader::new(body);
+        skip_response_header(&mut r).map_err(|_| invalid("bad header"))?;
+        parse_message(&mut r).map(Ok).map_err(|_| invalid("bad NotificationMessage"))
+    }
+
     /// Reads attributes; returns one DataValue per (node, attribute).
     pub fn read(&mut self, items: &[(NodeId, u32)]) -> io::Result<Vec<DataValue>> {
         let mut tx = std::mem::take(&mut self.tx);
@@ -561,4 +681,95 @@ pub fn service_result(body: &[u8]) -> u32 {
     let _ = r.i64();
     let _ = r.u32();
     r.u32().unwrap_or(0)
+}
+
+/// A monitored item to create (see [`Client::monitor`]).
+#[derive(Clone, Debug)]
+pub struct MonitorSpec {
+    pub node: NodeId,
+    pub attribute: u32,
+    pub mode: u32,
+    pub handle: u32,
+    pub sampling_ms: f64,
+    pub queue_size: u32,
+    pub discard_oldest: bool,
+    /// DataChangeFilter (trigger, deadband type, deadband value).
+    pub filter: Option<(u32, u32, f64)>,
+}
+
+impl MonitorSpec {
+    pub fn value(node: NodeId, handle: u32) -> MonitorSpec {
+        MonitorSpec {
+            node,
+            attribute: 13,
+            mode: 2,
+            handle,
+            sampling_ms: 0.0,
+            queue_size: 1,
+            discard_oldest: true,
+            filter: None,
+        }
+    }
+}
+
+/// A NotificationMessage.
+#[derive(Clone, Debug, Default)]
+pub struct Message {
+    pub seq: u32,
+    pub publish_time: i64,
+    /// DataChangeNotification items: (client handle, value).
+    pub data: Vec<(u32, DataValue)>,
+    /// StatusChangeNotification code.
+    pub status_change: Option<u32>,
+}
+
+impl Message {
+    pub fn is_keep_alive(&self) -> bool {
+        self.data.is_empty() && self.status_change.is_none()
+    }
+}
+
+/// A PublishResponse (or the fault code of a failed Publish).
+#[derive(Clone, Debug, Default)]
+pub struct Publish {
+    pub fault: u32,
+    pub subscription: u32,
+    pub available: Vec<u32>,
+    pub more: bool,
+    pub message: Message,
+    pub ack_results: Vec<u32>,
+}
+
+fn parse_message(r: &mut Reader) -> crate::codec::DResult<Message> {
+    let mut m = Message { seq: r.u32()?, publish_time: r.i64()?, ..Default::default() };
+    let n = r.length(3)?.unwrap_or(0);
+    for _ in 0..n {
+        let (ty, _, body) = r.extension_object_raw()?;
+        let mut b = Reader::new(body);
+        match ty.as_ns0() {
+            Some(ids::DATA_CHANGE_NOTIFICATION_ENCODING) => {
+                let items = b.array(5, |b| Ok((b.u32()?, b.data_value()?)))?;
+                m.data.extend(items);
+            }
+            Some(ids::STATUS_CHANGE_NOTIFICATION_ENCODING) => m.status_change = Some(b.u32()?),
+            _ => {}
+        }
+    }
+    Ok(m)
+}
+
+/// Parses a PublishResponse body (or records a ServiceFault).
+pub fn parse_publish(ty: u32, body: &[u8]) -> io::Result<Publish> {
+    if ty != ids::PUBLISH_RESPONSE {
+        return Ok(Publish { fault: service_result(body), ..Default::default() });
+    }
+    let mut r = Reader::new(body);
+    let bad = |_| invalid("bad PublishResponse");
+    skip_response_header(&mut r).map_err(bad)?;
+    let subscription = r.u32().map_err(bad)?;
+    let available = r.array(4, |r| r.u32()).map_err(bad)?;
+    let more = r.bool().map_err(bad)?;
+    let message = parse_message(&mut r).map_err(bad)?;
+    let ack_results = r.array(4, |r| r.u32()).map_err(bad)?;
+    Ok(Publish { fault: 0, subscription, available, more, message, ack_results })
 }

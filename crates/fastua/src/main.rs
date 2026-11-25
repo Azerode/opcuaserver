@@ -23,7 +23,9 @@ const USAGE: &str = "usage: fastua [options]
   --x509-users read|write      rights of users with a trusted certificate (default: write)
   --trust-all-clients     accept any client certificate (development only)
   --busy-poll US          poll each connection for US microseconds before sleeping
-                          (lower latency, one busy core per active connection; default: off)";
+                          (lower latency, one busy core per active connection; default: off)
+  --min-publishing-interval MS   fastest subscription publishing interval (default: 1, minimum 0.05)
+  --min-sampling-interval MS     fastest monitored item sampling interval (default: 1, minimum 0.05)";
 
 fn fail(msg: String) -> ! {
     eprintln!("{msg}");
@@ -66,6 +68,8 @@ fn main() {
     let mut x509_users = Access::ReadWrite;
     let mut trust_all = false;
     let mut busy_poll = std::time::Duration::ZERO;
+    let mut min_publishing: Option<f64> = None;
+    let mut min_sampling: Option<f64> = None;
 
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("hash-password") {
@@ -92,6 +96,19 @@ fn main() {
                 let v = value("--busy-poll");
                 let us: u64 = v.parse().unwrap_or_else(|_| fail(format!("invalid --busy-poll '{v}'\n\n{USAGE}")));
                 busy_poll = std::time::Duration::from_micros(us);
+            }
+            "--min-publishing-interval" | "--min-sampling-interval" => {
+                let v = value(&a);
+                let ms: f64 = v
+                    .parse()
+                    .ok()
+                    .filter(|m: &f64| m.is_finite() && *m >= 0.05)
+                    .unwrap_or_else(|| fail(format!("invalid {a} '{v}' (milliseconds, at least 0.05)\n\n{USAGE}")));
+                if a == "--min-publishing-interval" {
+                    min_publishing = Some(ms);
+                } else {
+                    min_sampling = Some(ms);
+                }
             }
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -142,6 +159,12 @@ fn main() {
     config.anonymous = anonymous;
     config.x509_users = x509_users;
     config.busy_poll = busy_poll;
+    if let Some(ms) = min_publishing {
+        config.limits.min_publishing_interval_ms = ms;
+    }
+    if let Some(ms) = min_sampling {
+        config.limits.min_sampling_interval_ms = ms;
+    }
     if !busy_poll.is_zero() {
         fastua::log!("busy-polling connections for {} us before sleeping", busy_poll.as_micros());
     }

@@ -6,6 +6,7 @@ use crate::codec::Writer;
 use crate::crypto::{Mode, Policy};
 use crate::pki::Pki;
 use crate::reload::Store;
+use crate::subscription::{SessionSubs, Subscription};
 use crate::types::*;
 use crate::users::{Access, Users};
 use std::net::{TcpListener, TcpStream};
@@ -36,6 +37,20 @@ pub struct Limits {
     pub max_token_lifetime_ms: u32,
     /// Time allowed between TCP connect and a valid HEL.
     pub hello_timeout: Duration,
+    pub max_subscriptions_per_session: usize,
+    pub max_monitored_items_per_subscription: usize,
+    /// Publish requests a session may queue.
+    pub max_publish_requests: usize,
+    /// Unacknowledged NotificationMessages kept per subscription for Republish.
+    pub max_retransmission_queue: usize,
+    pub max_queue_size: u32,
+    pub max_notifications_per_publish: u32,
+    pub min_publishing_interval_ms: f64,
+    pub max_publishing_interval_ms: f64,
+    pub min_sampling_interval_ms: f64,
+    pub max_sampling_interval_ms: f64,
+    pub max_keep_alive_count: u32,
+    pub max_lifetime_count: u32,
 }
 
 impl Default for Limits {
@@ -53,6 +68,18 @@ impl Default for Limits {
             min_token_lifetime_ms: 10_000,
             max_token_lifetime_ms: 3_600_000,
             hello_timeout: Duration::from_secs(10),
+            max_subscriptions_per_session: 100,
+            max_monitored_items_per_subscription: 100_000,
+            max_publish_requests: 32,
+            max_retransmission_queue: 64,
+            max_queue_size: 10_000,
+            max_notifications_per_publish: 100_000,
+            min_publishing_interval_ms: 1.0,
+            max_publishing_interval_ms: 3_600_000.0,
+            min_sampling_interval_ms: 1.0,
+            max_sampling_interval_ms: 3_600_000.0,
+            max_keep_alive_count: 100_000,
+            max_lifetime_count: 1_000_000,
         }
     }
 }
@@ -129,6 +156,12 @@ pub struct Session {
     pub server_nonce: Mutex<Vec<u8>>,
     /// Rights of the identity given at the last ActivateSession.
     pub can_write: AtomicBool,
+    /// User identity of the last ActivateSession ("anonymous", "user:<name>",
+    /// "x509:<thumbprint>"): TransferSubscriptions requires the same one.
+    pub identity: Mutex<Arc<str>>,
+    /// Subscriptions and queued Publish requests, driven by the thread of
+    /// the connection the session is bound to.
+    pub subs: Mutex<SessionSubs>,
 }
 
 pub struct Server {
@@ -144,6 +177,17 @@ pub struct Server {
     endpoints_encoded: Vec<u8>,
     /// FindServers answer, encoded once (array of one ApplicationDescription).
     application_encoded: Vec<u8>,
+    next_subscription: AtomicU32,
+    /// Subscriptions of sessions closed with deleteSubscriptions = false,
+    /// kept for TransferSubscriptions until their lifetime ends.
+    orphans: Mutex<Vec<Orphan>>,
+}
+
+/// A subscription whose session is gone.
+pub struct Orphan {
+    pub identity: Arc<str>,
+    pub expires_ms: u64,
+    pub sub: Subscription,
 }
 
 /// Cryptographically secure random bytes from the OS.
@@ -230,6 +274,8 @@ impl Server {
             next_channel: AtomicU32::new(1),
             endpoints_encoded,
             application_encoded,
+            next_subscription: AtomicU32::new(1),
+            orphans: Mutex::new(Vec::new()),
         })
     }
 
@@ -305,6 +351,8 @@ impl Server {
             security,
             server_nonce: Mutex::new(server_nonce),
             can_write: AtomicBool::new(false),
+            identity: Mutex::new(Arc::from("")),
+            subs: Mutex::new(SessionSubs::default()),
         });
         sessions.insert(session.token.clone(), session.clone());
         Ok(session)
@@ -336,6 +384,43 @@ impl Server {
             }
             keep
         });
+        drop(sessions);
+        let mut orphans = self.orphans.lock().unwrap_or_else(|e| e.into_inner());
+        orphans.retain(|o| o.expires_ms > now);
+    }
+
+    /// Every live session (TransferSubscriptions).
+    pub fn sessions(&self) -> Vec<Arc<Session>> {
+        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).values().cloned().collect()
+    }
+
+    pub fn next_subscription_id(&self) -> u32 {
+        loop {
+            let id = self.next_subscription.fetch_add(1, Ordering::Relaxed);
+            if id != 0 {
+                return id;
+            }
+        }
+    }
+
+    /// Keeps the subscriptions of a closed session for TransferSubscriptions.
+    pub fn orphan(&self, identity: Arc<str>, subs: Vec<Subscription>) {
+        let now = self.uptime_ms();
+        let mut orphans = self.orphans.lock().unwrap_or_else(|e| e.into_inner());
+        for sub in subs {
+            let expires_ms = now + sub.lifetime_ms() as u64;
+            orphans.push(Orphan { identity: identity.clone(), expires_ms, sub });
+        }
+    }
+
+    /// Takes an orphaned subscription: `Err` if it exists with another identity.
+    pub fn adopt(&self, id: u32, identity: &str) -> Option<Result<Subscription, ()>> {
+        let mut orphans = self.orphans.lock().unwrap_or_else(|e| e.into_inner());
+        let i = orphans.iter().position(|o| o.sub.id == id)?;
+        if &*orphans[i].identity != identity {
+            return Some(Err(()));
+        }
+        Some(Ok(orphans.swap_remove(i).sub))
     }
 
     pub fn session_count(&self) -> usize {

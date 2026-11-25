@@ -538,6 +538,37 @@ pub mod ids {
     pub const READ_RESPONSE: u32 = 634;
     pub const WRITE_REQUEST: u32 = 673;
     pub const WRITE_RESPONSE: u32 = 676;
+    pub const CREATE_MONITORED_ITEMS_REQUEST: u32 = 751;
+    pub const CREATE_MONITORED_ITEMS_RESPONSE: u32 = 754;
+    pub const MODIFY_MONITORED_ITEMS_REQUEST: u32 = 763;
+    pub const MODIFY_MONITORED_ITEMS_RESPONSE: u32 = 766;
+    pub const SET_MONITORING_MODE_REQUEST: u32 = 769;
+    pub const SET_MONITORING_MODE_RESPONSE: u32 = 772;
+    pub const SET_TRIGGERING_REQUEST: u32 = 775;
+    pub const SET_TRIGGERING_RESPONSE: u32 = 778;
+    pub const DELETE_MONITORED_ITEMS_REQUEST: u32 = 781;
+    pub const DELETE_MONITORED_ITEMS_RESPONSE: u32 = 784;
+    pub const CREATE_SUBSCRIPTION_REQUEST: u32 = 787;
+    pub const CREATE_SUBSCRIPTION_RESPONSE: u32 = 790;
+    pub const MODIFY_SUBSCRIPTION_REQUEST: u32 = 793;
+    pub const MODIFY_SUBSCRIPTION_RESPONSE: u32 = 796;
+    pub const SET_PUBLISHING_MODE_REQUEST: u32 = 799;
+    pub const SET_PUBLISHING_MODE_RESPONSE: u32 = 802;
+    pub const PUBLISH_REQUEST: u32 = 826;
+    pub const PUBLISH_RESPONSE: u32 = 829;
+    pub const REPUBLISH_REQUEST: u32 = 832;
+    pub const REPUBLISH_RESPONSE: u32 = 835;
+    pub const TRANSFER_SUBSCRIPTIONS_REQUEST: u32 = 841;
+    pub const TRANSFER_SUBSCRIPTIONS_RESPONSE: u32 = 844;
+    pub const DELETE_SUBSCRIPTIONS_REQUEST: u32 = 847;
+    pub const DELETE_SUBSCRIPTIONS_RESPONSE: u32 = 850;
+
+    // Notifications and filters (binary encodings)
+    pub const DATA_CHANGE_FILTER_ENCODING: u32 = 724;
+    pub const EVENT_FILTER_ENCODING: u32 = 727;
+    pub const AGGREGATE_FILTER_ENCODING: u32 = 730;
+    pub const DATA_CHANGE_NOTIFICATION_ENCODING: u32 = 811;
+    pub const STATUS_CHANGE_NOTIFICATION_ENCODING: u32 = 820;
 }
 
 /// Status codes (Part 4, §7.39 and Part 6 annex).

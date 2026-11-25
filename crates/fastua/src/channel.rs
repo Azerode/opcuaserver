@@ -12,6 +12,7 @@ use crate::crypto::{self, ChannelKeys, Mode, Policy, SymKeys, SYM_SIGNATURE_LEN}
 use crate::pki::CertInfo;
 use crate::server::{random_bytes, Server, Session};
 use crate::services;
+use crate::subscription::mono_ns;
 use crate::types::*;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
@@ -89,6 +90,11 @@ pub struct Connection<'a> {
     assembly_request: u32,
     session: Option<Arc<Session>>,
     space: Option<Arc<AddressSpace>>,
+    /// Subscriptions driven by this connection's thread.
+    conn: services::ConnState,
+    /// Next sampling / publishing deadline (monotonic ns, `u64::MAX` = none).
+    deadline: u64,
+    slack_set: bool,
 }
 
 #[derive(Debug)]
@@ -143,6 +149,9 @@ pub fn run(server: &Arc<Server>, stream: TcpStream) -> io::Result<()> {
         assembly_request: 0,
         session: None,
         space: None,
+        conn: services::ConnState::new(limits.max_message_size as usize),
+        deadline: u64::MAX,
+        slack_set: false,
     };
     match c.serve() {
         Ok(()) | Err(Fatal::Closed) => Ok(()),
@@ -166,12 +175,114 @@ impl<'a> Connection<'a> {
             self.in_end -= self.in_start;
             self.in_start = 0;
         }
-        let n = crate::net::recv(&mut self.stream, &mut self.inbuf[self.in_end..], self.spin)?;
+        let n = if self.conn.sessions.is_empty() {
+            crate::net::recv(&mut self.stream, &mut self.inbuf[self.in_end..], self.spin)?
+        } else {
+            self.recv_with_timers()?
+        };
         if n == 0 {
             return Err(Fatal::Io(io::ErrorKind::UnexpectedEof.into()));
         }
         self.in_end += n;
         Ok(())
+    }
+
+    /// Receives while running subscription timers: waits for data or the
+    /// next deadline, whichever comes first.
+    fn recv_with_timers(&mut self) -> Result<usize, Fatal> {
+        if !self.slack_set {
+            crate::net::set_timer_slack(1);
+            self.slack_set = true;
+        }
+        loop {
+            if self.conn.timers_dirty {
+                self.recompute_deadline();
+            }
+            let mut now = mono_ns();
+            if now >= self.deadline {
+                self.run_timers(now)?;
+                if self.conn.sessions.is_empty() {
+                    return Ok(crate::net::recv(&mut self.stream, &mut self.inbuf[self.in_end..], self.spin)?);
+                }
+                continue;
+            }
+            if !self.spin.is_zero() {
+                let stop = self.deadline.min(now + self.spin.as_nanos() as u64);
+                loop {
+                    if let Some(n) = crate::net::try_recv(&self.stream, &mut self.inbuf[self.in_end..])? {
+                        return Ok(n);
+                    }
+                    std::hint::spin_loop();
+                    now = mono_ns();
+                    if now >= stop {
+                        break;
+                    }
+                }
+                if now >= self.deadline {
+                    continue;
+                }
+            }
+            if crate::net::wait_readable(&self.stream, self.deadline - now)? {
+                if let Some(n) = crate::net::try_recv(&self.stream, &mut self.inbuf[self.in_end..])? {
+                    return Ok(n);
+                }
+            }
+        }
+    }
+
+    fn recompute_deadline(&mut self) {
+        self.conn.timers_dirty = false;
+        let mut d = u64::MAX;
+        for s in &self.conn.sessions {
+            d = d.min(s.subs.lock().unwrap_or_else(|e| e.into_inner()).next_deadline());
+        }
+        self.deadline = d;
+    }
+
+    /// Samples, runs the publishing timers and answers every Publish request
+    /// that has something to carry, for each session driven here.
+    fn run_timers(&mut self, now: u64) -> Result<(), Fatal> {
+        let Some(ch_id) = self.channel.as_ref().map(|c| c.id) else { return Ok(()) };
+        let mut sessions = std::mem::take(&mut self.conn.sessions);
+        let mut space = self.space.take();
+        self.server.store.cached(&mut space);
+        let mut tx = std::mem::take(&mut self.tx);
+        let server = self.server;
+        let limits = server.limits();
+        let max = self.conn.max_response;
+        let mut deadline = u64::MAX;
+        let mut result = Ok(());
+        sessions.retain(|s| {
+            if result.is_err() {
+                return true;
+            }
+            if s.closed.load(std::sync::atomic::Ordering::Acquire)
+                || s.channel_id.load(std::sync::atomic::Ordering::Acquire) != ch_id
+            {
+                return false;
+            }
+            let mut st = s.subs.lock().unwrap_or_else(|e| e.into_inner());
+            st.tick(now, space.as_ref().unwrap());
+            loop {
+                tx.clear();
+                tx.resize(MSG_HEADER_LEN, 0);
+                let ready = st.write_next(limits, now, ch_id, max, &mut Writer::new(&mut tx));
+                let Some(ready) = ready else { break };
+                if let Err(e) = self.send_response(ready.request_id, &mut tx, ready.handle) {
+                    result = Err(e);
+                    return true;
+                }
+            }
+            deadline = deadline.min(st.next_deadline());
+            !st.is_idle()
+        });
+        self.tx = tx;
+        self.space = space;
+        // Services may have added sessions while we iterated (not here: this
+        // runs between requests), so a plain swap back is enough.
+        self.conn.sessions = sessions;
+        self.deadline = deadline;
+        result
     }
 
     /// Reads one chunk: header into `hdr`, the rest into `rx`.
@@ -244,6 +355,13 @@ impl<'a> Connection<'a> {
         self.recv_buffer = ours.min(client_send);
         self.client_max_message = max_message;
         self.client_max_chunks = max_chunks;
+        // Largest NotificationMessage worth building: what the client accepts,
+        // with room for the PublishResponse around it and chunk overheads.
+        let ours = self.server.limits().max_message_size as usize;
+        let by_size = if max_message == 0 { ours } else { ours.min(max_message as usize) };
+        let chunk_body = self.send_buffer as usize - MSG_HEADER_LEN - SYM_SIGNATURE_LEN - crypto::AES_BLOCK;
+        let by_chunks = if max_chunks == 0 { usize::MAX } else { max_chunks as usize * chunk_body };
+        self.conn.max_response = by_size.min(by_chunks).saturating_sub(4096).max(1024);
 
         let limits = self.server.limits();
         self.tx.clear();
@@ -631,16 +749,23 @@ impl<'a> Connection<'a> {
         let mut r = Reader::new(body);
         let handle = {
             let mut w = Writer::new(&mut tx);
+            self.conn.request_id = request_id;
             let mut ctx = services::Ctx {
                 server: self.server,
                 channel_id: ch.id,
                 security: &ch.security,
                 session: &mut self.session,
                 space: &mut self.space,
+                conn: &mut self.conn,
             };
             services::dispatch(&mut ctx, &mut r, &mut w)
         };
-        let res = self.send_response(request_id, &mut tx, handle);
+        let res = if std::mem::take(&mut self.conn.deferred) {
+            Ok(())
+        } else {
+            let id = self.conn.reply_to.take().unwrap_or(request_id);
+            self.send_response(id, &mut tx, handle)
+        };
         self.tx = tx;
         res
     }

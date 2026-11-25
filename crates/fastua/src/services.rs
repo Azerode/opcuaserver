@@ -14,6 +14,9 @@ use crate::value::ValueCell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+#[path = "sub_services.rs"]
+mod sub;
+
 pub struct Ctx<'a> {
     pub server: &'a Arc<Server>,
     pub channel_id: u32,
@@ -22,6 +25,39 @@ pub struct Ctx<'a> {
     pub session: &'a mut Option<Arc<Session>>,
     /// Address space snapshot last used on this connection (see `Store::cached`).
     pub space: &'a mut Option<Arc<AddressSpace>>,
+    /// Connection-level state for services that answer later (Publish).
+    pub conn: &'a mut ConnState,
+}
+
+/// What the subscription services need from the connection.
+#[derive(Default)]
+pub struct ConnState {
+    /// Request id of the request being dispatched.
+    pub request_id: u32,
+    /// Set by a service that answers later (Publish): nothing to send now.
+    pub deferred: bool,
+    /// Set when the response written belongs to another (older) request.
+    pub reply_to: Option<u32>,
+    /// Sessions whose subscriptions this connection drives.
+    pub sessions: Vec<Arc<Session>>,
+    /// Subscription state changed: the next deadline must be recomputed.
+    pub timers_dirty: bool,
+    /// Largest response body the client accepts.
+    pub max_response: usize,
+}
+
+impl ConnState {
+    pub fn new(max_response: usize) -> ConnState {
+        ConnState { max_response, ..Default::default() }
+    }
+
+    /// This connection drives `s`'s subscriptions from now on.
+    pub fn drive(&mut self, s: &Arc<Session>) {
+        if !self.sessions.iter().any(|x| Arc::ptr_eq(x, s)) {
+            self.sessions.push(s.clone());
+        }
+        self.timers_dirty = true;
+    }
 }
 
 pub struct RequestHeader {
@@ -75,15 +111,21 @@ pub fn write_response_header(w: &mut Writer, now: i64, handle: u32, result: u32)
 }
 
 #[inline]
-fn begin(w: &mut Writer, response_type: u32, h: &RequestHeader) {
+pub(crate) fn begin(w: &mut Writer, response_type: u32, h: &RequestHeader) {
+    begin_raw(w, response_type, h.now, h.handle)
+}
+
+/// Response type id and a Good ResponseHeader.
+#[inline]
+pub fn begin_raw(w: &mut Writer, response_type: u32, now: i64, handle: u32) {
     // Every response type id fits the 4-byte NodeId encoding: type id and
     // ResponseHeader go out as one 32-byte block.
     debug_assert!(response_type <= 0xFFFF);
     let mut b = [0u8; 32];
     b[0] = 0x01;
     b[2..4].copy_from_slice(&(response_type as u16).to_le_bytes());
-    b[4..12].copy_from_slice(&h.now.to_le_bytes());
-    b[12..16].copy_from_slice(&h.handle.to_le_bytes());
+    b[4..12].copy_from_slice(&now.to_le_bytes());
+    b[12..16].copy_from_slice(&handle.to_le_bytes());
     // 16..20 serviceResult Good, 20 empty DiagnosticInfo
     b[21..25].copy_from_slice(&(-1i32).to_le_bytes()); // null stringTable
                                                        // 25..28 null additionalHeader
@@ -95,7 +137,7 @@ pub fn write_fault(w: &mut Writer, handle: u32, code: u32) {
     write_response_header(w, now_ticks(), handle, code);
 }
 
-type SResult = Result<(), u32>;
+pub(crate) type SResult = Result<(), u32>;
 
 /// Decodes the request type and header, runs the service and writes either its
 /// response or a ServiceFault. Returns the request handle.
@@ -122,6 +164,18 @@ pub fn dispatch(ctx: &mut Ctx, r: &mut Reader, w: &mut Writer) -> u32 {
         Some(ids::CREATE_SESSION_REQUEST) => create_session(ctx, &header, r, w),
         Some(ids::ACTIVATE_SESSION_REQUEST) => activate_session(ctx, &header, r, w),
         Some(ids::CLOSE_SESSION_REQUEST) => close_session(ctx, &header, r, w),
+        Some(ids::PUBLISH_REQUEST) => sub::publish(ctx, &header, r, w),
+        Some(ids::REPUBLISH_REQUEST) => sub::republish(ctx, &header, r, w),
+        Some(ids::CREATE_SUBSCRIPTION_REQUEST) => sub::create_subscription(ctx, &header, r, w),
+        Some(ids::MODIFY_SUBSCRIPTION_REQUEST) => sub::modify_subscription(ctx, &header, r, w),
+        Some(ids::SET_PUBLISHING_MODE_REQUEST) => sub::set_publishing_mode(ctx, &header, r, w),
+        Some(ids::DELETE_SUBSCRIPTIONS_REQUEST) => sub::delete_subscriptions(ctx, &header, r, w),
+        Some(ids::TRANSFER_SUBSCRIPTIONS_REQUEST) => sub::transfer_subscriptions(ctx, &header, r, w),
+        Some(ids::CREATE_MONITORED_ITEMS_REQUEST) => sub::create_monitored_items(ctx, &header, r, w),
+        Some(ids::MODIFY_MONITORED_ITEMS_REQUEST) => sub::modify_monitored_items(ctx, &header, r, w),
+        Some(ids::SET_MONITORING_MODE_REQUEST) => sub::set_monitoring_mode(ctx, &header, r, w),
+        Some(ids::SET_TRIGGERING_REQUEST) => sub::set_triggering(ctx, &header, r, w),
+        Some(ids::DELETE_MONITORED_ITEMS_REQUEST) => sub::delete_monitored_items(ctx, &header, r, w),
         _ => Err(status::BAD_SERVICE_UNSUPPORTED),
     };
     if let Err(code) = result {
@@ -131,18 +185,22 @@ pub fn dispatch(ctx: &mut Ctx, r: &mut Reader, w: &mut Writer) -> u32 {
     handle
 }
 
-fn decode_err(_: crate::codec::DecodeError) -> u32 {
+pub(crate) fn decode_err(_: crate::codec::DecodeError) -> u32 {
     status::BAD_DECODING_ERROR
 }
 
 /// Resolves and validates the session of a request (Part 4 §5.6).
-fn session(ctx: &mut Ctx, header: &RequestHeader, must_be_active: bool) -> Result<Arc<Session>, u32> {
+pub(crate) fn session(ctx: &mut Ctx, header: &RequestHeader, must_be_active: bool) -> Result<Arc<Session>, u32> {
     session_ref(ctx, header, must_be_active).cloned()
 }
 
 /// Like [`session`] without the reference-count round trip on the hot path.
 #[inline]
-fn session_ref<'c>(ctx: &'c mut Ctx, header: &RequestHeader, must_be_active: bool) -> Result<&'c Arc<Session>, u32> {
+pub(crate) fn session_ref<'c>(
+    ctx: &'c mut Ctx,
+    header: &RequestHeader,
+    must_be_active: bool,
+) -> Result<&'c Arc<Session>, u32> {
     if !ctx.session.as_ref().is_some_and(|s| s.token == header.auth_token) {
         let s = ctx.server.find_session(&header.auth_token).ok_or(status::BAD_SESSION_ID_INVALID)?;
         *ctx.session = Some(s);
@@ -164,7 +222,7 @@ fn session_ref<'c>(ctx: &'c mut Ctx, header: &RequestHeader, must_be_active: boo
     Ok(s)
 }
 
-fn check_count(ctx: &Ctx, n: usize) -> SResult {
+pub(crate) fn check_count(ctx: &Ctx, n: usize) -> SResult {
     if n == 0 {
         return Err(status::BAD_NOTHING_TO_DO);
     }
@@ -386,9 +444,9 @@ fn activate_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Wr
 
     let mut br = Reader::new(&token_body);
     let config = &ctx.server.config;
-    let access = match token_type.as_ns0() {
+    let (access, identity): (_, Arc<str>) = match token_type.as_ns0() {
         Some(0) | Some(ids::ANONYMOUS_IDENTITY_TOKEN_ENCODING) => {
-            config.anonymous.ok_or(status::BAD_IDENTITY_TOKEN_REJECTED)?
+            (config.anonymous.ok_or(status::BAD_IDENTITY_TOKEN_REJECTED)?, Arc::from("anonymous"))
         }
         Some(ids::USERNAME_IDENTITY_TOKEN_ENCODING) => {
             #[allow(clippy::type_complexity)]
@@ -405,7 +463,7 @@ fn activate_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Wr
             }
             let password = decrypt_secret(ctx, &password, alg.as_deref(), &nonce)?;
             match ctx.server.users.authenticate(&user, &password) {
-                Some(a) => a,
+                Some(a) => (a, Arc::from(format!("user:{user}"))),
                 None => {
                     crate::log!("login failed for user '{user}'");
                     return Err(status::BAD_USER_ACCESS_DENIED);
@@ -434,7 +492,8 @@ fn activate_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Wr
             {
                 return Err(BAD_USER_SIGNATURE_INVALID);
             }
-            config.x509_users
+            let thumb: String = info.thumbprint.iter().map(|b| format!("{b:02x}")).collect();
+            (config.x509_users, Arc::from(format!("x509:{thumb}")))
         }
         _ => return Err(status::BAD_IDENTITY_TOKEN_INVALID),
     };
@@ -442,7 +501,12 @@ fn activate_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Wr
     // Activation may move the session to the calling channel (Part 4 §5.6.3).
     s.channel_id.store(ctx.channel_id, Ordering::Release);
     s.can_write.store(access.can_write(), Ordering::Release);
+    *s.identity.lock().unwrap_or_else(|e| e.into_inner()) = identity;
     s.activated.store(true, Ordering::Release);
+    if !s.subs.lock().unwrap_or_else(|e| e.into_inner()).is_idle() {
+        // The subscriptions follow the session to this channel.
+        ctx.conn.drive(&s);
+    }
 
     let mut nonce = vec![0u8; crypto::NONCE_LEN];
     random_bytes(&mut nonce);
@@ -456,11 +520,17 @@ fn activate_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Wr
 
 fn close_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
     let s = session(ctx, h, false)?;
-    let _delete_subscriptions = r.bool().map_err(decode_err)?;
+    let delete_subscriptions = r.bool().map_err(decode_err)?;
     if s.channel_id.load(Ordering::Acquire) != ctx.channel_id {
         return Err(status::BAD_SECURE_CHANNEL_ID_INVALID);
     }
     ctx.server.remove_session(&s.token);
+    let subs = std::mem::take(&mut s.subs.lock().unwrap_or_else(|e| e.into_inner()).subs);
+    if !delete_subscriptions && !subs.is_empty() {
+        // Kept for TransferSubscriptions until their lifetime ends (Part 4 §5.6.4).
+        let identity = s.identity.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        ctx.server.orphan(identity, subs);
+    }
     *ctx.session = None;
     crate::log!("session '{}' ({}) closed", s.name, s.id);
     begin(w, ids::CLOSE_SESSION_RESPONSE, h);
@@ -574,22 +644,28 @@ fn write_dynamic(w: &mut Writer, v: &Variant, ts: Timestamps, now: i64) {
 }
 
 fn write_attribute(w: &mut Writer, space: &AddressSpace, node: &Node, attribute: u32, ts: Timestamps, can_write: bool) {
-    use attr::*;
-    let v = match (attribute, &node.kind) {
-        (VALUE, NodeKind::Variable { value, access, .. }) => {
-            if access & ACCESS_READ == 0 {
-                return write_bad(w, status::BAD_NOT_READABLE);
-            }
-            return write_value(w, space, value, ts);
+    if let (attr::VALUE, NodeKind::Variable { value, access, .. }) = (attribute, &node.kind) {
+        if access & ACCESS_READ == 0 {
+            return write_bad(w, status::BAD_NOT_READABLE);
         }
+        return write_value(w, space, value, ts);
+    }
+    match attribute_value(node, attribute, can_write) {
+        Some(v) => write_attr(w, &v, ts),
+        None => write_bad(w, status::BAD_ATTRIBUTE_ID_INVALID),
+    }
+}
+
+/// Value of an attribute other than Value; `None` if the node class does
+/// not have it.
+pub fn attribute_value(node: &Node, attribute: u32, can_write: bool) -> Option<Variant> {
+    use attr::*;
+    Some(match (attribute, &node.kind) {
         (NODE_ID, _) => Variant::NodeId(Box::new(node.id.clone())),
         (NODE_CLASS, _) => Variant::Int32(node.class() as i32),
         (BROWSE_NAME, _) => Variant::QualifiedName(Box::new(node.browse_name.clone())),
         (DISPLAY_NAME, _) => Variant::LocalizedText(Box::new(node.display_name.clone())),
-        (DESCRIPTION, _) => match &node.description {
-            Some(d) => Variant::LocalizedText(Box::new(d.clone())),
-            None => return write_bad(w, status::BAD_ATTRIBUTE_ID_INVALID),
-        },
+        (DESCRIPTION, _) => Variant::LocalizedText(Box::new(node.description.clone()?)),
         (WRITE_MASK | USER_WRITE_MASK, _) => Variant::UInt32(0),
         (IS_ABSTRACT, NodeKind::ObjectType { is_abstract })
         | (IS_ABSTRACT, NodeKind::VariableType { is_abstract, .. })
@@ -619,9 +695,8 @@ fn write_attribute(w: &mut Writer, space: &AddressSpace, node: &Node, attribute:
         (ACCESS_LEVEL_EX, NodeKind::Variable { access, .. }) => Variant::UInt32(*access as u32),
         (MINIMUM_SAMPLING_INTERVAL, NodeKind::Variable { .. }) => Variant::Double(0.0),
         (HISTORIZING, NodeKind::Variable { .. }) => Variant::Boolean(false),
-        _ => return write_bad(w, status::BAD_ATTRIBUTE_ID_INVALID),
-    };
-    write_attr(w, &v, ts);
+        _ => return None,
+    })
 }
 
 fn read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {

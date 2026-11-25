@@ -132,6 +132,42 @@ async def main(work, cfg):
     await c.get_node(machine).write_value(ua.DataValue(ua.Variant(7, ua.VariantType.Int16)))
     check("trusted X.509 user can write", await c.get_node(machine).read_value() == 7)
 
+    # Subscriptions over the secure session: initial value, changes, deadband.
+    class Handler:
+        def __init__(self):
+            self.values = []
+
+        def datachange_notification(self, node, val, data):
+            self.values.append((node.nodeid, val))
+
+    async def write(v):
+        await c.get_node(machine).write_value(ua.DataValue(ua.Variant(v, ua.VariantType.Int16)))
+
+    h = Handler()
+    sub = await c.create_subscription(10, h)
+    await sub.subscribe_data_change([c.get_node(machine), c.get_node(ua.ObjectIds.Server_ServerStatus_State)])
+    await asyncio.sleep(0.3)
+    check("subscription initial values", (machine, 7) in h.values and len(h.values) == 2, str(h.values))
+    for v in (8, 9, 10):
+        await write(v)
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(0.2)
+    seen = [v for n, v in h.values if n == machine]
+    check("subscription data changes", seen[-3:] == [8, 9, 10], str(seen))
+    hd = Handler()
+    sub2 = await c.create_subscription(10, hd)
+    await sub2.deadband_monitor(c.get_node(machine), 5, 1)
+    await asyncio.sleep(0.2)
+    for v in (12, 16, 30):
+        await write(v)
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(0.2)
+    seen = [v for n, v in hd.values]
+    check("absolute deadband", seen == [10, 16, 30], str(seen))
+    await sub2.delete()
+    await sub.delete()
+    await write(7)
+
     # Hot reload seen through a secure session.
     path = f"{cfg}/Machine/Machine.json"
     d = json.load(open(path))

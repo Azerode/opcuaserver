@@ -25,6 +25,16 @@ pub struct ValueCell {
     blob: Mutex<Variant>,
 }
 
+/// Raw state of an inline cell: what [`encode_raw`] needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Raw {
+    pub seq: u32,
+    pub bits: u64,
+    pub status: u32,
+    pub source_ts: i64,
+    pub server_ts: i64,
+}
+
 /// One consistent copy of a cell.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Sample {
@@ -94,6 +104,68 @@ fn inline_size(kind: u8) -> u8 {
 /// status and two timestamps.
 pub const ENCODED_MAX: usize = 1 + 1 + 8 + 4 + 8 + 8;
 
+/// Encodes an inline value (`size` from [`ValueCell::inline_size`]) as a
+/// DataValue into `out`; returns the length. A `source_ts` of
+/// [`NO_SOURCE_TS`] leaves the source timestamp out.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_raw(
+    kind: u8,
+    size: u8,
+    bits: u64,
+    st: u32,
+    src: i64,
+    srv: i64,
+    source: bool,
+    server: bool,
+    out: &mut [u8; ENCODED_MAX],
+) -> usize {
+    let size = size as usize;
+    let source = source && src != NO_SOURCE_TS;
+    let bad = st != status::GOOD;
+    out[0] = 0x01 | (bad as u8) << 1 | (source as u8) << 2 | (server as u8) << 3;
+    out[1] = kind;
+    // Bits are stored zero-extended little-endian: the first `size` bytes
+    // are the encoding of the value.
+    out[2..10].copy_from_slice(&bits.to_le_bytes());
+    let mut n = 2 + size;
+    out[n..n + 4].copy_from_slice(&st.to_le_bytes());
+    n += 4 * bad as usize;
+    out[n..n + 8].copy_from_slice(&src.to_le_bytes());
+    n += 8 * source as usize;
+    out[n..n + 8].copy_from_slice(&srv.to_le_bytes());
+    n += 8 * server as usize;
+    n
+}
+
+/// Marks a value without a source timestamp (attributes other than Value).
+pub const NO_SOURCE_TS: i64 = i64::MIN;
+
+/// Value of an inline numeric kind as f64 (deadband filters).
+#[inline(always)]
+pub fn bits_as_f64(kind: u8, b: u64) -> Option<f64> {
+    use builtin::*;
+    Some(match kind {
+        SBYTE => b as u8 as i8 as f64,
+        BYTE => b as u8 as f64,
+        INT16 => b as u16 as i16 as f64,
+        UINT16 => b as u16 as f64,
+        INT32 => b as u32 as i32 as f64,
+        UINT32 => b as u32 as f64,
+        INT64 => b as i64 as f64,
+        UINT64 => b as f64,
+        FLOAT => f32::from_bits(b as u32) as f64,
+        DOUBLE => f64::from_bits(b),
+        _ => return None,
+    })
+}
+
+/// Value of a numeric Variant as f64 (deadband filters).
+pub fn variant_as_f64(v: &Variant) -> Option<f64> {
+    let k = v.type_id();
+    is_inline(k).then(|| bits_as_f64(k, to_bits(v))).flatten()
+}
+
 /// Default (zero) value of a built-in type.
 pub fn default_value(kind: u8) -> Variant {
     match kind {
@@ -129,39 +201,45 @@ impl ValueCell {
     /// variable-length kinds (use [`ValueCell::read`]).
     #[inline(always)]
     pub fn encode(&self, source: bool, server: bool, out: &mut [u8; ENCODED_MAX]) -> Option<usize> {
-        let size = self.size as usize;
-        if size == 0 {
+        if self.size == 0 {
             return None;
         }
-        let (bits, st, src, srv) = loop {
+        let r = self.raw();
+        Some(encode_raw(self.kind, self.size, r.bits, r.status, r.source_ts, r.server_ts, source, server, out))
+    }
+
+    /// Encoded size of an inline kind, 0 for String / ByteString / Guid.
+    #[inline(always)]
+    pub fn inline_size(&self) -> u8 {
+        self.size
+    }
+
+    /// Change counter: different after every write (even for String /
+    /// ByteString). One load, no shared write: what a sampling loop checks
+    /// before reading anything else.
+    #[inline(always)]
+    pub fn version(&self) -> u32 {
+        self.seq.load(Ordering::Acquire)
+    }
+
+    /// Consistent copy of an inline cell (see [`ValueCell::inline_size`]).
+    #[inline(always)]
+    pub fn raw(&self) -> Raw {
+        loop {
             let s1 = self.seq.load(Ordering::Acquire);
             if s1 & 1 != 0 {
                 std::hint::spin_loop();
                 continue;
             }
             let bits = self.bits.load(Ordering::Relaxed);
-            let st = self.status.load(Ordering::Relaxed);
-            let src = self.source_ts.load(Ordering::Relaxed);
-            let srv = self.server_ts.load(Ordering::Relaxed);
+            let status = self.status.load(Ordering::Relaxed);
+            let source_ts = self.source_ts.load(Ordering::Relaxed);
+            let server_ts = self.server_ts.load(Ordering::Relaxed);
             fence(Ordering::Acquire);
             if self.seq.load(Ordering::Relaxed) == s1 {
-                break (bits, st, src, srv);
+                return Raw { seq: s1, bits, status, source_ts, server_ts };
             }
-        };
-        let bad = st != status::GOOD;
-        out[0] = 0x01 | (bad as u8) << 1 | (source as u8) << 2 | (server as u8) << 3;
-        out[1] = self.kind;
-        // Bits are stored zero-extended little-endian: the first `size` bytes
-        // are the encoding of the value.
-        out[2..10].copy_from_slice(&bits.to_le_bytes());
-        let mut n = 2 + size;
-        out[n..n + 4].copy_from_slice(&st.to_le_bytes());
-        n += 4 * bad as usize;
-        out[n..n + 8].copy_from_slice(&src.to_le_bytes());
-        n += 8 * source as usize;
-        out[n..n + 8].copy_from_slice(&srv.to_le_bytes());
-        n += 8 * server as usize;
-        Some(n)
+        }
     }
 
     /// Reads a consistent sample. Wait-free for readers unless a writer is
@@ -203,6 +281,8 @@ impl ValueCell {
             self.status.store(status, Ordering::Relaxed);
             self.source_ts.store(source_ts, Ordering::Relaxed);
             self.server_ts.store(server_ts, Ordering::Relaxed);
+            // Only a change counter here (readers take the mutex).
+            self.seq.fetch_add(2, Ordering::Release);
             return;
         }
         // Writers serialise on the odd sequence number.

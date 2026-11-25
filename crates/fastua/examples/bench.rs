@@ -6,6 +6,8 @@
 //!    seqlock, encode the response. This is the CPU cost the server adds.
 //! 2. Full round trip over loopback TCP with a blocking client (includes the
 //!    kernel network stack on both sides, which dominates).
+//! 3. Secure channels: server-side crypto per Read and round trips.
+//! 4. Subscriptions: engine cost per item, write -> notification latency.
 
 use fastua::address_space::ServerInfo;
 use fastua::channel::Security;
@@ -101,6 +103,7 @@ fn main() {
         }
         let mut cache = Some(session.clone());
         let mut space = None;
+        let mut conn = services::ConnState::new(1 << 20);
         let mut out = Vec::with_capacity(65536);
         let iters = 2_000_000 / batch;
         for _ in 0..iters / 10 {
@@ -111,6 +114,7 @@ fn main() {
                 security: &Security::NONE,
                 session: &mut cache,
                 space: &mut space,
+                conn: &mut conn,
             };
             services::dispatch(&mut ctx, &mut Reader::new(&req), &mut Writer::new(&mut out));
         }
@@ -126,6 +130,7 @@ fn main() {
                     security: &Security::NONE,
                     session: &mut cache,
                     space: &mut space,
+                    conn: &mut conn,
                 };
                 black_box(services::dispatch(&mut ctx, &mut Reader::new(black_box(&req)), &mut Writer::new(&mut out)));
             }
@@ -142,7 +147,7 @@ fn main() {
     let spin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let spin_addr = spin_listener.local_addr().unwrap().to_string();
     {
-        let server = Server::new(store, spin_config, pki.clone(), Users::default());
+        let server = Server::new(store.clone(), spin_config, pki.clone(), Users::default());
         std::thread::spawn(move || server.serve(spin_listener));
     }
     loopback("server blocking, client blocking ", &addr, false);
@@ -187,7 +192,146 @@ fn main() {
             println!("secure loopback {name:<35} {label}  p50 {p50:>6.1} us  p99 {p99:>6.1} us");
         }
     }
+
+    // ---- 4. subscriptions
+    subscription_engine(&store);
+    let fast_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let fast_addr = fast_listener.local_addr().unwrap().to_string();
+    {
+        let mut c = ServerConfig::all_endpoints(fast_addr.clone(), format!("opc.tcp://{fast_addr}"));
+        c.anonymous = Some(fastua::users::Access::ReadWrite);
+        c.busy_poll = std::time::Duration::from_micros(200);
+        c.limits.min_publishing_interval_ms = 0.1;
+        c.limits.min_sampling_interval_ms = 0.1;
+        let server = Server::new(store.clone(), c, pki.clone(), Users::default());
+        std::thread::spawn(move || server.serve(fast_listener));
+    }
+    notify_latency("interval 1 ms,   blocking ", &addr, 1.0, false);
+    notify_latency("interval 1 ms,   busy-poll", &spin_addr, 1.0, true);
+    notify_latency("interval 0.1 ms, busy-poll", &fast_addr, 0.1, true);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Cost of the subscription engine on 10 000 Double items: a sampling pass
+/// over unchanged values, and sample + queue + encode of changed values.
+fn subscription_engine(store: &Store) {
+    use fastua::address_space::{NodeKind, ValueSource};
+    use fastua::server::Limits;
+    use fastua::subscription::{ItemParams, PublishRequest, SessionSubs, SubParams, Subscription};
+    let space = store.load_full();
+    let n = 10_000u32;
+    let l = Limits::default();
+    let cells: Vec<_> = (0..n)
+        .map(|i| match &space.get(&NodeId::Numeric(2, i)).unwrap().kind {
+            NodeKind::Variable { value: ValueSource::Cell(c), .. } => c.clone(),
+            _ => unreachable!(),
+        })
+        .collect();
+    let mut st = SessionSubs::default();
+    let mut sub = Subscription::new(1, SubParams::revise(&l, 1.0, 1_000_000, 10, 0, 0), true, 0);
+    for i in 0..n {
+        let p = ItemParams {
+            client_handle: i,
+            sampling_ms: 1.0,
+            filter: Default::default(),
+            percent_deadband: false,
+            filter_present: false,
+            queue_size: 1,
+            discard_oldest: true,
+        };
+        sub.create_item(&l, &space, NodeId::Numeric(2, i), 13, 2, (true, true), &p, true, 0).unwrap();
+    }
+    st.subs.push(sub);
+    let mut out = Vec::with_capacity(1 << 20);
+    let mut now = 0u64;
+    let mut seq = None;
+    let mut cycle = |st: &mut SessionSubs, change: bool, round: u64| -> u64 {
+        if change {
+            for c in &cells {
+                c.write(&Variant::Double(round as f64), status::GOOD, 1, 2);
+            }
+        }
+        let mut acks = st.ack_buffer();
+        if let Some(q) = seq.take() {
+            acks.push(st.acknowledge(1, q));
+        }
+        let _ = st.queue(&l, PublishRequest { request_id: 1, channel_id: 1, handle: 1, deadline: u64::MAX, acks });
+        now += 1_000_000;
+        let t = Instant::now();
+        st.tick(now, &space);
+        out.clear();
+        st.write_next(&l, now, 1, 64 << 20, &mut Writer::new(&mut out));
+        let ns = t.elapsed().as_nanos() as u64;
+        if out.is_empty() {
+            return ns; // nothing to publish: a sampling pass only
+        }
+        let k = u32::from_le_bytes(out[36..40].try_into().unwrap()) as usize;
+        let at = 40 + 4 * k + 1;
+        seq = Some(u32::from_le_bytes(out[at..at + 4].try_into().unwrap()));
+        ns
+    };
+    for (label, change) in [("unchanged values (sampling pass)", false), ("changed values (notification)", true)] {
+        let mut best = u64::MAX;
+        for round in 0..200 {
+            best = best.min(cycle(&mut st, change, round + 1));
+        }
+        println!("subscription   {label:<34} {:>6.2} ns/item", best as f64 / n as f64);
+    }
+}
+
+/// Time from a Write by one client to the DataChangeNotification received by
+/// another (publishing and sampling interval `interval_ms`).
+fn notify_latency(label: &str, addr: &str, interval_ms: f64, spin: bool) {
+    use fastua::client::MonitorSpec;
+    let url = format!("opc.tcp://{addr}");
+    let mut writer = Client::connect(addr, &url).unwrap();
+    writer.create_session("writer").unwrap();
+    let mut c = Client::connect(addr, &url).unwrap();
+    c.create_session("subscriber").unwrap();
+    writer.spin = spin;
+    c.spin = spin;
+    let node = NodeId::Numeric(2, 7);
+    let (sub, ..) = c.create_subscription(interval_ms, 100_000, 100_000).unwrap();
+    let mut spec = MonitorSpec::value(node.clone(), 1);
+    spec.sampling_ms = interval_ms;
+    c.monitor(sub, &[spec]).unwrap();
+    for _ in 0..3 {
+        c.send_publish(&[]).unwrap();
+    }
+    let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+    let n = 400;
+    let mut samples = Vec::with_capacity(n);
+    for i in 0..n + 20 {
+        // Random phase relative to the server's timers.
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        let pause = std::time::Duration::from_nanos(rng % (interval_ms * 1e6) as u64);
+        let until = Instant::now() + pause;
+        while Instant::now() < until {
+            std::hint::spin_loop();
+        }
+        let v = -(i as f64) - 1.0;
+        let t = Instant::now();
+        writer.write(&[(node.clone(), Variant::Double(v))]).unwrap();
+        loop {
+            let p = c.receive_publish().unwrap();
+            let acks: Vec<(u32, u32)> = if p.message.data.is_empty() { vec![] } else { vec![(sub, p.message.seq)] };
+            c.send_publish(&acks).unwrap();
+            if p.message.data.iter().any(|(_, d)| d.value == Some(Variant::Double(v))) {
+                break;
+            }
+        }
+        if i >= 20 {
+            samples.push(t.elapsed().as_nanos() as u64);
+        }
+    }
+    samples.sort_unstable();
+    println!(
+        "subscription   write -> notification  {label}  p50 {:>7.1} us  p99 {:>7.1} us",
+        percentile(&samples, 0.5) as f64 / 1000.0,
+        percentile(&samples, 0.99) as f64 / 1000.0
+    );
 }
 
 /// Server-side symmetric crypto of one Read x1 exchange (sizes of a real
