@@ -41,13 +41,27 @@ pub struct Security {
     /// A TLS connection of the HTTPS transport (policy None, protected by
     /// TLS).
     pub https: bool,
+    /// HTTPS with the JSON encoding (https-uajson).
+    pub json: bool,
 }
 
 impl Security {
-    pub const NONE: Security =
-        Security { policy: Policy::None, mode: Mode::None, client_cert: None, channel_thumbprint: None, https: false };
-    pub const HTTPS: Security =
-        Security { policy: Policy::None, mode: Mode::None, client_cert: None, channel_thumbprint: None, https: true };
+    pub const NONE: Security = Security {
+        policy: Policy::None,
+        mode: Mode::None,
+        client_cert: None,
+        channel_thumbprint: None,
+        https: false,
+        json: false,
+    };
+    pub const HTTPS: Security = Security {
+        policy: Policy::None,
+        mode: Mode::None,
+        client_cert: None,
+        channel_thumbprint: None,
+        https: true,
+        json: false,
+    };
 }
 
 /// Symmetric keys of one security token. The RSA keys stay inline (no
@@ -698,8 +712,14 @@ impl<'a> Connection<'a> {
 
         let limits = self.server.limits();
         let lifetime = requested_lifetime.clamp(limits.min_token_lifetime_ms, limits.max_token_lifetime_ms);
-        let security =
-            Security { policy, mode, client_cert: client_cert.clone(), channel_thumbprint: None, https: false };
+        let security = Security {
+            policy,
+            mode,
+            client_cert: client_cert.clone(),
+            channel_thumbprint: None,
+            https: false,
+            json: false,
+        };
         let ch = match (request_type, self.channel.as_mut()) {
             (0, None) => {
                 if channel_id != 0 {

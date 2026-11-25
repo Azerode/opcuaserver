@@ -543,12 +543,44 @@ endpoint. GetEndpoints filters on the transport profiles a client asks for.
   certificate and its ApplicationUri (BadSecurityChecksFailed /
   BadCertificateUriInvalid), ActivateSession needs no client signature (the
   handshake proved the key), and the session diagnostics show it.
-- Not supported: chunked request bodies, the JSON encoding.
+- Not supported: chunked request bodies.
+
+#### JSON encoding (https-uajson)
+
+The HTTPS endpoint is listed a second time with transport profile
+https-uajson (same URL). A POST with `Content-Type: application/json` (any
+type containing `json`) carries a message in the JSON compact encoding of
+Part 6 §5.4: an ExtensionObject `{"TypeId": "i=629", "Body": {...}}`, the
+TypeId being the request's DataType or its binary encoding NodeId. The
+response comes back as `application/json`, its TypeId being the response's
+DataType (`i=632` for a ReadResponse, `i=395` for a ServiceFault).
+
+- The service layer only knows UA binary: `json::Transcoder` turns the
+  JSON request into its binary encoding and the binary response into JSON,
+  driven by `data/types.bin`, the structure and enumeration definitions of
+  every namespace 0 DataType (497 types). `tools/gen_types.py` generates it
+  from `Opc.Ua.NodeSet2.Services.xml` and CI checks it matches the official
+  nodeset. A binary request pays one header check, nothing else.
+- Encoding: default values omitted, Int64/UInt64 as strings, NaN and
+  Infinity as strings, DateTime as RFC 3339 with 100 ns precision, NodeIds
+  as `i=`/`s=`/`g=`/`b=` with `nsu=<uri>;` for namespaces other than 0
+  (`ns=<index>;` is accepted), StatusCode as `{"Code": n}`, Variant as
+  `{"UaType", "Value", "Dimensions"}`, DataValue with the Variant fields
+  inline plus `Status`, timestamps and picoseconds, structures with optional
+  fields with `EncodingMask`, unions with `SwitchField`, enumerations as
+  numbers (`"Name_N"` accepted). ExtensionObjects of known types are
+  written as JSON, others keep their binary body in base64 (`Encoding: 1`);
+  `UaTypeId`/`UaEncoding`/`UaBody` are accepted as field names.
+- A body that is not valid JSON or names an unknown type gets 400 with the
+  reason as text. Session diagnostics show the encoding ("UA JSON") and the
+  transport profile its CreateSession used.
+- Cost: only the JSON path pays for parsing and the conversion (serde_json);
+  opc.tcp and https-uabinary are unchanged.
 
 ## Scope
 
 Implemented: UA TCP (HEL/ACK/ERR, chunking both ways), HTTPS
-(https-uabinary, see [HTTPS transport](#https-transport)), SecureChannel with
+(https-uabinary and https-uajson, see [HTTPS transport](#https-transport)), SecureChannel with
 SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep,
 Aes256_Sha256_RsaPss and the six ECC AEAD policies in Sign and SignAndEncrypt
 modes (issue/renew, token

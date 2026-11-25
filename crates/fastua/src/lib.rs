@@ -13,6 +13,7 @@ pub mod ecc;
 pub mod events;
 pub mod history;
 pub mod https;
+pub mod json;
 pub mod net;
 pub mod ns0;
 pub mod persist;

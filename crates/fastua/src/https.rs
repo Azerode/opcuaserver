@@ -19,6 +19,7 @@
 
 use crate::channel::{Security, MSG_HEADER_LEN};
 use crate::codec::{Reader, Writer};
+use crate::json::{self, Transcoder};
 use crate::server::Server;
 use crate::services;
 use crate::subscription::mono_ns;
@@ -29,6 +30,8 @@ use std::time::Duration;
 
 /// Transport profile of the HTTPS endpoint.
 pub const TRANSPORT_PROFILE_HTTPS: &str = "http://opcfoundation.org/UA-Profile/Transport/https-uabinary";
+/// The same URL with the JSON encoding (`Content-Type: application/json`).
+pub const TRANSPORT_PROFILE_HTTPS_JSON: &str = "http://opcfoundation.org/UA-Profile/Transport/https-uajson";
 
 /// Largest request line plus headers.
 const MAX_HEAD: usize = 16 * 1024;
@@ -147,10 +150,12 @@ struct Head {
     length: Option<usize>,
     chunked: bool,
     close: bool,
+    /// The body uses the JSON encoding (https-uajson), not UA binary.
+    json: bool,
 }
 
 fn read_head(r: &mut impl BufRead, line: &mut String) -> io::Result<Option<Head>> {
-    let mut head = Head { post: false, length: None, chunked: false, close: false };
+    let mut head = Head { post: false, length: None, chunked: false, close: false, json: false };
     let mut total = 0;
     let mut first = true;
     loop {
@@ -185,15 +190,21 @@ fn read_head(r: &mut impl BufRead, line: &mut String) -> io::Result<Option<Head>
             head.chunked = value.eq_ignore_ascii_case("chunked");
         } else if name.eq_ignore_ascii_case("connection") {
             head.close = value.eq_ignore_ascii_case("close");
+        } else if name.eq_ignore_ascii_case("content-type") {
+            head.json = value.as_bytes().windows(4).any(|w| w.eq_ignore_ascii_case(b"json"));
         }
     }
 }
 
 fn respond(w: &mut impl Write, code: &str, body: &[u8], close: bool) -> io::Result<()> {
+    respond_as(w, code, "application/octet-stream", body, close)
+}
+
+fn respond_as(w: &mut impl Write, code: &str, content_type: &str, body: &[u8], close: bool) -> io::Result<()> {
     let mut head = Vec::with_capacity(160);
     write!(
         head,
-        "HTTP/1.1 {code}\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\n{}\r\n",
+        "HTTP/1.1 {code}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n{}\r\n",
         body.len(),
         if close { "Connection: close\r\n" } else { "" }
     )?;
@@ -217,6 +228,7 @@ fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerCo
     let mut conn = services::ConnState::new(limits.max_message_size as usize);
     let mut line = String::new();
     let mut body = Vec::new();
+    let mut json_in = Vec::new();
     let mut tx: Vec<u8> = Vec::with_capacity(limits.buffer_size as usize);
     let mut request_id = 0u32;
     loop {
@@ -261,6 +273,26 @@ fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerCo
         tx.clear();
         tx.resize(MSG_HEADER_LEN, 0);
         conn.request_id = request_id;
+        // The JSON encoding is transcoded to and from UA binary around the
+        // service layer, which only knows the binary encoding.
+        let ns = if head.json {
+            server.store.cached(&mut space);
+            let ns = space.clone().expect("cached");
+            json_in.clear();
+            if let Err(e) = Transcoder::new(&ns.namespaces).message_to_binary(&body, &mut json_in) {
+                crate::log!("https json request rejected: {e}");
+                respond_as(tls.get_mut(), "400 Bad Request", "text/plain", e.as_bytes(), head.close)?;
+                if head.close {
+                    return Ok(());
+                }
+                continue;
+            }
+            std::mem::swap(&mut body, &mut json_in);
+            Some(ns)
+        } else {
+            None
+        };
+        security.json = head.json;
         let mut r = Reader::new(&body);
         let handle = {
             let mut w = Writer::new(&mut tx);
@@ -284,7 +316,17 @@ fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerCo
             tx.truncate(MSG_HEADER_LEN);
             services::write_fault(&mut Writer::new(&mut tx), handle, crate::types::status::BAD_RESPONSE_TOO_LARGE);
         }
-        respond(tls.get_mut(), "200 OK", &tx[MSG_HEADER_LEN..], head.close)?;
+        match ns {
+            None => respond(tls.get_mut(), "200 OK", &tx[MSG_HEADER_LEN..], head.close)?,
+            Some(ns) => match Transcoder::new(&ns.namespaces).message_to_json(&tx[MSG_HEADER_LEN..]) {
+                Ok(out) => respond_as(tls.get_mut(), "200 OK", json::CONTENT_TYPE, &out, head.close)?,
+                Err(e) => {
+                    crate::log!("https json response not encodable: {e}");
+                    respond_as(tls.get_mut(), "500 Internal Server Error", "text/plain", e.as_bytes(), true)?;
+                    return Ok(());
+                }
+            },
+        }
         if head.close {
             return Ok(());
         }

@@ -133,7 +133,7 @@ impl fmt::Display for NodeId {
 
 /// GUIDs are encoded in binary as Data1 (LE u32), Data2 (LE u16), Data3 (LE u16), Data4 (8 bytes).
 /// We store them directly in that wire layout.
-fn parse_guid(text: &str) -> Option<[u8; 16]> {
+pub fn parse_guid(text: &str) -> Option<[u8; 16]> {
     let hex: Vec<u8> = text.bytes().filter(|b| *b != b'-').collect();
     if hex.len() != 32 || text.len() != 36 {
         return None;
@@ -151,7 +151,7 @@ fn parse_guid(text: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
-fn format_guid(g: &[u8; 16]) -> String {
+pub fn format_guid(g: &[u8; 16]) -> String {
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
         g[3], g[2], g[1], g[0], g[5], g[4], g[7], g[6], g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]
