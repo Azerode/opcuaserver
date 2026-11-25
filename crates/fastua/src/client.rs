@@ -570,6 +570,23 @@ impl Client {
         let token = r.node_id().map_err(|_| invalid("bad token"))?;
         r.f64().map_err(|_| invalid("bad timeout"))?;
         let server_nonce = r.bytes().map_err(|_| invalid("bad nonce"))?.unwrap_or(&[]).to_vec();
+        r.bytes().map_err(|_| invalid("bad certificate"))?;
+        // PolicyIds of the anonymous and user name tokens the server offers on
+        // our endpoint (they are server-defined strings).
+        let (policy_uri, mode) = match &self.sec {
+            Some(s) => (s.policy.uri(), s.mode as i32),
+            None => (Policy::None.uri(), Mode::None as i32),
+        };
+        let endpoints = r.array(0, |r| read_endpoint(r)).map_err(|_| invalid("bad endpoints"))?;
+        let token_policy = |kind: i32, default: &str| {
+            let ours = endpoints.iter().filter(|e| e.0 == policy_uri && e.1 == mode);
+            ours.chain(endpoints.iter())
+                .flat_map(|e| e.2.iter())
+                .find(|t| t.1 == kind)
+                .map_or_else(|| default.to_string(), |t| t.0.clone())
+        };
+        let anonymous_policy = token_policy(0, "anonymous");
+        let username_policy = token_policy(1, crate::server::USERNAME_POLICY_ID);
 
         let signature = match &self.sec {
             Some(sec) if sec.policy.is_ecc() => {
@@ -584,8 +601,6 @@ impl Client {
                     d.extend_from_slice(last);
                     d
                 };
-                r.bytes().map_err(|_| invalid("bad certificate"))?;
-                r.array(0, |r| skip_endpoint(r)).map_err(|_| invalid("bad endpoints"))?;
                 r.array(0, |r| r.bytes().map(|_| ())).map_err(|_| invalid("bad software certificates"))?;
                 r.str().map_err(|_| invalid("bad signature"))?;
                 let server_sig = r.bytes().map_err(|_| invalid("bad signature"))?.unwrap_or(&[]).to_vec();
@@ -631,12 +646,12 @@ impl Client {
             match &token_data {
                 None => {
                     let at = w.begin_extension_object(ids::ANONYMOUS_IDENTITY_TOKEN_ENCODING);
-                    w.string("anonymous");
+                    w.string(&anonymous_policy);
                     w.end_extension_object(at);
                 }
                 Some((user, secret)) => {
                     let at = w.begin_extension_object(ids::USERNAME_IDENTITY_TOKEN_ENCODING);
-                    w.string(crate::server::USERNAME_POLICY_ID);
+                    w.string(&username_policy);
                     w.string(user);
                     w.bytes(Some(secret));
                     w.str(None);
@@ -994,8 +1009,10 @@ pub struct HistoryResult {
     pub modifications: Vec<(i64, u32, String)>,
 }
 
-/// Skips an EndpointDescription.
-fn skip_endpoint(r: &mut Reader) -> crate::codec::DResult<()> {
+/// EndpointDescription: (security policy URI, security mode, user token
+/// policies as (policyId, token type)).
+#[allow(clippy::type_complexity)]
+fn read_endpoint(r: &mut Reader) -> crate::codec::DResult<(String, i32, Vec<(String, i32)>)> {
     r.str()?;
     r.str()?;
     r.str()?;
@@ -1005,17 +1022,19 @@ fn skip_endpoint(r: &mut Reader) -> crate::codec::DResult<()> {
     r.str()?;
     r.skip_string_array()?;
     r.bytes()?;
-    r.u32()?;
-    r.str()?;
-    r.array(0, |r| {
+    let mode = r.u32()? as i32;
+    let policy = r.str()?.unwrap_or("").to_string();
+    let tokens = r.array(0, |r| {
+        let id = r.str()?.unwrap_or("").to_string();
+        let kind = r.i32()?;
         r.str()?;
-        r.i32()?;
         r.str()?;
         r.str()?;
-        r.str().map(|_| ())
+        Ok((id, kind))
     })?;
     r.str()?;
-    r.u8().map(|_| ())
+    r.u8()?;
+    Ok((policy, mode, tokens))
 }
 
 /// Skips a ResponseHeader; returns the ECDHKey (public key, signature) of its
