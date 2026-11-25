@@ -194,30 +194,10 @@ impl AddressSpace {
     }
 }
 
-/// Parent of each standard reference type (namespace 0).
-const REF_TYPE_PARENT: &[(u32, u32)] = &[
-    (ids::HIERARCHICAL_REFERENCES, ids::REFERENCES),
-    (ids::NON_HIERARCHICAL_REFERENCES, ids::REFERENCES),
-    (ids::HAS_CHILD, ids::HIERARCHICAL_REFERENCES),
-    (ids::ORGANIZES, ids::HIERARCHICAL_REFERENCES),
-    (ids::HAS_EVENT_SOURCE, ids::HIERARCHICAL_REFERENCES),
-    (ids::HAS_MODELLING_RULE, ids::NON_HIERARCHICAL_REFERENCES),
-    (ids::HAS_ENCODING, ids::NON_HIERARCHICAL_REFERENCES),
-    (ids::HAS_DESCRIPTION, ids::NON_HIERARCHICAL_REFERENCES),
-    (ids::HAS_TYPE_DEFINITION, ids::NON_HIERARCHICAL_REFERENCES),
-    (ids::GENERATES_EVENT, ids::NON_HIERARCHICAL_REFERENCES),
-    (ids::AGGREGATES, ids::HAS_CHILD),
-    (ids::HAS_SUBTYPE, ids::HAS_CHILD),
-    (ids::HAS_PROPERTY, ids::AGGREGATES),
-    (ids::HAS_COMPONENT, ids::AGGREGATES),
-    (ids::HAS_NOTIFIER, ids::HAS_EVENT_SOURCE),
-    (ids::HAS_ORDERED_COMPONENT, ids::HAS_COMPONENT),
-    (ids::HAS_CONDITION, ids::NON_HIERARCHICAL_REFERENCES),
-];
-
+/// Parent of a standard reference type (namespace 0).
 #[inline]
 pub fn ref_type_parent(t: u32) -> Option<u32> {
-    REF_TYPE_PARENT.iter().find(|(c, _)| *c == t).map(|(_, p)| *p)
+    crate::ns0::ref_type_parent(t)
 }
 
 /// Whether `t` is `base` or (when `include_subtypes`) one of its subtypes.
@@ -555,9 +535,7 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
             NodeKind::ReferenceType { is_abstract: abs, symmetric: sym, inverse_name: inverse.map(LocalizedText::new) },
         );
     }
-    for &(child, parent) in REF_TYPE_PARENT {
-        b.subtype(parent, child);
-    }
+    // Their HasSubtype hierarchy comes from the nodeset (merge_nodeset).
     let (rtf, refs) = (b.idx(ids::REFERENCE_TYPES_FOLDER), b.idx(ids::REFERENCES));
     b.link(rtf, ids::ORGANIZES, refs);
 
@@ -710,6 +688,57 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
         ValueSource::Static(Variant::Int32(0)),
     );
     build_server_details(b, info);
+    merge_nodeset(b);
+}
+
+/// Completes namespace 0 from the official nodeset (see [`crate::ns0`]).
+///
+/// Nodes built above keep their attributes and live values; the nodeset adds
+/// the missing nodes and references. A node keeps at most one
+/// HasTypeDefinition and one HasModellingRule, and two nodes already linked
+/// by a hierarchical reference get no second one.
+fn merge_nodeset(b: &mut Builder) {
+    let nodes = crate::ns0::nodes();
+    // Every reference appears on both of its nodes: keep the forward side.
+    let mut refs = Vec::with_capacity(nodes.iter().map(|n| n.refs.len()).sum::<usize>() / 2);
+    for n in nodes {
+        refs.extend(n.refs.iter().filter(|r| r.1).map(|&(t, _, d)| (n.id, t, d)));
+        let id = NodeId::ns0(n.id);
+        if let Some(&i) = b.index.get(&id) {
+            let node = &mut b.nodes[i as usize];
+            if node.description.is_none() {
+                node.description = n.description;
+            }
+            continue;
+        }
+        b.nodes.push(Node {
+            id: id.clone(),
+            browse_name: n.browse_name,
+            display_name: n.display_name,
+            description: n.description,
+            refs: Vec::with_capacity(n.refs.len()),
+            kind: n.kind,
+        });
+        b.index.insert(id, b.nodes.len() as u32 - 1);
+    }
+    let hierarchical = |t| ref_type_matches(t, ids::HIERARCHICAL_REFERENCES, true);
+    for (s, t, d) in refs {
+        let (Some(&si), Some(&di)) = (b.index.get(&NodeId::ns0(s)), b.index.get(&NodeId::ns0(d))) else {
+            continue;
+        };
+        let single = t == ids::HAS_TYPE_DEFINITION || t == ids::HAS_MODELLING_RULE;
+        let linked = b.nodes[si as usize].refs.iter().any(|r| {
+            r.forward
+                && (r.type_id == t && (single || r.target == di)
+                    || r.target == di && hierarchical(t) && hierarchical(r.type_id))
+        });
+        // A type has one supertype.
+        let second_parent = t == ids::HAS_SUBTYPE
+            && b.nodes[di as usize].refs.iter().any(|r| !r.forward && r.type_id == ids::HAS_SUBTYPE);
+        if !linked && !second_parent {
+            b.link(si, t, di);
+        }
+    }
 }
 
 /// ServerStatus/BuildInfo, ServerCapabilities, diagnostics, redundancy,
@@ -767,6 +796,21 @@ fn build_server_details(b: &mut Builder, info: &ServerInfo) {
     b.property(11702, "MaxArrayLength", caps, 7, -1, fixed(Variant::UInt32(l.max_message_size)));
     b.property(11703, "MaxStringLength", caps, 7, -1, fixed(Variant::UInt32(l.max_message_size)));
     b.property(12911, "MaxByteStringLength", caps, 7, -1, fixed(Variant::UInt32(l.max_message_size)));
+    // OPC UA 1.05 capabilities (0 = no limit).
+    let sat = |v: usize| Variant::UInt32(v.min(u32::MAX as usize) as u32);
+    let subs = l.max_sessions.saturating_mul(l.max_subscriptions_per_session);
+    for (id, name, value) in [
+        (24095, "MaxSessions", sat(l.max_sessions)),
+        (24096, "MaxSubscriptions", sat(subs)),
+        (24097, "MaxMonitoredItems", sat(subs.saturating_mul(l.max_monitored_items_per_subscription))),
+        (24098, "MaxSubscriptionsPerSession", sat(l.max_subscriptions_per_session)),
+        (24104, "MaxMonitoredItemsPerSubscription", sat(l.max_monitored_items_per_subscription)),
+        (24099, "MaxSelectClauseParameters", Variant::UInt32(0)),
+        (24100, "MaxWhereClauseParameters", Variant::UInt32(0)),
+        (31916, "MaxMonitoredItemsQueueSize", Variant::UInt32(l.max_queue_size)),
+    ] {
+        b.property(id, name, caps, 7, -1, fixed(value));
+    }
     let ops = ids::OPERATION_LIMITS;
     b.object(ops, "OperationLimits", caps, ids::OPERATION_LIMITS_TYPE);
     let per_call = Variant::UInt32(l.max_operations_per_request.min(u32::MAX as usize) as u32);
@@ -921,7 +965,7 @@ pub fn build(
     }
     let namespaces = registry.uris().to_vec();
 
-    let capacity = 128
+    let capacity = 6144
         + configs
             .iter()
             .map(|c| {
@@ -1087,7 +1131,8 @@ pub fn build(
 
 /// Builds the direct lookup tables of [`AddressSpace::dense`]. A namespace
 /// gets one when its largest numeric id is at most 4x its numeric node count
-/// (plus a small slack) and below 2^24: at most 16 bytes per node.
+/// (plus a small slack) and below 2^24: at most 16 bytes per node. Namespace 0
+/// always gets one.
 fn dense_tables(nodes: &[Node], namespaces: usize) -> Vec<Box<[u32]>> {
     let mut stats = vec![(0usize, 0u32); namespaces];
     for n in nodes {
@@ -1100,9 +1145,11 @@ fn dense_tables(nodes: &[Node], namespaces: usize) -> Vec<Box<[u32]>> {
     }
     let mut tables: Vec<Box<[u32]>> = stats
         .iter()
-        .map(|&(count, max)| {
+        .enumerate()
+        .map(|(ns, &(count, max))| {
             let len = max as usize + 1;
-            if count > 0 && len <= 4 * count + 64 && len < 1 << 24 {
+            // Namespace 0 (~5 500 nodes up to i=33 000) always gets one: 130 KB.
+            if count > 0 && (len <= 4 * count + 64 || ns == 0) && len < 1 << 24 {
                 vec![u32::MAX; len].into_boxed_slice()
             } else {
                 Box::default()
@@ -1249,6 +1296,79 @@ mod tests {
             1,
         );
         assert!(err.is_err());
+    }
+
+    /// Namespace 0 matches the official nodeset and is well formed.
+    #[test]
+    fn namespace_zero_is_complete_and_consistent() {
+        let mut reg = NamespaceRegistry::new("urn:test");
+        let a = build(&[cfg("A", &[(1, builtin::INT32)])], &mut reg, None, Arc::new(ServerInfo::default()), 1).unwrap();
+        let mut problems = Vec::new();
+        for n in crate::ns0::nodes() {
+            match a.get(&NodeId::ns0(n.id)) {
+                None => problems.push(format!("i={} missing", n.id)),
+                Some(m) if m.browse_name != n.browse_name => {
+                    problems.push(format!("i={}: browse name {} vs {}", n.id, m.browse_name.name, n.browse_name.name))
+                }
+                Some(m) if std::mem::discriminant(&m.kind) != std::mem::discriminant(&n.kind) => {
+                    problems.push(format!("i={}: node class {:?}", n.id, m.class()))
+                }
+                _ => {}
+            }
+        }
+        let hier = |t| ref_type_matches(t, ids::HIERARCHICAL_REFERENCES, true);
+        for (i, n) in a.nodes.iter().enumerate() {
+            let count = |f: &dyn Fn(&Ref) -> bool| n.refs.iter().filter(|r| f(r)).count();
+            if count(&|r| r.forward && r.type_id == ids::HAS_TYPE_DEFINITION) > 1 {
+                problems.push(format!("{}: several type definitions", n.id));
+            }
+            if matches!(n.class(), NodeClass::Object | NodeClass::Variable)
+                && count(&|r| r.forward && r.type_id == ids::HAS_TYPE_DEFINITION) == 0
+            {
+                problems.push(format!("{}: no type definition", n.id));
+            }
+            if count(&|r| !r.forward && r.type_id == ids::HAS_SUBTYPE) > 1 {
+                problems.push(format!("{}: several supertypes", n.id));
+            }
+            for r in &n.refs {
+                let twins = n
+                    .refs
+                    .iter()
+                    .filter(|o| o.forward == r.forward && o.target == r.target && hier(o.type_id) && hier(r.type_id))
+                    .count();
+                if r.forward && hier(r.type_id) && twins > 1 {
+                    problems.push(format!("{} -> {}: several hierarchical references", n.id, a.node(r.target).id));
+                }
+                let back = a
+                    .node(r.target)
+                    .refs
+                    .iter()
+                    .any(|o| o.type_id == r.type_id && o.forward != r.forward && o.target == i as u32);
+                if !back {
+                    problems.push(format!("{}: reference without its inverse", n.id));
+                }
+            }
+        }
+        // Everything is reachable from Root, or from one of the few standalone
+        // nodes of the nodeset (the DataTypeEncoding names, some property
+        // names, the FileSystem object): nodes no reference points to.
+        let roots: Vec<u32> = (0..a.nodes.len() as u32).filter(|&i| a.node(i).refs.iter().all(|r| r.forward)).collect();
+        assert!(roots.len() < 64, "{} nodes without parent", roots.len());
+        let mut seen = vec![false; a.nodes.len()];
+        let mut stack = roots;
+        while let Some(i) = stack.pop() {
+            if std::mem::replace(&mut seen[i as usize], true) {
+                continue;
+            }
+            stack.extend(a.node(i).refs.iter().filter(|r| r.forward).map(|r| r.target));
+        }
+        let orphans: Vec<_> = a.nodes.iter().zip(&seen).filter(|(_, s)| !**s).map(|(n, _)| n.id.to_string()).collect();
+        if !orphans.is_empty() {
+            problems.push(format!("{} unreachable nodes, e.g. {:?}", orphans.len(), &orphans[..orphans.len().min(10)]));
+        }
+        problems.sort();
+        problems.dedup();
+        assert!(problems.is_empty(), "{} problems:\n{}", problems.len(), problems[..problems.len().min(60)].join("\n"));
     }
 
     #[test]

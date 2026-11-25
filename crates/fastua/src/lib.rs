@@ -12,6 +12,7 @@ pub mod ecc;
 pub mod events;
 pub mod history;
 pub mod net;
+pub mod ns0;
 pub mod pki;
 pub mod reload;
 pub mod server;

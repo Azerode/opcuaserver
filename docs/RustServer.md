@@ -82,6 +82,26 @@ NodeId and type keeps its current value across reloads.
 the loopback round-trip latency, the secure channel costs, the subscription
 engine cost per item and the write -> notification latency.
 
+## Namespace 0
+
+The address space holds the whole namespace 0 of the specification: the 5 477
+nodes of `Opc.Ua.NodeSet2.xml` 1.05.07 (types with their instance declarations,
+DataType encodings, EnumStrings and EnumValues, method arguments, the complete
+Server object).
+
+- `tools/gen_ns0.py` compiles the nodeset into `data/ns0.bin` (attributes,
+  static values in UA binary, references) and `src/ns0_ref_types.rs` (the
+  reference type hierarchy). The binary embeds the table: no file to ship.
+- On each build of the address space, fastua first creates the nodes it serves
+  live values for (ServerStatus, capabilities, history, alarms...), then merges
+  the table: missing nodes and references are added, a node keeps one type
+  definition and one supertype. Standard methods that fastua does not implement
+  have `Executable = false`.
+- Cost: about 2 ms per configuration load, 1.2 MB of binary, and nothing per
+  request. Namespace 0 always gets a direct lookup table (130 KB).
+- CI regenerates the tables from the tagged nodeset and fails if they differ.
+  To move to a newer nodeset, change `NODESET_TAG` and run the script.
+
 ## Subscriptions
 
 Every Subscription and MonitoredItem service is implemented: CreateSubscription,
@@ -400,5 +420,5 @@ those elements are compared and reported, through the Variant path) and events w
 [Events](#events)), alarms and conditions (see
 [Alarms and conditions](#alarms-and-conditions)).
 
-Not yet: the full namespace 0 nodeset, condition branches and shelving, event history,
+Not yet: condition branches and shelving, event history,
 history persistence across restarts, the deprecated non-AEAD ECC policies.
