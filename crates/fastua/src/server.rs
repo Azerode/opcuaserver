@@ -244,7 +244,14 @@ impl Server {
     #[inline]
     pub(crate) fn acquire_spin(&self) -> bool {
         let limit = self.spin_limit.load(Ordering::Relaxed);
-        self.spinners.fetch_update(Ordering::Acquire, Ordering::Relaxed, |n| (n < limit).then_some(n + 1)).is_ok()
+        let mut n = self.spinners.load(Ordering::Relaxed);
+        while n < limit {
+            match self.spinners.compare_exchange_weak(n, n + 1, Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => return true,
+                Err(now) => n = now,
+            }
+        }
+        false
     }
 
     /// True when more connections spin than the sampler allows now: the
