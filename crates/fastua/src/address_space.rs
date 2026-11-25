@@ -113,6 +113,10 @@ impl Default for ServerInfo {
 pub struct AddressSpace {
     pub nodes: Vec<Node>,
     index: FxHashMap<NodeId, u32>,
+    /// Per namespace, numeric id -> node index (`u32::MAX` = absent) when the
+    /// namespace's numeric ids are dense enough: one bounds check and one load
+    /// instead of hashing and probing. Empty for sparse namespaces.
+    dense: Vec<Box<[u32]>>,
     pub namespaces: Vec<Arc<str>>,
     pub generation: u64,
     pub info: Arc<ServerInfo>,
@@ -121,6 +125,12 @@ pub struct AddressSpace {
 impl AddressSpace {
     #[inline]
     pub fn find(&self, id: &NodeId) -> Option<u32> {
+        if let NodeId::Numeric(ns, v) = *id {
+            if let Some(t) = self.dense.get(ns as usize).filter(|t| !t.is_empty()) {
+                // The table holds every numeric id of the namespace.
+                return t.get(v as usize).copied().filter(|&i| i != u32::MAX);
+            }
+        }
         self.index.get(id).copied()
     }
 
@@ -568,7 +578,42 @@ pub fn build(
         }
     }
 
-    Ok(AddressSpace { nodes: b.nodes, index: b.index, namespaces, generation, info })
+    let dense = dense_tables(&b.nodes, namespaces.len());
+    Ok(AddressSpace { nodes: b.nodes, index: b.index, dense, namespaces, generation, info })
+}
+
+/// Builds the direct lookup tables of [`AddressSpace::dense`]. A namespace
+/// gets one when its largest numeric id is at most 4x its numeric node count
+/// (plus a small slack) and below 2^24: at most 16 bytes per node.
+fn dense_tables(nodes: &[Node], namespaces: usize) -> Vec<Box<[u32]>> {
+    let mut stats = vec![(0usize, 0u32); namespaces];
+    for n in nodes {
+        if let NodeId::Numeric(ns, v) = n.id {
+            if let Some(s) = stats.get_mut(ns as usize) {
+                s.0 += 1;
+                s.1 = s.1.max(v);
+            }
+        }
+    }
+    let mut tables: Vec<Box<[u32]>> = stats
+        .iter()
+        .map(|&(count, max)| {
+            let len = max as usize + 1;
+            if count > 0 && len <= 4 * count + 64 && len < 1 << 24 {
+                vec![u32::MAX; len].into_boxed_slice()
+            } else {
+                Box::default()
+            }
+        })
+        .collect();
+    for (i, n) in nodes.iter().enumerate() {
+        if let NodeId::Numeric(ns, v) = n.id {
+            if let Some(t) = tables.get_mut(ns as usize).filter(|t| !t.is_empty()) {
+                t[v as usize] = i as u32;
+            }
+        }
+    }
+    tables
 }
 
 /// Encodes the ServerStatusDataType structure (as an ExtensionObject body).
@@ -618,6 +663,27 @@ mod tests {
                     .collect(),
             }],
         }
+    }
+
+    /// The direct tables must give the same answers as the hash index.
+    #[test]
+    fn dense_and_hash_lookups_agree() {
+        let info = Arc::new(ServerInfo::default());
+        let mut reg = NamespaceRegistry::new("urn:test");
+        let dense: Vec<(u32, u8)> = (0..50).map(|i| (i * 2, builtin::INT32)).collect();
+        let sparse = [(5, builtin::INT32), (1_000_000, builtin::DOUBLE)];
+        let a = build(&[cfg("D", &dense), cfg("S", &sparse)], &mut reg, None, info, 1).unwrap();
+        assert!(!a.dense[2].is_empty(), "namespace D should get a table");
+        assert!(a.dense[3].is_empty(), "namespace S is too sparse");
+        for ns in 0..5u16 {
+            for v in (0..120).chain([1_000_000, u32::MAX]) {
+                let id = NodeId::Numeric(ns, v);
+                assert_eq!(a.find(&id), a.index.get(&id).copied(), "{id}");
+            }
+        }
+        assert!(a.find(&NodeId::Numeric(2, 4)).is_some());
+        assert!(a.find(&NodeId::Numeric(2, 5)).is_none());
+        assert!(a.find(&NodeId::Numeric(3, 1_000_000)).is_some());
     }
 
     #[test]

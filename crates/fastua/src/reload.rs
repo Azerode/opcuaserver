@@ -48,6 +48,18 @@ impl Store {
         self.space.load()
     }
 
+    /// Current snapshot through a per-connection cache: one atomic load per
+    /// request while the configuration does not change, instead of arc-swap's
+    /// debt protocol (~4x more work).
+    #[inline(always)]
+    pub fn cached<'c>(&self, cache: &'c mut Option<Arc<AddressSpace>>) -> &'c AddressSpace {
+        let generation = self.generation.load(Ordering::Acquire);
+        if !cache.as_ref().is_some_and(|s| s.generation == generation) {
+            *cache = Some(self.space.load_full());
+        }
+        cache.as_ref().unwrap()
+    }
+
     #[inline]
     pub fn load_full(&self) -> Arc<AddressSpace> {
         self.space.load_full()
@@ -69,7 +81,8 @@ impl Store {
         let generation = self.generation.load(Ordering::Relaxed) + 1;
         let space = address_space::build(&configs, &mut registry, Some(&previous), self.info.clone(), generation)?;
         self.space.store(Arc::new(space));
-        self.generation.store(generation, Ordering::Relaxed);
+        // Published after the snapshot: a reader that sees the new number loads the new snapshot.
+        self.generation.store(generation, Ordering::Release);
         Ok(generation)
     }
 

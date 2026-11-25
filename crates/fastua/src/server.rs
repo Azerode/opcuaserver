@@ -11,7 +11,7 @@ use crate::users::{Access, Users};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub const SECURITY_POLICY_NONE: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
 pub const TRANSPORT_PROFILE_BINARY: &str = "http://opcfoundation.org/UA-Profile/Transport/uatcp-uasc-uabinary";
@@ -68,6 +68,10 @@ pub struct ServerConfig {
     pub anonymous: Option<Access>,
     /// Rights of users authenticated by a trusted X.509 certificate.
     pub x509_users: Access,
+    /// How long a connection thread polls its socket before sleeping (zero =
+    /// never). Removes the wake-up latency at the cost of a busy core per
+    /// connection while its client is idle.
+    pub busy_poll: Duration,
 }
 
 impl ServerConfig {
@@ -85,6 +89,7 @@ impl ServerConfig {
             endpoints,
             anonymous: Some(Access::ReadOnly),
             x509_users: Access::ReadWrite,
+            busy_poll: Duration::ZERO,
         }
     }
 }
@@ -112,7 +117,10 @@ pub struct Session {
     pub activated: AtomicBool,
     pub closed: AtomicBool,
     pub timeout_ms: f64,
-    /// Milliseconds since server start of the last request.
+    /// Set by every request (a plain store, no clock read on the hot path).
+    pub touched: AtomicBool,
+    /// Milliseconds since server start of the last activity, as seen by the
+    /// once-a-second sweeper.
     pub last_seen: AtomicU64,
     pub continuation_points: Mutex<Vec<ContinuationPoint>>,
     /// Security of the channel the session was created on.
@@ -128,7 +136,7 @@ pub struct Server {
     pki: Arc<Pki>,
     pub users: Users,
     pub config: ServerConfig,
-    started: Instant,
+    started: u64,
     sessions: Mutex<FxHashMap<NodeId, Arc<Session>>>,
     next_session: AtomicU32,
     next_channel: AtomicU32,
@@ -216,7 +224,7 @@ impl Server {
             pki,
             users,
             config,
-            started: Instant::now(),
+            started: coarse_ms(),
             sessions: Mutex::new(FxHashMap::default()),
             next_session: AtomicU32::new(1),
             next_channel: AtomicU32::new(1),
@@ -243,9 +251,11 @@ impl Server {
         &self.config.limits
     }
 
+    /// Milliseconds since start, from the coarse monotonic clock (a few ns,
+    /// ~1-4 ms resolution): only used for session idle timeouts.
     #[inline]
     pub fn uptime_ms(&self) -> u64 {
-        self.started.elapsed().as_millis() as u64
+        coarse_ms().wrapping_sub(self.started)
     }
 
     pub fn endpoints_encoded(&self) -> &[u8] {
@@ -277,16 +287,19 @@ impl Server {
         if sessions.len() >= self.limits().max_sessions {
             return Err(status::BAD_TOO_MANY_SESSIONS);
         }
-        let mut token = [0u8; 32];
+        // 128 random bits as a Guid NodeId: decoded without a heap allocation
+        // on every request, unlike a ByteString token.
+        let mut token = [0u8; 16];
         random_bytes(&mut token);
         let session = Arc::new(Session {
             id: NodeId::Numeric(1, self.next_session.fetch_add(1, Ordering::Relaxed)),
-            token: NodeId::Opaque(1, token.into()),
+            token: NodeId::Guid(1, token),
             name,
             channel_id: AtomicU32::new(channel_id),
             activated: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             timeout_ms,
+            touched: AtomicBool::new(false),
             last_seen: AtomicU64::new(self.uptime_ms()),
             continuation_points: Mutex::new(Vec::new()),
             security,
@@ -312,6 +325,9 @@ impl Server {
         let now = self.uptime_ms();
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         sessions.retain(|_, s| {
+            if s.touched.swap(false, Ordering::Relaxed) {
+                s.last_seen.store(now, Ordering::Relaxed);
+            }
             let idle = now.saturating_sub(s.last_seen.load(Ordering::Relaxed)) as f64;
             let keep = idle <= s.timeout_ms;
             if !keep {
@@ -351,6 +367,9 @@ impl Server {
         let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
         let r = std::thread::Builder::new().name("fastua-conn".into()).spawn(move || {
             let _ = stream.set_nodelay(true);
+            if !server.config.busy_poll.is_zero() {
+                crate::net::set_kernel_busy_poll(&stream, server.config.busy_poll);
+            }
             if let Err(e) = crate::channel::run(&server, stream) {
                 crate::log!("connection {peer} closed: {e}");
             }
@@ -359,4 +378,14 @@ impl Server {
             crate::log!("cannot spawn connection thread: {e}");
         }
     }
+}
+
+/// CLOCK_MONOTONIC_COARSE in milliseconds: read from the vDSO without touching
+/// the TSC, ~6x cheaper than `Instant::now()`.
+#[inline]
+fn coarse_ms() -> u64 {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid pointer; CLOCK_MONOTONIC_COARSE exists on every Linux.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut t) };
+    t.tv_sec as u64 * 1000 + t.tv_nsec as u64 / 1_000_000
 }

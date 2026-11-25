@@ -21,7 +21,9 @@ const USAGE: &str = "usage: fastua [options]
   --users FILE            users file enabling user name / password login
   --anonymous off|read|write   rights of anonymous users (default: read)
   --x509-users read|write      rights of users with a trusted certificate (default: write)
-  --trust-all-clients     accept any client certificate (development only)";
+  --trust-all-clients     accept any client certificate (development only)
+  --busy-poll US          poll each connection for US microseconds before sleeping
+                          (lower latency, one busy core per active connection; default: off)";
 
 fn fail(msg: String) -> ! {
     eprintln!("{msg}");
@@ -63,6 +65,7 @@ fn main() {
     let mut anonymous = Some(Access::ReadOnly);
     let mut x509_users = Access::ReadWrite;
     let mut trust_all = false;
+    let mut busy_poll = std::time::Duration::ZERO;
 
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().map(String::as_str) == Some("hash-password") {
@@ -85,6 +88,11 @@ fn main() {
             "--anonymous" => anonymous = parse_access(&value("--anonymous"), true),
             "--x509-users" => x509_users = parse_access(&value("--x509-users"), false).unwrap(),
             "--trust-all-clients" => trust_all = true,
+            "--busy-poll" => {
+                let v = value("--busy-poll");
+                let us: u64 = v.parse().unwrap_or_else(|_| fail(format!("invalid --busy-poll '{v}'\n\n{USAGE}")));
+                busy_poll = std::time::Duration::from_micros(us);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -133,6 +141,10 @@ fn main() {
     }
     config.anonymous = anonymous;
     config.x509_users = x509_users;
+    config.busy_poll = busy_poll;
+    if !busy_poll.is_zero() {
+        fastua::log!("busy-polling connections for {} us before sleeping", busy_poll.as_micros());
+    }
     for (p, m) in &config.endpoints {
         fastua::log!("endpoint {endpoint} {p:?} {m:?}");
     }

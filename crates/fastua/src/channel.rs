@@ -6,6 +6,7 @@
 //! signed and encrypted in place behind a reserved header and sent with one
 //! `write` syscall.
 
+use crate::address_space::AddressSpace;
 use crate::codec::{Reader, Writer};
 use crate::crypto::{self, ChannelKeys, Mode, Policy, SymKeys, SYM_SIGNATURE_LEN};
 use crate::pki::CertInfo;
@@ -73,6 +74,13 @@ pub struct Connection<'a> {
     next_seq: u32,
     last_client_seq: Option<u32>,
     hdr: [u8; 8],
+    /// Receive buffer: the header and body of a chunk (and pipelined
+    /// requests) arrive with one `recv` instead of two `read_exact`.
+    inbuf: Box<[u8]>,
+    in_start: usize,
+    in_end: usize,
+    /// Busy-poll period before sleeping in `recv` (zero = off).
+    spin: std::time::Duration,
     rx: Vec<u8>,
     tx: Vec<u8>,
     out: Vec<u8>,
@@ -80,6 +88,7 @@ pub struct Connection<'a> {
     assembly_chunks: u32,
     assembly_request: u32,
     session: Option<Arc<Session>>,
+    space: Option<Arc<AddressSpace>>,
 }
 
 #[derive(Debug)]
@@ -122,6 +131,10 @@ pub fn run(server: &Arc<Server>, stream: TcpStream) -> io::Result<()> {
         next_seq: 1,
         last_client_seq: None,
         hdr: [0; 8],
+        inbuf: vec![0; limits.buffer_size.max(MIN_BUFFER) as usize].into_boxed_slice(),
+        in_start: 0,
+        in_end: 0,
+        spin: server.config.busy_poll,
         rx: Vec::with_capacity(limits.buffer_size as usize),
         tx: Vec::with_capacity(limits.buffer_size as usize + 64),
         out: Vec::new(),
@@ -129,6 +142,7 @@ pub fn run(server: &Arc<Server>, stream: TcpStream) -> io::Result<()> {
         assembly_chunks: 0,
         assembly_request: 0,
         session: None,
+        space: None,
     };
     match c.serve() {
         Ok(()) | Err(Fatal::Closed) => Ok(()),
@@ -142,9 +156,31 @@ pub fn run(server: &Arc<Server>, stream: TcpStream) -> io::Result<()> {
 }
 
 impl<'a> Connection<'a> {
+    /// Receives more bytes into `inbuf` (compacting it first if needed).
+    fn fill(&mut self) -> Result<(), Fatal> {
+        if self.in_start == self.in_end {
+            self.in_start = 0;
+            self.in_end = 0;
+        } else if self.in_end == self.inbuf.len() {
+            self.inbuf.copy_within(self.in_start..self.in_end, 0);
+            self.in_end -= self.in_start;
+            self.in_start = 0;
+        }
+        let n = crate::net::recv(&mut self.stream, &mut self.inbuf[self.in_end..], self.spin)?;
+        if n == 0 {
+            return Err(Fatal::Io(io::ErrorKind::UnexpectedEof.into()));
+        }
+        self.in_end += n;
+        Ok(())
+    }
+
     /// Reads one chunk: header into `hdr`, the rest into `rx`.
     fn read_chunk(&mut self, limit: u32) -> Result<([u8; 3], u8), Fatal> {
-        self.stream.read_exact(&mut self.hdr)?;
+        while self.in_end - self.in_start < 8 {
+            self.fill()?;
+        }
+        self.hdr.copy_from_slice(&self.inbuf[self.in_start..self.in_start + 8]);
+        self.in_start += 8;
         let size = u32::from_le_bytes(self.hdr[4..8].try_into().unwrap());
         if size < 8 {
             return Err(Fatal::Protocol(status::BAD_TCP_MESSAGE_TYPE_INVALID, "chunk too small"));
@@ -152,9 +188,16 @@ impl<'a> Connection<'a> {
         if size > limit {
             return Err(Fatal::Protocol(status::BAD_TCP_MESSAGE_TOO_LARGE, "chunk larger than receive buffer"));
         }
+        let body = size as usize - 8;
+        let have = body.min(self.in_end - self.in_start);
         self.rx.clear();
-        self.rx.resize(size as usize - 8, 0);
-        self.stream.read_exact(&mut self.rx)?;
+        self.rx.extend_from_slice(&self.inbuf[self.in_start..self.in_start + have]);
+        self.in_start += have;
+        if have < body {
+            // The rest of a large chunk goes straight into `rx`.
+            self.rx.resize(body, 0);
+            self.stream.read_exact(&mut self.rx[have..])?;
+        }
         let h = self.hdr;
         Ok(([h[0], h[1], h[2]], h[3]))
     }
@@ -418,7 +461,7 @@ impl<'a> Connection<'a> {
             w.u32(seq_out);
             w.u32(request_id);
             w.node_id(&NodeId::ns0(ids::OPEN_SECURE_CHANNEL_RESPONSE));
-            services::write_response_header(&mut w, header.handle, status::GOOD);
+            services::write_response_header(&mut w, header.now, header.handle, status::GOOD);
             w.u32(PROTOCOL_VERSION);
             w.u32(id);
             w.u32(token_id);
@@ -593,6 +636,7 @@ impl<'a> Connection<'a> {
                 channel_id: ch.id,
                 security: &ch.security,
                 session: &mut self.session,
+                space: &mut self.space,
             };
             services::dispatch(&mut ctx, &mut r, &mut w)
         };
@@ -682,7 +726,7 @@ impl<'a> Connection<'a> {
 
 /// Validates and removes `PaddingSize | Padding | [ExtraPaddingSize]` at the
 /// end of `data`; returns the length of what precedes the padding.
-fn strip_padding(data: &[u8], extra: bool) -> Option<usize> {
+pub(crate) fn strip_padding(data: &[u8], extra: bool) -> Option<usize> {
     let n = data.len();
     let tail = extra as usize;
     if n < 1 + tail {

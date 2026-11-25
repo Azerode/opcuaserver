@@ -15,6 +15,8 @@ use std::sync::Mutex;
 
 pub struct ValueCell {
     kind: u8,
+    /// Encoded size of an inline kind, 0 for String / ByteString / Guid.
+    size: u8,
     seq: AtomicU32,
     bits: AtomicU64,
     status: AtomicU32,
@@ -76,6 +78,22 @@ fn from_bits(kind: u8, b: u64) -> Variant {
     }
 }
 
+#[inline(always)]
+fn inline_size(kind: u8) -> u8 {
+    use builtin::*;
+    match kind {
+        BOOLEAN | SBYTE | BYTE => 1,
+        INT16 | UINT16 => 2,
+        INT32 | UINT32 | FLOAT => 4,
+        INT64 | UINT64 | DOUBLE | DATETIME => 8,
+        _ => 0,
+    }
+}
+
+/// Largest DataValue [`ValueCell::encode`] produces: mask, type, 8-byte value,
+/// status and two timestamps.
+pub const ENCODED_MAX: usize = 1 + 1 + 8 + 4 + 8 + 8;
+
 /// Default (zero) value of a built-in type.
 pub fn default_value(kind: u8) -> Variant {
     match kind {
@@ -91,6 +109,7 @@ impl ValueCell {
     pub fn new(kind: u8, created: i64) -> Self {
         ValueCell {
             kind,
+            size: inline_size(kind),
             seq: AtomicU32::new(0),
             bits: AtomicU64::new(0),
             status: AtomicU32::new(status::UNCERTAIN_INITIAL_VALUE),
@@ -103,6 +122,46 @@ impl ValueCell {
     #[inline(always)]
     pub fn kind(&self) -> u8 {
         self.kind
+    }
+
+    /// Encodes the current value as a DataValue straight into `out`, without
+    /// building a `Variant`. Returns the encoded length, or `None` for the
+    /// variable-length kinds (use [`ValueCell::read`]).
+    #[inline(always)]
+    pub fn encode(&self, source: bool, server: bool, out: &mut [u8; ENCODED_MAX]) -> Option<usize> {
+        let size = self.size as usize;
+        if size == 0 {
+            return None;
+        }
+        let (bits, st, src, srv) = loop {
+            let s1 = self.seq.load(Ordering::Acquire);
+            if s1 & 1 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let bits = self.bits.load(Ordering::Relaxed);
+            let st = self.status.load(Ordering::Relaxed);
+            let src = self.source_ts.load(Ordering::Relaxed);
+            let srv = self.server_ts.load(Ordering::Relaxed);
+            fence(Ordering::Acquire);
+            if self.seq.load(Ordering::Relaxed) == s1 {
+                break (bits, st, src, srv);
+            }
+        };
+        let bad = st != status::GOOD;
+        out[0] = 0x01 | (bad as u8) << 1 | (source as u8) << 2 | (server as u8) << 3;
+        out[1] = self.kind;
+        // Bits are stored zero-extended little-endian: the first `size` bytes
+        // are the encoding of the value.
+        out[2..10].copy_from_slice(&bits.to_le_bytes());
+        let mut n = 2 + size;
+        out[n..n + 4].copy_from_slice(&st.to_le_bytes());
+        n += 4 * bad as usize;
+        out[n..n + 8].copy_from_slice(&src.to_le_bytes());
+        n += 8 * source as usize;
+        out[n..n + 8].copy_from_slice(&srv.to_le_bytes());
+        n += 8 * server as usize;
+        Some(n)
     }
 
     /// Reads a consistent sample. Wait-free for readers unless a writer is
@@ -183,6 +242,53 @@ impl ValueCell {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// `encode` must produce exactly what the generic Variant encoder does.
+    #[test]
+    fn encode_matches_generic_encoder() {
+        use crate::codec::Writer;
+        let values = [
+            Variant::Boolean(true),
+            Variant::SByte(-3),
+            Variant::Byte(200),
+            Variant::Int16(-7),
+            Variant::UInt16(65000),
+            Variant::Int32(-123456),
+            Variant::UInt32(4_000_000_000),
+            Variant::Int64(-1),
+            Variant::UInt64(u64::MAX - 5),
+            Variant::Float(1.5),
+            Variant::Double(-2.25),
+            Variant::DateTime(132_000_000_000_000_000),
+        ];
+        for v in values {
+            let kind = v.type_id();
+            for st in [status::GOOD, status::UNCERTAIN_INITIAL_VALUE] {
+                let c = ValueCell::new(kind, 1);
+                c.write(&v, st, 22, 33);
+                for (src, srv) in [(false, false), (true, false), (false, true), (true, true)] {
+                    let mut buf = [0u8; ENCODED_MAX];
+                    let n = c.encode(src, srv, &mut buf).unwrap();
+                    let mut want = Vec::new();
+                    let mut w = Writer::new(&mut want);
+                    let bad = st != status::GOOD;
+                    w.u8(0x01 | (bad as u8) << 1 | (src as u8) << 2 | (srv as u8) << 3);
+                    w.variant(&v);
+                    if bad {
+                        w.u32(st);
+                    }
+                    if src {
+                        w.i64(22);
+                    }
+                    if srv {
+                        w.i64(33);
+                    }
+                    assert_eq!(&buf[..n], &want[..], "{v:?} status {st:#x} src {src} srv {srv}");
+                }
+            }
+        }
+        assert!(ValueCell::new(builtin::STRING, 0).encode(true, true, &mut [0; ENCODED_MAX]).is_none());
+    }
 
     #[test]
     fn write_then_read() {

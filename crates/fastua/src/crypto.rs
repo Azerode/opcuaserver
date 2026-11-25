@@ -231,9 +231,98 @@ pub fn p_sha256(secret: &[u8], seed: &[u8], len: usize) -> Vec<u8> {
     out
 }
 
+/// HMAC-SHA256 (RFC 2104) with the inner and outer key states hashed once,
+/// when the channel keys are derived. A MAC then costs only the compressions
+/// of the message plus one: about 3x less than recomputing the key pads on
+/// every call. Uses the SHA-NI / ARMv8 SHA-2 instructions when present.
+#[derive(Clone)]
+pub struct HmacSha256 {
+    inner: [u32; 8],
+    outer: [u32; 8],
+}
+
+const SHA256_IV: [u32; 8] =
+    [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+
+#[inline(always)]
+fn compress(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
+    // SAFETY: GenericArray<u8, U64> has the layout of [u8; 64].
+    let blocks = unsafe { std::slice::from_raw_parts(blocks.as_ptr().cast(), blocks.len()) };
+    sha2::compress256(state, blocks);
+}
+
+impl HmacSha256 {
+    pub fn new(key: &[u8]) -> HmacSha256 {
+        let mut k = [0u8; 64];
+        if key.len() > 64 {
+            k[..32].copy_from_slice(aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, key).as_ref());
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let (mut inner, mut outer) = (SHA256_IV, SHA256_IV);
+        compress(&mut inner, &[k.map(|b| b ^ 0x36)]);
+        compress(&mut outer, &[k.map(|b| b ^ 0x5c)]);
+        HmacSha256 { inner, outer }
+    }
+
+    /// MAC of the concatenation of `parts`.
+    pub fn mac(&self, parts: &[&[u8]]) -> [u8; 32] {
+        let mut state = self.inner;
+        let mut buf = [0u8; 64];
+        let mut fill = 0usize;
+        let mut total = 64u64; // the key block
+        for part in parts {
+            let mut p = *part;
+            total += p.len() as u64;
+            if fill > 0 {
+                let n = p.len().min(64 - fill);
+                buf[fill..fill + n].copy_from_slice(&p[..n]);
+                fill += n;
+                p = &p[n..];
+                if fill < 64 {
+                    continue;
+                }
+                compress(&mut state, &[buf]);
+            }
+            let full = p.len() / 64 * 64;
+            if full > 0 {
+                // SAFETY: `full` bytes are `full / 64` contiguous 64-byte blocks.
+                let blocks = unsafe { std::slice::from_raw_parts(p.as_ptr().cast::<[u8; 64]>(), full / 64) };
+                compress(&mut state, blocks);
+            }
+            let rest = &p[full..];
+            buf[..rest.len()].copy_from_slice(rest);
+            fill = rest.len();
+        }
+        // Padding: 0x80, zeros, 64-bit big-endian bit length.
+        buf[fill] = 0x80;
+        buf[fill + 1..].fill(0);
+        if fill + 1 > 56 {
+            compress(&mut state, &[buf]);
+            buf = [0; 64];
+        }
+        buf[56..].copy_from_slice(&(total * 8).to_be_bytes());
+        compress(&mut state, &[buf]);
+
+        let mut block = [0u8; 64];
+        for (i, w) in state.iter().enumerate() {
+            block[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        block[32] = 0x80;
+        block[56..].copy_from_slice(&((64u64 + 32) * 8).to_be_bytes());
+        let mut outer = self.outer;
+        compress(&mut outer, &[block]);
+        let mut out = [0u8; 32];
+        for (i, w) in outer.iter().enumerate() {
+            out[i * 4..i * 4 + 4].copy_from_slice(&w.to_be_bytes());
+        }
+        out
+    }
+}
+
 /// One direction's symmetric keys, with AES key schedules prepared once.
 pub struct SymKeys {
-    signing: hmac::Key,
+    signing: HmacSha256,
     encrypt: EncryptingKey,
     decrypt: DecryptingKey,
     iv: [u8; AES_BLOCK],
@@ -247,7 +336,7 @@ impl SymKeys {
         let alg = if ek == 16 { &AES_128 } else { &AES_256 };
         let enc_key = &material[32..32 + ek];
         Ok(SymKeys {
-            signing: hmac::Key::new(hmac::HMAC_SHA256, &material[..32]),
+            signing: HmacSha256::new(&material[..32]),
             encrypt: EncryptingKey::cbc(UnboundCipherKey::new(alg, enc_key)?)?,
             decrypt: DecryptingKey::cbc(UnboundCipherKey::new(alg, enc_key)?)?,
             iv: material[32 + ek..].try_into().unwrap(),
@@ -256,23 +345,19 @@ impl SymKeys {
 
     #[inline]
     pub fn sign(&self, data: &[u8]) -> [u8; SYM_SIGNATURE_LEN] {
-        hmac::sign(&self.signing, data).as_ref().try_into().unwrap()
+        self.signing.mac(&[data])
     }
 
     /// Constant-time HMAC check.
     #[inline]
     pub fn verify(&self, data: &[u8], sig: &[u8]) -> bool {
-        hmac::verify(&self.signing, data, sig).is_ok()
+        self.verify_parts(&[data], sig)
     }
 
     /// HMAC over the concatenation of `parts`.
     #[inline]
     pub fn sign_parts(&self, parts: &[&[u8]]) -> [u8; SYM_SIGNATURE_LEN] {
-        let mut ctx = hmac::Context::with_key(&self.signing);
-        for p in parts {
-            ctx.update(p);
-        }
-        ctx.sign().as_ref().try_into().unwrap()
+        self.signing.mac(parts)
     }
 
     /// Constant-time check of an HMAC over the concatenation of `parts`.
@@ -352,6 +437,39 @@ pub fn padding(plain_len: usize, signature_len: usize, block: usize, extra: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RFC 4231 test cases 1, 2, 6 and 7, and agreement with aws-lc on every
+    /// length and split around the block boundaries.
+    #[test]
+    fn hmac_sha256_vectors_and_aws_lc_agreement() {
+        let hex = |s: &str| {
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect::<Vec<_>>()
+        };
+        let cases: [(&[u8], &[u8], &str); 4] = [
+            (&[0x0b; 20], b"Hi There", "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"),
+            (b"Jefe", b"what do ya want for nothing?", "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"),
+            (&[0xaa; 131], b"Test Using Larger Than Block-Size Key - Hash Key First", "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"),
+            (&[0xaa; 131], b"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.", "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2"),
+        ];
+        for (key, data, want) in cases {
+            assert_eq!(HmacSha256::new(key).mac(&[data]).to_vec(), hex(want));
+        }
+        let key = [0x42u8; 32];
+        let ours = HmacSha256::new(&key);
+        let theirs = hmac::Key::new(hmac::HMAC_SHA256, &key);
+        let data: Vec<u8> = (0..300u32).map(|i| (i * 7 + 3) as u8).collect();
+        for len in 0..data.len() {
+            let want = hmac::sign(&theirs, &data[..len]);
+            assert_eq!(&ours.mac(&[&data[..len]])[..], want.as_ref(), "len {len}");
+            for split in [0, 1, 8, 55, 56, 63, 64, 65, 128].into_iter().filter(|&s| s <= len) {
+                assert_eq!(
+                    &ours.mac(&[&data[..split], &data[split..len]])[..],
+                    want.as_ref(),
+                    "len {len} split {split}"
+                );
+            }
+        }
+    }
     use aws_lc_rs::encoding::AsDer;
     use aws_lc_rs::rsa::KeySize;
 
