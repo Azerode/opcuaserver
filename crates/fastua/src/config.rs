@@ -56,6 +56,30 @@ struct RawItem {
     /// Values kept in the history (default 10 000).
     #[serde(rename = "HistoryCapacity", default)]
     history_capacity: Option<u32>,
+    #[serde(rename = "Alarm", default)]
+    alarm: Option<RawAlarm>,
+}
+
+/// `{"HighHigh": 95, "High": 80, "Low": 10, "LowLow": 5, "Severity": 700}`
+/// (limit alarm) or `{"Normal": false}` (off-normal alarm).
+#[derive(Deserialize, Debug)]
+struct RawAlarm {
+    #[serde(rename = "HighHigh")]
+    high_high: Option<f64>,
+    #[serde(rename = "High")]
+    high: Option<f64>,
+    #[serde(rename = "Low")]
+    low: Option<f64>,
+    #[serde(rename = "LowLow")]
+    low_low: Option<f64>,
+    #[serde(rename = "Normal")]
+    normal: Option<serde_json::Value>,
+    #[serde(rename = "Severity")]
+    severity: Option<u16>,
+    #[serde(rename = "Message")]
+    message: Option<String>,
+    #[serde(rename = "Deadband", default)]
+    deadband: f64,
 }
 
 /// `{"Low": 0, "High": 100}` or `[0, 100]`.
@@ -101,6 +125,7 @@ pub struct ItemConfig {
     pub eu_range: Option<(f64, f64)>,
     /// Values kept in the history; `None` = not historized.
     pub history: Option<usize>,
+    pub alarm: Option<crate::alarms::AlarmConfig>,
 }
 
 /// Maps a type name (`System.Int16`, `Int16`, `int16`, `Single`…) to a built-in type id.
@@ -162,12 +187,63 @@ pub fn parse_file(path: &Path, text: &str) -> Result<NamespaceConfig, String> {
                 }
                 (true, cap) => Some(cap.map_or(crate::history::DEFAULT_CAPACITY, |c| c as usize)),
             };
-            items.push(ItemConfig { name: it.name, node_id, data_type, writable: it.writable, eu_range, history });
+            let alarm = match it.alarm {
+                None => None,
+                Some(a) => Some(
+                    parse_alarm(a, data_type)
+                        .map_err(|e| format!("{}: item '{}': Alarm: {e}", path.display(), it.name))?,
+                ),
+            };
+            items.push(ItemConfig {
+                name: it.name,
+                node_id,
+                data_type,
+                writable: it.writable,
+                eu_range,
+                history,
+                alarm,
+            });
         }
         groups.push(GroupConfig { name: g.name, items });
     }
     let uri = raw.namespace.trim().to_string();
     Ok(NamespaceConfig { source: path.to_path_buf(), name: raw.name.unwrap_or_else(|| uri.clone()), uri, groups })
+}
+
+fn parse_alarm(a: RawAlarm, data_type: u8) -> Result<crate::alarms::AlarmConfig, String> {
+    use crate::alarms::{AlarmConfig, AlarmKind};
+    let numeric = crate::value::bits_as_f64(data_type, 0).is_some();
+    let limits = [a.low_low, a.low, a.high, a.high_high];
+    let kind = match (&a.normal, limits.iter().any(Option::is_some)) {
+        (Some(_), true) => return Err("Normal and limits are exclusive".into()),
+        (None, false) => return Err("no limit and no Normal value".into()),
+        (None, true) => {
+            if !numeric {
+                return Err("limits need a numeric Type".into());
+            }
+            let set: Vec<f64> = limits.iter().flatten().copied().collect();
+            if set.iter().any(|x| !x.is_finite()) || set.windows(2).any(|w| w[0] > w[1]) {
+                return Err("limits must be finite and ordered LowLow <= Low <= High <= HighHigh".into());
+            }
+            AlarmKind::Limit { low_low: a.low_low, low: a.low, high: a.high, high_high: a.high_high }
+        }
+        (Some(v), false) => {
+            let normal = match v {
+                serde_json::Value::Bool(b) if data_type == builtin::BOOLEAN => *b as u8 as f64,
+                serde_json::Value::Number(n) if numeric => n.as_f64().ok_or("invalid Normal value")?,
+                _ => return Err("Normal must be a Boolean or a number of the item's Type".into()),
+            };
+            AlarmKind::OffNormal { normal }
+        }
+    };
+    if !(a.deadband >= 0.0 && a.deadband.is_finite()) {
+        return Err("Deadband must be >= 0".into());
+    }
+    let severity = a.severity.unwrap_or(500);
+    if !(1..=1000).contains(&severity) {
+        return Err("Severity must be 1..1000".into());
+    }
+    Ok(AlarmConfig { kind, severity, message: a.message, deadband: a.deadband })
 }
 
 /// Lists config files in a stable order (so namespace indexes assigned on
@@ -226,7 +302,9 @@ mod tests {
                 { "Name": "S", "NodeId": "s=Speed", "Type": "Double", "Writable": false,
                   "EURange": { "Low": -10, "High": 90 } },
                 { "Name": "T", "NodeId": "i=7", "Type": "Float", "EURange": [0, 5], "Historizing": true },
-                { "Name": "H", "NodeId": "i=8", "Type": "Int32", "Historizing": true, "HistoryCapacity": 50 } ] } ] }"#;
+                { "Name": "H", "NodeId": "i=8", "Type": "Int32", "Historizing": true, "HistoryCapacity": 50,
+                  "Alarm": { "High": 10, "HighHigh": 20, "Severity": 800 } },
+                { "Name": "B", "NodeId": "i=9", "Type": "Boolean", "Alarm": { "Normal": false } } ] } ] }"#;
         let ns = parse_file(Path::new("m.json"), text).unwrap();
         assert_eq!(ns.uri, "Machine1");
         assert_eq!(ns.groups[0].items[0].node_id, NodeId::Numeric(0, 1000));
@@ -238,6 +316,13 @@ mod tests {
         assert_eq!(ns.groups[0].items[0].history, None);
         assert_eq!(ns.groups[0].items[2].history, Some(crate::history::DEFAULT_CAPACITY));
         assert_eq!(ns.groups[0].items[3].history, Some(50));
+        let a = ns.groups[0].items[3].alarm.as_ref().unwrap();
+        assert_eq!(a.severity, 800);
+        assert!(matches!(a.kind, crate::alarms::AlarmKind::Limit { high: Some(10.0), high_high: Some(20.0), .. }));
+        assert!(matches!(
+            ns.groups[0].items[4].alarm.as_ref().unwrap().kind,
+            crate::alarms::AlarmKind::OffNormal { normal: 0.0 }
+        ));
     }
 
     #[test]
@@ -253,6 +338,9 @@ mod tests {
         let text_range = r#"{"Namespace":"x","Subscriptions":[{"Name":"g","Items":[
             {"Name":"a","NodeId":"i=1","Type":"String","EURange":[0,1]}]}]}"#;
         assert!(parse_file(Path::new("a"), text_range).unwrap_err().contains("numeric"));
+        let bad_alarm = r#"{"Namespace":"x","Subscriptions":[{"Name":"g","Items":[
+            {"Name":"a","NodeId":"i=1","Type":"Double","Alarm":{"High":5,"Low":9}}]}]}"#;
+        assert!(parse_file(Path::new("a"), bad_alarm).unwrap_err().contains("ordered"));
     }
 
     #[test]

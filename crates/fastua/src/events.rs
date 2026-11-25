@@ -47,6 +47,56 @@ pub mod types {
 
     /// Duration data type.
     pub const DURATION: u32 = 290;
+
+    // Conditions and alarms (Part 9).
+    pub const CONDITION_TYPE: u32 = 2782;
+    pub const ACKNOWLEDGEABLE_CONDITION_TYPE: u32 = 2881;
+    pub const ALARM_CONDITION_TYPE: u32 = 2915;
+    pub const LIMIT_ALARM_TYPE: u32 = 2955;
+    pub const EXCLUSIVE_LIMIT_ALARM_TYPE: u32 = 9341;
+    pub const DISCRETE_ALARM_TYPE: u32 = 10523;
+    pub const OFF_NORMAL_ALARM_TYPE: u32 = 10637;
+    pub const REFRESH_START_EVENT_TYPE: u32 = 2787;
+    pub const REFRESH_END_EVENT_TYPE: u32 = 2788;
+
+    pub const CONDITION_CLASS_ID: u32 = 11112;
+    pub const CONDITION_CLASS_NAME: u32 = 11113;
+    pub const CONDITION_NAME: u32 = 9009;
+    pub const BRANCH_ID: u32 = 9010;
+    pub const RETAIN: u32 = 3874;
+    pub const ENABLED_STATE: u32 = 9011;
+    pub const ENABLED_STATE_ID: u32 = 9012;
+    pub const ENABLED_STATE_TRANSITION_TIME: u32 = 9016;
+    pub const QUALITY: u32 = 9020;
+    pub const QUALITY_SOURCE_TIMESTAMP: u32 = 9021;
+    pub const LAST_SEVERITY: u32 = 9022;
+    pub const LAST_SEVERITY_SOURCE_TIMESTAMP: u32 = 9023;
+    pub const COMMENT: u32 = 9024;
+    pub const COMMENT_SOURCE_TIMESTAMP: u32 = 9025;
+    pub const CONDITION_CLIENT_USER_ID: u32 = 9026;
+    pub const ACKED_STATE: u32 = 9093;
+    pub const ACKED_STATE_ID: u32 = 9094;
+    pub const ACKED_STATE_TRANSITION_TIME: u32 = 9098;
+    pub const CONFIRMED_STATE: u32 = 9102;
+    pub const CONFIRMED_STATE_ID: u32 = 9103;
+    pub const CONFIRMED_STATE_TRANSITION_TIME: u32 = 9107;
+    pub const ACTIVE_STATE: u32 = 9160;
+    pub const ACTIVE_STATE_ID: u32 = 9161;
+    pub const ACTIVE_STATE_EFFECTIVE_DISPLAY_NAME: u32 = 9164;
+    pub const ACTIVE_STATE_TRANSITION_TIME: u32 = 9165;
+    pub const INPUT_NODE: u32 = 11120;
+    pub const SUPPRESSED_OR_SHELVED: u32 = 9215;
+    pub const HIGH_HIGH_LIMIT: u32 = 11124;
+    pub const HIGH_LIMIT: u32 = 11125;
+    pub const LOW_LIMIT: u32 = 11126;
+    pub const LOW_LOW_LIMIT: u32 = 11127;
+    pub const LIMIT_STATE: u32 = 9455;
+    pub const LIMIT_STATE_CURRENT_STATE: u32 = 9456;
+    pub const LIMIT_STATE_CURRENT_STATE_ID: u32 = 9457;
+    pub const NORMAL_STATE: u32 = 11158;
+    /// Not a field declaration: the NodeId of a condition (ConditionId),
+    /// selected with the NodeId attribute and an empty browse path.
+    pub const CONDITION_ID: u32 = u32::MAX - 1;
 }
 use types::*;
 
@@ -143,6 +193,110 @@ pub const EVENT_TYPES: &[EventTypeDef] = &[
         is_abstract: true,
         fields: &[],
     },
+    EventTypeDef {
+        id: REFRESH_START_EVENT_TYPE,
+        name: "RefreshStartEventType",
+        parent: SYSTEM_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[],
+    },
+    EventTypeDef {
+        id: REFRESH_END_EVENT_TYPE,
+        name: "RefreshEndEventType",
+        parent: SYSTEM_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[],
+    },
+    // Fields with a `/` are children of the field before it (data type 0:
+    // an Object, such as a state machine).
+    EventTypeDef {
+        id: CONDITION_TYPE,
+        name: "ConditionType",
+        parent: BASE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[
+            (CONDITION_CLASS_ID, "ConditionClassId", 17, -1),
+            (CONDITION_CLASS_NAME, "ConditionClassName", 21, -1),
+            (CONDITION_NAME, "ConditionName", 12, -1),
+            (BRANCH_ID, "BranchId", 17, -1),
+            (RETAIN, "Retain", 1, -1),
+            (ENABLED_STATE, "EnabledState", 21, -1),
+            (ENABLED_STATE_ID, "EnabledState/Id", 1, -1),
+            (ENABLED_STATE_TRANSITION_TIME, "EnabledState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (QUALITY, "Quality", 19, -1),
+            (QUALITY_SOURCE_TIMESTAMP, "Quality/SourceTimestamp", crate::types::ids::UTC_TIME, -1),
+            (LAST_SEVERITY, "LastSeverity", 5, -1),
+            (LAST_SEVERITY_SOURCE_TIMESTAMP, "LastSeverity/SourceTimestamp", crate::types::ids::UTC_TIME, -1),
+            (COMMENT, "Comment", 21, -1),
+            (COMMENT_SOURCE_TIMESTAMP, "Comment/SourceTimestamp", crate::types::ids::UTC_TIME, -1),
+            (CONDITION_CLIENT_USER_ID, "ClientUserId", 12, -1),
+        ],
+    },
+    EventTypeDef {
+        id: ACKNOWLEDGEABLE_CONDITION_TYPE,
+        name: "AcknowledgeableConditionType",
+        parent: CONDITION_TYPE,
+        is_abstract: false,
+        fields: &[
+            (ACKED_STATE, "AckedState", 21, -1),
+            (ACKED_STATE_ID, "AckedState/Id", 1, -1),
+            (ACKED_STATE_TRANSITION_TIME, "AckedState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (CONFIRMED_STATE, "ConfirmedState", 21, -1),
+            (CONFIRMED_STATE_ID, "ConfirmedState/Id", 1, -1),
+            (CONFIRMED_STATE_TRANSITION_TIME, "ConfirmedState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+        ],
+    },
+    EventTypeDef {
+        id: ALARM_CONDITION_TYPE,
+        name: "AlarmConditionType",
+        parent: ACKNOWLEDGEABLE_CONDITION_TYPE,
+        is_abstract: false,
+        fields: &[
+            (ACTIVE_STATE, "ActiveState", 21, -1),
+            (ACTIVE_STATE_ID, "ActiveState/Id", 1, -1),
+            (ACTIVE_STATE_EFFECTIVE_DISPLAY_NAME, "ActiveState/EffectiveDisplayName", 21, -1),
+            (ACTIVE_STATE_TRANSITION_TIME, "ActiveState/TransitionTime", crate::types::ids::UTC_TIME, -1),
+            (INPUT_NODE, "InputNode", 17, -1),
+            (SUPPRESSED_OR_SHELVED, "SuppressedOrShelved", 1, -1),
+        ],
+    },
+    EventTypeDef {
+        id: LIMIT_ALARM_TYPE,
+        name: "LimitAlarmType",
+        parent: ALARM_CONDITION_TYPE,
+        is_abstract: false,
+        fields: &[
+            (HIGH_HIGH_LIMIT, "HighHighLimit", 11, -1),
+            (HIGH_LIMIT, "HighLimit", 11, -1),
+            (LOW_LIMIT, "LowLimit", 11, -1),
+            (LOW_LOW_LIMIT, "LowLowLimit", 11, -1),
+        ],
+    },
+    EventTypeDef {
+        id: EXCLUSIVE_LIMIT_ALARM_TYPE,
+        name: "ExclusiveLimitAlarmType",
+        parent: LIMIT_ALARM_TYPE,
+        is_abstract: false,
+        fields: &[
+            (LIMIT_STATE, "LimitState", 0, -1),
+            (LIMIT_STATE_CURRENT_STATE, "LimitState/CurrentState", 21, -1),
+            (LIMIT_STATE_CURRENT_STATE_ID, "LimitState/CurrentState/Id", 17, -1),
+        ],
+    },
+    EventTypeDef {
+        id: DISCRETE_ALARM_TYPE,
+        name: "DiscreteAlarmType",
+        parent: ALARM_CONDITION_TYPE,
+        is_abstract: false,
+        fields: &[],
+    },
+    EventTypeDef {
+        id: OFF_NORMAL_ALARM_TYPE,
+        name: "OffNormalAlarmType",
+        parent: DISCRETE_ALARM_TYPE,
+        is_abstract: false,
+        fields: &[(NORMAL_STATE, "NormalState", 17, -1)],
+    },
 ];
 
 fn def(id: u32) -> Option<&'static EventTypeDef> {
@@ -194,6 +348,9 @@ pub struct Event {
     pub type_id: u32,
     /// (field declaration, value)
     pub fields: Vec<(u32, Variant)>,
+    /// Only for one subscription (and one of its items, 0 = all): events of
+    /// a ConditionRefresh.
+    pub target: Option<(u32, u32)>,
 }
 
 static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -218,6 +375,15 @@ impl Event {
                 (MESSAGE, Variant::LocalizedText(Box::new(LocalizedText::new(message)))),
                 (SEVERITY, Variant::UInt16(severity)),
             ],
+            target: None,
+        }
+    }
+
+    /// The EventId (16 bytes) of an event built by [`Event::new`].
+    pub fn event_id(&self) -> &[u8] {
+        match self.get(EVENT_ID) {
+            Some(Variant::ByteString(Some(b))) => b,
+            _ => &[],
         }
     }
 
@@ -419,9 +585,14 @@ fn read_simple_operand(r: &mut Reader) -> DResult<Result<Field, u32>> {
     }
     let decl = match (attribute, &path[..]) {
         // The NodeId of the event (ConditionId): null for plain events.
-        (crate::services::attr::NODE_ID, []) => 0,
+        (crate::services::attr::NODE_ID, []) => CONDITION_ID,
         (crate::services::attr::VALUE, []) => 0,
         (crate::services::attr::VALUE, [q]) if q.ns == 0 => field(type_id, &q.name).unwrap_or(0),
+        // Nested fields ("ActiveState/Id"), all in namespace 0.
+        (crate::services::attr::VALUE, p) if p.iter().all(|q| q.ns == 0) => {
+            let name: Vec<&str> = p.iter().map(|q| &*q.name).collect();
+            field(type_id, &name.join("/")).unwrap_or(0)
+        }
         // Unknown fields are reported as null values (Part 4 §7.22.3).
         (crate::services::attr::VALUE, _) => 0,
         _ => return Ok(Err(status::BAD_ATTRIBUTE_ID_INVALID)),
@@ -679,6 +850,8 @@ impl EventFilter {
 
 pub struct EventItem {
     pub id: u32,
+    /// Id of the subscription holding the item (targeted events).
+    pub subscription: u32,
     pub client_handle: u32,
     pub mode: u32,
     pub node: NodeId,
@@ -708,6 +881,7 @@ impl EventItem {
         let cursor = bus.head();
         EventItem {
             id,
+            subscription: 0,
             client_handle,
             mode,
             node,
@@ -753,7 +927,12 @@ impl EventItem {
         let mut queued = false;
         let enabled = self.mode != crate::subscription::MODE_DISABLED;
         let (cursor, lost) = bus.since(self.cursor, |ev| {
-            if enabled && self.filter.matches(ev) {
+            let for_me = ev.target.is_none_or(|(s, i)| s == self.subscription && (i == 0 || i == self.id));
+            // RefreshStart / RefreshEnd frame a ConditionRefresh whatever the
+            // where clause (a client filtering on ConditionType needs them).
+            let framing = ev.target.is_some()
+                && matches!(ev.type_id, types::REFRESH_START_EVENT_TYPE | types::REFRESH_END_EVENT_TYPE);
+            if enabled && for_me && (framing || self.filter.matches(ev)) {
                 let f = self.filter.fields(ev);
                 self.push(f);
                 queued = true;

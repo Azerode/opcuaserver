@@ -174,7 +174,7 @@ async def main(work, cfg):
     d["Subscriptions"][0]["Items"].append({"Name": "NEW", "NodeId": "s=New", "Type": "Double"})
     d["Subscriptions"][0]["Items"].append(
         {"Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": {"Low": 0, "High": 200},
-         "Historizing": True})
+         "Historizing": True, "Alarm": {"High": 100, "HighHigh": 150, "Severity": 600}})
 
     # Events: the reload raises a model change event, sessions raise audit events.
     class Events:
@@ -267,6 +267,36 @@ async def main(work, cfg):
     res = await c.uaclient.history_read(hp_)
     got = [r.HistoryData.DataValues[0].Value.Value for r in res]
     check("HistoryRead processed (Average, Maximum)", abs(got[0] - 29.2) < 1e-9 and got[1] == 51.0, str(got))
+
+    # Alarms and conditions: limit alarm on Level, acknowledged through Call.
+    ha = Events()
+    sub6 = await c.create_subscription(10, ha)
+    await sub6.subscribe_alarms_and_conditions(c.nodes.server, ua.ObjectIds.ExclusiveLimitAlarmType)
+    await asyncio.sleep(0.2)
+    ha.events.clear()
+    await level.write_value(ua.DataValue(ua.Variant(120.0, ua.VariantType.Double)))
+    await asyncio.sleep(0.3)
+    active = [e for e in ha.events if getattr(e, "ActiveState/Id", None) is True]
+    check("alarm raised", len(active) == 1 and active[0].Severity == 600
+          and str(getattr(active[0], "LimitState/CurrentState").Text) == "High", str(ha.events))
+    cond = c.get_node(active[0].NodeId if getattr(active[0], "NodeId", None) else ua.NodeId("__alarm/s=Level", 2))
+    await cond.call_method(ua.NodeId(ua.ObjectIds.AcknowledgeableConditionType_Acknowledge),
+                           ua.Variant(active[0].EventId, ua.VariantType.ByteString),
+                           ua.Variant(ua.LocalizedText("seen"), ua.VariantType.LocalizedText))
+    await asyncio.sleep(0.3)
+    acked = [e for e in ha.events if getattr(e, "AckedState/Id", None) is True]
+    check("alarm acknowledged", len(acked) == 1 and acked[0].Comment.Text == "seen"
+          and acked[0].ClientUserId, str(ha.events[-1:]))
+    ha.events.clear()
+    await c.get_node(ua.ObjectIds.ConditionType).call_method(
+        ua.NodeId(ua.ObjectIds.ConditionType_ConditionRefresh),
+        ua.Variant(sub6.subscription_id, ua.VariantType.UInt32))
+    await asyncio.sleep(0.3)
+    types = [e.EventType for e in ha.events]
+    check("ConditionRefresh", ua.NodeId(ua.ObjectIds.RefreshStartEventType) in types
+          and ua.NodeId(ua.ObjectIds.RefreshEndEventType) in types
+          and ua.NodeId(ua.ObjectIds.ExclusiveLimitAlarmType) in types, str(types))
+    await sub6.delete()
 
     # Methods: GetMonitoredItems.
     out = await c.nodes.server.call_method("0:GetMonitoredItems", ua.Variant(sub5.subscription_id, ua.VariantType.UInt32))

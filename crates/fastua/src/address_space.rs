@@ -151,6 +151,8 @@ pub struct AddressSpace {
     pub info: Arc<ServerInfo>,
     /// Shared by every snapshot: events outlive reloads.
     pub events: Arc<crate::events::EventBus>,
+    /// Shared by every snapshot: condition states outlive reloads.
+    pub alarms: Arc<crate::alarms::Alarms>,
 }
 
 impl AddressSpace {
@@ -210,6 +212,7 @@ const REF_TYPE_PARENT: &[(u32, u32)] = &[
     (ids::HAS_COMPONENT, ids::AGGREGATES),
     (ids::HAS_NOTIFIER, ids::HAS_EVENT_SOURCE),
     (ids::HAS_ORDERED_COMPONENT, ids::HAS_COMPONENT),
+    (ids::HAS_CONDITION, ids::NON_HIERARCHICAL_REFERENCES),
 ];
 
 #[inline]
@@ -463,6 +466,7 @@ const REF_TYPES: &[(u32, &str, Option<&str>, bool, bool)] = &[
     (ids::HAS_COMPONENT, "HasComponent", Some("ComponentOf"), false, false),
     (ids::HAS_NOTIFIER, "HasNotifier", Some("NotifierOf"), false, false),
     (ids::HAS_ORDERED_COMPONENT, "HasOrderedComponent", Some("OrderedComponentOf"), false, false),
+    (ids::HAS_CONDITION, "HasCondition", Some("IsConditionOf"), false, false),
 ];
 
 fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
@@ -567,16 +571,84 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     }
     let mandatory = b.idx(ids::MODELLING_RULE_MANDATORY);
 
-    // Event types and their fields.
+    // Types the condition fields are instances of (Part 5 §B, Part 9).
+    use crate::alarms::types as at;
+    for (id, name, parent, abs) in [
+        (at::STATE_VARIABLE_TYPE, "StateVariableType", ids::BASE_DATA_VARIABLE_TYPE, false),
+        (at::TWO_STATE_VARIABLE_TYPE, "TwoStateVariableType", at::STATE_VARIABLE_TYPE, false),
+        (at::FINITE_STATE_VARIABLE_TYPE, "FiniteStateVariableType", at::STATE_VARIABLE_TYPE, false),
+        (at::CONDITION_VARIABLE_TYPE, "ConditionVariableType", ids::BASE_DATA_VARIABLE_TYPE, false),
+    ] {
+        b.ns0(id, name, vt(21, -1, abs));
+        b.subtype(parent, id);
+    }
+    for (id, name, parent, abs) in [
+        (at::STATE_MACHINE_TYPE, "StateMachineType", ids::BASE_OBJECT_TYPE, false),
+        (at::FINITE_STATE_MACHINE_TYPE, "FiniteStateMachineType", at::STATE_MACHINE_TYPE, true),
+        (
+            at::EXCLUSIVE_LIMIT_STATE_MACHINE_TYPE,
+            "ExclusiveLimitStateMachineType",
+            at::FINITE_STATE_MACHINE_TYPE,
+            false,
+        ),
+        (at::BASE_CONDITION_CLASS_TYPE, "BaseConditionClassType", ids::BASE_OBJECT_TYPE, true),
+        (at::PROCESS_CONDITION_CLASS_TYPE, "ProcessConditionClassType", at::BASE_CONDITION_CLASS_TYPE, true),
+    ] {
+        b.ns0(id, name, NodeKind::ObjectType { is_abstract: abs });
+        b.subtype(parent, id);
+    }
+
+    // Event types and their fields. A field named `A/B` is a child of
+    // field `A`; a field with children is a component variable (or, with
+    // data type 0, an object).
     for t in crate::events::EVENT_TYPES {
         b.ns0(t.id, t.name, NodeKind::ObjectType { is_abstract: t.is_abstract });
         b.subtype(t.parent, t.id);
         for &(decl, name, data_type, rank) in t.fields {
-            b.property(decl, name, t.id, data_type, rank, ValueSource::Static(Variant::Empty));
+            let (parent, leaf) = match name.rsplit_once('/') {
+                Some((p, leaf)) => (t.fields.iter().find(|f| f.1 == p).map_or(t.id, |f| f.0), leaf),
+                None => (t.id, name),
+            };
+            let has_children = t
+                .fields
+                .iter()
+                .any(|f| f.1.len() > name.len() && f.1.starts_with(name) && f.1.as_bytes()[name.len()] == b'/');
+            if data_type == 0 {
+                b.object(decl, leaf, parent, at::EXCLUSIVE_LIMIT_STATE_MACHINE_TYPE);
+            } else if has_children {
+                let type_def = if leaf == "CurrentState" {
+                    at::FINITE_STATE_VARIABLE_TYPE
+                } else if leaf.ends_with("State") {
+                    at::TWO_STATE_VARIABLE_TYPE
+                } else {
+                    at::CONDITION_VARIABLE_TYPE
+                };
+                b.component_var(decl, leaf, parent, data_type, type_def, ValueSource::Static(Variant::Empty));
+            } else {
+                b.property(decl, leaf, parent, data_type, rank, ValueSource::Static(Variant::Empty));
+            }
             let d = b.idx(decl);
             b.link(d, ids::HAS_MODELLING_RULE, mandatory);
         }
     }
+    // Condition methods (Part 9 §5.5, §5.7).
+    let event_id = || Argument { name: "EventId", data_type: 15, value_rank: -1 };
+    let comment = || Argument { name: "Comment", data_type: 21, value_rank: -1 };
+    let sub = || Argument { name: "SubscriptionId", data_type: 288, value_rank: -1 };
+    use crate::events::types::{ACKNOWLEDGEABLE_CONDITION_TYPE as ACK, CONDITION_TYPE as COND};
+    b.method(at::DISABLE, "Disable", COND, &[], &[]);
+    b.method(at::ENABLE, "Enable", COND, &[], &[]);
+    b.method(at::ADD_COMMENT, "AddComment", COND, &[event_id(), comment()], &[]);
+    b.method(at::CONDITION_REFRESH, "ConditionRefresh", COND, &[sub()], &[]);
+    b.method(
+        at::CONDITION_REFRESH2,
+        "ConditionRefresh2",
+        COND,
+        &[sub(), Argument { name: "MonitoredItemId", data_type: 288, value_rank: -1 }],
+        &[],
+    );
+    b.method(at::ACKNOWLEDGE, "Acknowledge", ACK, &[event_id(), comment()], &[]);
+    b.method(at::CONFIRM, "Confirm", ACK, &[event_id(), comment()], &[]);
 
     // Server object: the root notifier of every event.
     let server = b.ns0(ids::SERVER, "Server", NodeKind::Object { event_notifier: 1 });
@@ -824,6 +896,15 @@ pub fn range_value(low: f64, high: f64) -> Variant {
     }))
 }
 
+/// The condition of a variable, set on its cell once the build succeeded.
+struct PendingAlarm {
+    cell: Arc<ValueCell>,
+    cfg: Option<crate::alarms::AlarmConfig>,
+    id: NodeId,
+    source: NodeId,
+    name: String,
+}
+
 /// Builds a new snapshot. Cells of variables that still exist with the same
 /// data type are taken over from `previous`, so values survive reloads.
 pub fn build(
@@ -866,6 +947,10 @@ pub fn build(
     let mut fresh = 0usize;
     let mut stamp = None;
     let mut history: Vec<(Arc<ValueCell>, Option<usize>)> = Vec::new();
+    let events = previous.map(|p| p.events.clone()).unwrap_or_default();
+    let alarms = previous.map(|p| p.alarms.clone()).unwrap_or_default();
+    // Applied once the build succeeded, like history.
+    let mut conditions: Vec<PendingAlarm> = Vec::new();
 
     for (c, &ns) in configs.iter().zip(&assigned) {
         let folder_id = |path: &str| NodeId::String(ns, format!("__folder/{path}").into());
@@ -909,6 +994,14 @@ pub fn build(
                 // Applied once the whole build succeeded (a failed reload
                 // must leave the live cells untouched).
                 history.push((cell.clone(), it.history));
+                let alarm_id = NodeId::String(ns, format!("__alarm/{}", it.node_id).into());
+                conditions.push(PendingAlarm {
+                    cell: cell.clone(),
+                    cfg: it.alarm.clone(),
+                    id: alarm_id.clone(),
+                    source: id.clone(),
+                    name: it.name.clone(),
+                });
                 let var = b
                     .add(Node {
                         id,
@@ -925,6 +1018,22 @@ pub fn build(
                     })
                     .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
                 b.link(group, ids::HAS_COMPONENT, var);
+                if let Some(a) = &it.alarm {
+                    let name = format!("{}Alarm", it.name);
+                    let cond = b
+                        .add(Node {
+                            id: alarm_id,
+                            browse_name: QualifiedName { ns, name: name.as_str().into() },
+                            display_name: LocalizedText::new(&name),
+                            description: None,
+                            refs: Vec::with_capacity(2),
+                            kind: NodeKind::Object { event_notifier: 0 },
+                        })
+                        .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
+                    let td = b.idx(a.type_id());
+                    b.link(cond, ids::HAS_TYPE_DEFINITION, td);
+                    b.link(var, ids::HAS_CONDITION, cond);
+                }
                 let Some((low, high)) = it.eu_range else {
                     b.link(var, ids::HAS_TYPE_DEFINITION, bdv_type);
                     continue;
@@ -954,9 +1063,26 @@ pub fn build(
     for (cell, capacity) in history {
         cell.set_history(capacity);
     }
+    let mut keep = Vec::new();
+    for PendingAlarm { cell, cfg, id, source, name } in conditions {
+        let Some(cfg) = cfg else {
+            cell.set_alarm(None);
+            continue;
+        };
+        let (cond, new) = alarms.upsert(id.clone(), source, &name, cfg, &events);
+        if new {
+            // Evaluate the current value, unless nothing was written yet.
+            let s = cell.read();
+            if s.status != status::UNCERTAIN_INITIAL_VALUE {
+                cond.evaluate(&s.value, s.status, s.source_ts);
+            }
+        }
+        cell.set_alarm(Some(cond));
+        keep.push(id);
+    }
+    alarms.retain(&keep);
     let dense = dense_tables(&b.nodes, namespaces.len());
-    let events = previous.map(|p| p.events.clone()).unwrap_or_default();
-    Ok(AddressSpace { nodes: b.nodes, index: b.index, dense, namespaces, generation, info, events })
+    Ok(AddressSpace { nodes: b.nodes, index: b.index, dense, namespaces, generation, info, events, alarms })
 }
 
 /// Builds the direct lookup tables of [`AddressSpace::dense`]. A namespace
@@ -1038,6 +1164,7 @@ mod tests {
                         writable: true,
                         eu_range: None,
                         history: None,
+                        alarm: None,
                     })
                     .collect(),
             }],

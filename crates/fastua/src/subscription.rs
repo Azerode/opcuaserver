@@ -833,7 +833,9 @@ impl Subscription {
         let id = self.next_item_id;
         self.next_item_id = self.next_item_id.checked_add(1).unwrap_or(1);
         let bus = space.events.clone();
-        self.events.push(EventItem::new(id, p.client_handle, mode, node, filter, queue_size, p.discard_oldest, bus));
+        let mut item = EventItem::new(id, p.client_handle, mode, node, filter, queue_size, p.discard_oldest, bus);
+        item.subscription = self.id;
+        self.events.push(item);
         Ok((id, queue_size as u32))
     }
 
