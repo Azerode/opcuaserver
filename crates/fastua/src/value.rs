@@ -23,6 +23,21 @@ pub struct ValueCell {
     source_ts: AtomicI64,
     server_ts: AtomicI64,
     blob: Mutex<Variant>,
+    /// Change stamp shared by up to [`BLOCK`] cells: every write stores a
+    /// value unique to (cell, write) into it, so a sampling pass skips a
+    /// whole block of unchanged cells with one load.
+    stamp: &'static AtomicU32,
+    /// Position in the block (top 6 bits of every stamp this cell stores).
+    lane: u32,
+}
+
+/// Cells per change stamp.
+pub const BLOCK: usize = 64;
+
+/// Allocates a change stamp. Stamps live as long as the process: cells keep
+/// them across reloads and a few bytes per 64 cells are never worth freeing.
+pub fn new_stamp() -> &'static AtomicU32 {
+    Box::leak(Box::new(AtomicU32::new(0)))
 }
 
 /// Raw state of an inline cell: what [`encode_raw`] needs.
@@ -178,8 +193,18 @@ pub fn default_value(kind: u8) -> Variant {
 }
 
 impl ValueCell {
+    /// A cell with a change stamp of its own.
     pub fn new(kind: u8, created: i64) -> Self {
+        Self::with_stamp(kind, created, new_stamp(), 0)
+    }
+
+    /// A cell sharing `stamp` with other cells; `lane` < [`BLOCK`] tells the
+    /// cells of one stamp apart.
+    pub fn with_stamp(kind: u8, created: i64, stamp: &'static AtomicU32, lane: u32) -> Self {
+        debug_assert!((lane as usize) < BLOCK);
         ValueCell {
+            stamp,
+            lane,
             kind,
             size: inline_size(kind),
             seq: AtomicU32::new(0),
@@ -220,6 +245,27 @@ impl ValueCell {
     #[inline(always)]
     pub fn version(&self) -> u32 {
         self.seq.load(Ordering::Acquire)
+    }
+
+    /// [`ValueCell::version`] without ordering: for change detection after
+    /// an Acquire load of the cell's stamp (a plain load on aarch64 instead
+    /// of `ldar`, which would serialise a scan).
+    #[inline(always)]
+    pub fn version_relaxed(&self) -> u32 {
+        self.seq.load(Ordering::Relaxed)
+    }
+
+    /// The change stamp of the cell's block.
+    #[inline(always)]
+    pub fn stamp(&self) -> &'static AtomicU32 {
+        self.stamp
+    }
+
+    /// Publishes a write: after the cell's own release store, so a reader
+    /// that sees the stamp sees the new value.
+    #[inline(always)]
+    fn publish(&self, seq: u32) {
+        self.stamp.store((self.lane << 26) | ((seq >> 1) & 0x03FF_FFFF), Ordering::Release);
     }
 
     /// Consistent copy of an inline cell (see [`ValueCell::inline_size`]).
@@ -282,7 +328,9 @@ impl ValueCell {
             self.source_ts.store(source_ts, Ordering::Relaxed);
             self.server_ts.store(server_ts, Ordering::Relaxed);
             // Only a change counter here (readers take the mutex).
-            self.seq.fetch_add(2, Ordering::Release);
+            let seq = self.seq.fetch_add(2, Ordering::Release).wrapping_add(2);
+            drop(blob);
+            self.publish(seq);
             return;
         }
         // Writers serialise on the odd sequence number.
@@ -304,6 +352,7 @@ impl ValueCell {
         self.source_ts.store(source_ts, Ordering::Relaxed);
         self.server_ts.store(server_ts, Ordering::Relaxed);
         self.seq.store(s.wrapping_add(2), Ordering::Release);
+        self.publish(s.wrapping_add(2));
     }
 
     pub fn to_data_value(&self) -> DataValue {

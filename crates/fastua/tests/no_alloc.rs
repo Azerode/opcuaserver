@@ -96,7 +96,7 @@ fn steady_state_publishing_does_not_allocate() {
                 .unwrap();
             st.tick(now, &space);
             out.clear();
-            let ready = st.write_next(&l, now, 1, 1 << 20, &mut Writer::new(&mut out));
+            let ready = st.write_next(&l, now, 1, 1 << 20, &mut Writer::new(&mut out), true);
             assert!(ready.is_some());
             assert!(out.len() > 50 * 25, "50 notifications expected, {} bytes", out.len());
             // The message sequence number sits after type id (4), header
@@ -104,6 +104,9 @@ fn steady_state_publishing_does_not_allocate() {
             let n = u32::from_le_bytes(out[36..40].try_into().unwrap()) as usize;
             let at = 40 + 4 * n + 1;
             seq_to_ack = Some(u32::from_le_bytes(out[at..at + 4].try_into().unwrap()));
+            // Sent: the response buffer is kept for Republish, as the
+            // connection thread does.
+            assert!(st.keep_sent(&mut out, true));
         }
     };
     run(200, &mut st); // warm-up: queues, pools and buffers reach their size

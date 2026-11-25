@@ -89,10 +89,16 @@ SetMonitoringMode, SetTriggering and DeleteMonitoredItems.
   waits in `ppoll` for the next request or the next sampling / publishing
   deadline, whichever comes first, with a timer slack of 1 ns. With
   `--busy-poll` it spins up to that deadline instead.
-- **Sampling:** items are grouped by sampling interval. A pass over an unchanged
-  value reads only a 16-byte entry and the value's change counter (about 1 ns
-  per item). Sampling timers are phase-aligned with the publishing timer, so a
-  change waits at most one interval.
+- **Sampling:** items are grouped by sampling interval.
+  - Value cells are created in blocks of 64 sharing a change stamp. Every
+    write stores a value unique to (cell, write) into the stamp, after the
+    value (release store: about 1 ns on the write).
+  - A group keeps its items sorted by stamp. A pass loads each block's stamp
+    once and skips the block when it did not move, so unchanged values cost
+    a few hundredths of a ns each. In a block that moved, each item's change
+    counter is compared (plain loads, ordered by the stamp's acquire load).
+  - Sampling timers are phase-aligned with the publishing timer, so a change
+    waits at most one interval.
 - **Queues and filters:**
   - Numeric samples are copied out of the seqlock into 32-byte entries, kept
     inline for the default queue size of 1, and encoded straight into the
@@ -113,6 +119,10 @@ SetMonitoringMode, SetTriggering and DeleteMonitoredItems.
   - Publish requests time out according to their `timeoutHint`.
   - Acknowledgements are processed on arrival.
   - Unacknowledged messages stay available for Republish (64 per subscription).
+    The NotificationMessage is encoded straight into the PublishResponse; once
+    sent, that buffer is kept for Republish and the connection continues with
+    a recycled one, so nothing is copied (except with SignAndEncrypt, where the
+    message is copied out before encryption in place).
 - **Moving subscriptions:**
   - TransferSubscriptions moves a subscription to a session with the same user
     identity, optionally resending initial values, and notifies the old session

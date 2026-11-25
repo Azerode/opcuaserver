@@ -219,7 +219,7 @@ pub(super) fn publish(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut 
     }
     // A late subscription is answered right away, otherwise the request
     // waits for the next publishing cycle.
-    match st.write_next(l, now, ctx.channel_id, ctx.conn.max_response, w) {
+    match st.write_next(l, now, ctx.channel_id, ctx.conn.max_response, w, false) {
         Some(ready) if ready.request_id != ctx.conn.request_id => ctx.conn.reply_to = Some(ready.request_id),
         Some(_) => {}
         None => ctx.conn.deferred = true,
