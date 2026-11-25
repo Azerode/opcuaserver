@@ -69,8 +69,57 @@ NodeId and type keeps its current value across reloads.
 - Variable values in a seqlock: wait-free reads, no shared writes on read.
 - Release profile: fat LTO, 1 codegen unit, `panic = "abort"`.
 
-`cargo run --release --example bench` prints the service-layer cost of a Read
-and the loopback round-trip latency.
+`cargo run --release --example bench` prints the service-layer cost of a Read,
+the loopback round-trip latency, the secure channel costs, the subscription
+engine cost per item and the write -> notification latency.
+
+## Subscriptions
+
+Every Subscription and MonitoredItem service is implemented: CreateSubscription,
+ModifySubscription, SetPublishingMode, Publish, Republish, TransferSubscriptions,
+DeleteSubscriptions, CreateMonitoredItems, ModifyMonitoredItems,
+SetMonitoringMode, SetTriggering and DeleteMonitoredItems.
+
+- **Who drives them:** the thread of the connection a session is bound to. It
+  waits in `ppoll` for the next request or the next sampling / publishing
+  deadline, whichever comes first, with a timer slack of 1 ns. With
+  `--busy-poll` it spins up to that deadline instead.
+- **Sampling:** items are grouped by sampling interval. A pass over an unchanged
+  value reads only a 16-byte entry and the value's change counter (about 1 ns
+  per item). Sampling timers are phase-aligned with the publishing timer, so a
+  change waits at most one interval.
+- **Queues and filters:**
+  - Numeric samples are copied out of the seqlock into 32-byte entries, kept
+    inline for the default queue size of 1, and encoded straight into the
+    NotificationMessage.
+  - Queue sizes, `discardOldest` and the Overflow bit follow Part 4 §5.12.1.5.
+  - DataChangeFilter supports the Status, StatusValue and
+    StatusValueTimestamp triggers and the absolute deadband.
+  - Percent deadbands need an EURange, which the configured variables do not
+    have, so they return `BadMonitoredItemFilterUnsupported`. Event and
+    aggregate filters do too.
+- **Publish state machine:**
+  - Keep-alives and lifetime counters run per subscription; when a lifetime
+    expires, a StatusChangeNotification `BadTimeout` is sent.
+  - `MaxNotificationsPerPublish` is honoured, setting `moreNotifications`.
+  - Priorities decide which subscription gets the next Publish request.
+  - Publish requests time out according to their `timeoutHint`.
+  - Acknowledgements are processed on arrival.
+  - Unacknowledged messages stay available for Republish (64 per subscription).
+- **Moving subscriptions:**
+  - TransferSubscriptions moves a subscription to a session with the same user
+    identity, optionally resending initial values, and notifies the old session
+    with `GoodSubscriptionTransferred`.
+  - Subscriptions of a session closed with `deleteSubscriptions = false` can be
+    transferred until their lifetime ends.
+- **Hot reload:** items follow it. A node that disappears reports
+  `BadNodeIdUnknown`.
+- **No allocation:** once queues and buffers have grown to size, nothing is
+  allocated for numeric values. `tests/no_alloc.rs` checks this with a counting
+  allocator over 1000 publish cycles.
+- **Intervals:** the fastest publishing and sampling intervals default to 1 ms.
+  `--min-publishing-interval MS` and `--min-sampling-interval MS` lower them (to
+  0.05 ms at least), at the cost of more wake-ups per second.
 
 ## Security
 
@@ -136,7 +185,8 @@ Aes256_Sha256_RsaPss in Sign and SignAndEncrypt modes (issue/renew, token
 lifetime, sequence checks), PKI with CRLs, sessions with anonymous, user name
 and X.509 identities, per-user read/write rights, GetEndpoints, FindServers,
 Read, Write, Browse, BrowseNext, TranslateBrowsePathsToNodeIds,
-RegisterNodes/UnregisterNodes, ServerStatus, NamespaceArray.
+RegisterNodes/UnregisterNodes, ServerStatus, NamespaceArray, and every
+Subscription and MonitoredItem service (see [Subscriptions](#subscriptions)).
 
-Not yet: subscriptions / MonitoredItems, Call, events, the full namespace 0
+Not yet: Call, events, the full namespace 0
 nodeset, index ranges, ECC policies, audit events.
