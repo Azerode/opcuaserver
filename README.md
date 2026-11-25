@@ -50,7 +50,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: per-session diagnostics arrays, the deprecated non-AEAD ECC policies, HTTPS with client certificates or the JSON encoding.
+Not yet: the deprecated non-AEAD ECC policies, HTTPS with client certificates or the JSON encoding.
 
 ## Build and run
 
@@ -83,6 +83,7 @@ Main options (`fastua --help` lists them all):
 | `--https-listen ADDR:PORT`, `--https-endpoint URL` | Also serve the HTTPS transport (`opc.https`); the endpoint URL defaults to `opc.https://<hostname>:<port>`. |
 | `--history-dir DIR` | Keep the history of historized variables across restarts (written every second). |
 | `--event-history N` | Keep the last N events for HistoryRead on the Server object (default 0, off). |
+| `--session-diagnostics` | Count requests per session and service for SessionDiagnosticsArray (`EnabledFlag` true). The diagnostics arrays are always readable. |
 
 `echo -n 's3cret' | ./target/release/fastua hash-password` prints a password hash for the users file.
 

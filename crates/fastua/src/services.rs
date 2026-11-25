@@ -307,6 +307,9 @@ pub fn dispatch(ctx: &mut Ctx, r: &mut Reader, w: &mut Writer) -> u32 {
         Some(ids::HISTORY_UPDATE_REQUEST) => crate::history::history_update(ctx, &header, r, w),
         _ => Err(status::BAD_SERVICE_UNSUPPORTED),
     };
+    if ctx.server.config.session_diagnostics {
+        count_request(ctx, &header, &type_id, result);
+    }
     if let Err(code) = result {
         let session_service =
             matches!(type_id.as_ns0(), Some(ids::CREATE_SESSION_REQUEST | ids::ACTIVATE_SESSION_REQUEST));
@@ -315,6 +318,29 @@ pub fn dispatch(ctx: &mut Ctx, r: &mut Reader, w: &mut Writer) -> u32 {
         write_fault(w, handle, code);
     }
     handle
+}
+
+/// Session diagnostics service counters (`--session-diagnostics`).
+#[cold]
+#[inline(never)]
+fn count_request(ctx: &Ctx, header: &RequestHeader, type_id: &NodeId, result: SResult) {
+    let Some(s) = ctx.session.as_ref().filter(|s| s.token == header.auth_token) else { return };
+    let c = &s.diag.counters;
+    let bad = result.is_err();
+    let total = crate::diagnostics::TOTAL_REQUESTS;
+    c[total].fetch_add(1, Ordering::Relaxed);
+    if bad {
+        c[total + 1].fetch_add(1, Ordering::Relaxed);
+    }
+    if result == Err(status::BAD_USER_ACCESS_DENIED) {
+        c[crate::diagnostics::UNAUTHORIZED_REQUESTS].fetch_add(1, Ordering::Relaxed);
+    }
+    if let Some(i) = type_id.as_ns0().and_then(crate::diagnostics::service_slot) {
+        c[2 * i].fetch_add(1, Ordering::Relaxed);
+        if bad {
+            c[2 * i + 1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 pub(crate) fn decode_err(_: crate::codec::DecodeError) -> u32 {
@@ -411,18 +437,23 @@ const BAD_APPLICATION_SIGNATURE_INVALID: u32 = 0x8058_0000;
 
 fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
     #[allow(clippy::type_complexity)]
-    let mut parse = || -> DResult<(Option<String>, String, Vec<u8>, Option<Vec<u8>>, f64)> {
-        let app_uri = read_application_uri(r)?;
-        let _server_uri = r.str()?;
-        let _endpoint_url = r.str()?;
-        let name = r.str()?.unwrap_or("").to_string();
-        let nonce = r.bytes()?.unwrap_or(&[]).to_vec();
-        let cert = r.bytes()?.filter(|c| !c.is_empty()).map(<[u8]>::to_vec);
-        let timeout = r.f64()?;
-        let _max_response = r.u32()?;
-        Ok((app_uri, name, nonce, cert, timeout))
-    };
-    let (app_uri, name, client_nonce, client_cert, requested_timeout) = parse().map_err(decode_err)?;
+    let mut parse =
+        || -> DResult<(Option<String>, String, Vec<u8>, Option<Vec<u8>>, f64, crate::server::SessionDiag)> {
+            let description = r.rest();
+            let at = r.position();
+            let app_uri = read_application_uri(r)?;
+            let description = &description[..r.position() - at];
+            let server_uri = r.str()?.map(str::to_string);
+            let endpoint_url = r.str()?.map(str::to_string);
+            let name = r.str()?.unwrap_or("").to_string();
+            let nonce = r.bytes()?.unwrap_or(&[]).to_vec();
+            let cert = r.bytes()?.filter(|c| !c.is_empty()).map(<[u8]>::to_vec);
+            let timeout = r.f64()?;
+            let max_response = r.u32()?;
+            let diag = crate::server::SessionDiag::new(description, server_uri, endpoint_url, max_response);
+            Ok((app_uri, name, nonce, cert, timeout, diag))
+        };
+    let (app_uri, name, client_nonce, client_cert, requested_timeout, diag) = parse().map_err(decode_err)?;
     let security = ctx.security.clone();
     let pki = ctx.server.pki();
 
@@ -482,6 +513,7 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
         security.clone(),
         nonce.clone(),
         client_nonce.clone(),
+        diag,
     )?;
     let thumbprint = client_cert.as_deref().map(|c| crate::pki::hex(&crypto::thumbprint(c)));
     let channel = ctx.channel_id;
@@ -723,6 +755,12 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
     // Activation may move the session to the calling channel (Part 4 §5.6.3).
     s.channel_id.store(ctx.channel_id, Ordering::Release);
     s.can_write.store(access.can_write(), Ordering::Release);
+    {
+        let mut history = s.diag.identities.lock().unwrap_or_else(|e| e.into_inner());
+        if history.len() < 16 && history.last() != Some(&identity) {
+            history.push(identity.clone());
+        }
+    }
     *s.identity.lock().unwrap_or_else(|e| e.into_inner()) = identity;
     s.activated.store(true, Ordering::Release);
     if !s.subs.lock().unwrap_or_else(|e| e.into_inner()).is_idle() {

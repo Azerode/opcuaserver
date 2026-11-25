@@ -822,6 +822,32 @@ impl Subscription {
         self.by_id.len() + self.events.len()
     }
 
+    /// SubscriptionDiagnosticsDataType (Part 5 §12.15) after its SessionId.
+    /// Counters the server does not keep are 0.
+    pub fn write_diagnostics(&self, w: &mut Writer) {
+        let disabled = self.items.iter().flatten().filter(|i| i.mode == 0).count()
+            + self.events.iter().filter(|e| e.mode == 0).count();
+        w.u32(self.id);
+        w.u8(self.params.priority);
+        w.f64(self.params.interval_ms);
+        w.u32(self.params.keepalive);
+        w.u32(self.params.lifetime);
+        w.u32(self.params.max_notifications);
+        w.bool(self.publishing_enabled);
+        for _ in 0..14 {
+            w.u32(0); // ModifyCount .. LatePublishRequestCount
+        }
+        w.u32(self.keepalive_counter);
+        w.u32(self.lifetime_counter);
+        w.u32(self.retransmit.len() as u32);
+        w.u32(0); // DiscardedMessageCount
+        w.u32(self.item_count() as u32);
+        w.u32(disabled as u32);
+        w.u32(0); // MonitoringQueueOverflowCount
+        w.u32(self.seq);
+        w.u32(0); // EventQueueOverflowCount
+    }
+
     fn event_index(&self, id: u32) -> Option<usize> {
         self.events.iter().position(|e| e.id == id)
     }
@@ -1693,6 +1719,11 @@ pub struct Ready {
 }
 
 impl SessionSubs {
+    /// Publish requests waiting for a notification.
+    pub fn queued_requests(&self) -> usize {
+        self.requests.len()
+    }
+
     pub fn find(&mut self, id: u32) -> Option<&mut Subscription> {
         self.subs.iter_mut().find(|s| s.id == id)
     }

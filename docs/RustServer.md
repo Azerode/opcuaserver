@@ -119,8 +119,19 @@ live: current and cumulated sessions and subscriptions, rejected and
 security-rejected sessions (failed CreateSession / ActivateSession) and
 requests (any other ServiceFault), session timeouts. They are relaxed atomics
 touched only when a session or subscription starts or ends, or a request is
-rejected, never on a successful Read, Write or Publish. Per-session
-diagnostics are not collected (`EnabledFlag` is false, their arrays are empty).
+rejected, never on a successful Read, Write or Publish.
+
+`SessionDiagnosticsArray`, `SessionSecurityDiagnosticsArray` and
+`SubscriptionDiagnosticsArray` are encoded when read, from the live sessions:
+client description, endpoint, timeouts, connection and last contact times,
+subscription, monitored item and queued Publish counts, identity history,
+security policy and mode, client certificate, and for each subscription its
+parameters, keep-alive and lifetime counters, unacknowledged messages, item
+counts and next sequence number. Request counters (total, errors,
+unauthorized, and one per service) are kept only with `--session-diagnostics`,
+which sets `EnabledFlag`: each request then costs two relaxed atomic adds on
+the session's counters (a cold path, skipped by one branch otherwise).
+Counters the server does not track (republish, transfer, late publish) are 0.
 
 ## Subscriptions
 

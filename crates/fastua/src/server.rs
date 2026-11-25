@@ -111,6 +111,8 @@ pub struct ServerConfig {
     /// URL of the HTTPS endpoint (`opc.https://host:port`) when HTTPS is
     /// served (see [`crate::https`]).
     pub https_url: Option<String>,
+    /// Count every request per session and service (SessionDiagnostics).
+    pub session_diagnostics: bool,
 }
 
 impl ServerConfig {
@@ -132,6 +134,7 @@ impl ServerConfig {
             busy_poll: Duration::ZERO,
             busy_poll_threads: 0,
             https_url: None,
+            session_diagnostics: false,
         }
     }
 }
@@ -181,6 +184,46 @@ pub struct Session {
     /// Subscriptions and queued Publish requests, driven by the thread of
     /// the connection the session is bound to.
     pub subs: Mutex<SessionSubs>,
+    /// SessionDiagnostics / SessionSecurityDiagnostics (Part 5 §12.11).
+    pub diag: SessionDiag,
+}
+
+/// What a session's diagnostics report beyond its other fields.
+pub struct SessionDiag {
+    /// The client's ApplicationDescription, as encoded in CreateSession.
+    pub client_description: Box<[u8]>,
+    pub server_uri: Option<String>,
+    pub endpoint_url: Option<String>,
+    pub max_response: u32,
+    pub connected: i64,
+    /// Set by the once-a-second sweeper from the `touched` flag.
+    pub last_contact: std::sync::atomic::AtomicI64,
+    /// Service counters (see [`crate::diagnostics::COUNTERS`]); counted only
+    /// with `--session-diagnostics`.
+    pub counters: [AtomicU32; crate::diagnostics::COUNTERS],
+    /// Identities of the successive ActivateSession calls.
+    pub identities: Mutex<Vec<Arc<str>>>,
+}
+
+impl SessionDiag {
+    pub fn new(
+        client_description: &[u8],
+        server_uri: Option<String>,
+        endpoint_url: Option<String>,
+        max_response: u32,
+    ) -> SessionDiag {
+        let now = now_ticks();
+        SessionDiag {
+            client_description: client_description.into(),
+            server_uri,
+            endpoint_url,
+            max_response,
+            connected: now,
+            last_contact: std::sync::atomic::AtomicI64::new(now),
+            counters: std::array::from_fn(|_| AtomicU32::new(0)),
+            identities: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 pub struct Server {
@@ -307,6 +350,8 @@ impl Server {
             n => n,
         };
         let info = store.info().clone();
+        // EnabledFlag of ServerDiagnostics.
+        info.diagnostics.counting.store(config.session_diagnostics, Ordering::Relaxed);
         // An ECC endpoint needs our certificate on its curve.
         config.endpoints.retain(|(p, _)| match p.ecc() {
             Some(s) if pki.ecc_own(s.curve).is_none() => {
@@ -450,6 +495,7 @@ impl Server {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn create_session(
         &self,
         name: String,
@@ -458,6 +504,7 @@ impl Server {
         security: Security,
         server_nonce: Vec<u8>,
         client_nonce: Vec<u8>,
+        diag: SessionDiag,
     ) -> Result<Arc<Session>, u32> {
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         if sessions.len() >= self.limits().max_sessions {
@@ -485,10 +532,12 @@ impl Server {
             can_write: AtomicBool::new(false),
             identity: Mutex::new(Arc::from("")),
             subs: Mutex::new(SessionSubs::default()),
+            diag,
         });
         sessions.insert(session.token.clone(), session.clone());
         drop(sessions);
         let d = &self.store.info().diagnostics;
+        d.register(&session);
         crate::diagnostics::inc(&d.current_sessions);
         crate::diagnostics::inc(&d.cumulated_sessions);
         Ok(session)
@@ -513,6 +562,7 @@ impl Server {
         sessions.retain(|_, s| {
             if s.touched.swap(false, Ordering::Relaxed) {
                 s.last_seen.store(now, Ordering::Relaxed);
+                s.diag.last_contact.store(now_ticks(), Ordering::Relaxed);
             }
             let idle = now.saturating_sub(s.last_seen.load(Ordering::Relaxed)) as f64;
             let keep = idle <= s.timeout_ms;

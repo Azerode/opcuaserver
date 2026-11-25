@@ -751,8 +751,9 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     diagnostics_values(b);
 }
 
-/// Live values of ServerDiagnosticsSummary, and empty per-session arrays
-/// (per-session diagnostics are not collected: EnabledFlag is false).
+/// Live values of ServerDiagnosticsSummary, the per-session arrays and
+/// EnabledFlag (true with `--session-diagnostics`, which counts requests
+/// per session).
 fn diagnostics_values(b: &mut Builder) {
     use crate::diagnostics::{FIELD_NODES, SUMMARY, SUMMARY_NODE};
     let mut set = |id: u32, v: ValueSource| {
@@ -765,13 +766,15 @@ fn diagnostics_values(b: &mut Builder) {
     for (i, &id) in FIELD_NODES.iter().enumerate() {
         set(id, ValueSource::Diagnostics(i as u8));
     }
-    // SamplingIntervalDiagnosticsArray, SubscriptionDiagnosticsArray,
-    // SessionDiagnosticsArray, SessionSecurityDiagnosticsArray.
-    for id in [2289, 2290, 3707, 3708] {
-        let empty =
-            Variant::Array(Box::new(VariantArray { type_id: builtin::EXTENSIONOBJECT, items: vec![], dims: None }));
-        set(id, ValueSource::Static(empty));
-    }
+    use crate::diagnostics::{ENABLED_FLAG, SECURITY_ARRAY, SESSIONS_ARRAY, SUBSCRIPTIONS_ARRAY};
+    // Encoded when read from the live sessions.
+    set(3707, ValueSource::Diagnostics(SESSIONS_ARRAY));
+    set(3708, ValueSource::Diagnostics(SECURITY_ARRAY));
+    set(2290, ValueSource::Diagnostics(SUBSCRIPTIONS_ARRAY));
+    set(2294, ValueSource::Diagnostics(ENABLED_FLAG));
+    // SamplingIntervalDiagnosticsArray: sampling follows each item.
+    let empty = Variant::Array(Box::new(VariantArray { type_id: builtin::EXTENSIONOBJECT, items: vec![], dims: None }));
+    set(2289, ValueSource::Static(empty));
 }
 
 /// Completes namespace 0 from the official nodeset (see [`crate::ns0`]).

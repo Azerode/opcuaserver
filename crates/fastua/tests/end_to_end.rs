@@ -351,3 +351,82 @@ fn server_diagnostics_summary() {
     assert_eq!(read(&mut c, 2285), Variant::UInt32(0)); // deleted with its session
     assert_eq!(read(&mut c, 2286), Variant::UInt32(1));
 }
+
+#[test]
+fn session_diagnostics_arrays() {
+    use fastua::codec::Reader;
+    let dir = temp_config("sessdiag", MACHINE);
+    let store = Store::open(&dir, ServerInfo::default()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let mut config = ServerConfig::all_endpoints(addr.clone(), format!("opc.tcp://{addr}"));
+    config.anonymous = Some(Access::ReadWrite);
+    config.session_diagnostics = true;
+    let pki = Pki::open(&dir.join("pki"), "urn:test:fastua", "localhost", false).unwrap();
+    let server = Server::new(store, config, pki, Users::default());
+    std::thread::spawn(move || server.serve(listener));
+
+    let read = |c: &mut Client, id: u32| c.read(&[(NodeId::ns0(id), 13)]).unwrap().remove(0).value.unwrap_or_default();
+    let objects = |v: Variant| match v {
+        Variant::Array(a) => a
+            .items
+            .into_iter()
+            .map(|x| match x {
+                Variant::ExtensionObject(x) => *x,
+                other => panic!("not a structure: {other:?}"),
+            })
+            .collect::<Vec<_>>(),
+        other => panic!("not an array: {other:?}"),
+    };
+    let mut c = Client::connect(&addr, "opc.tcp://x").unwrap();
+    c.create_session("sd").unwrap();
+    assert_eq!(read(&mut c, 2294), Variant::Boolean(true)); // EnabledFlag
+    c.create_subscription(100.0, 30, 10).unwrap();
+
+    let sessions = objects(read(&mut c, 3707));
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].type_id, NodeId::ns0(867));
+    let mut r = Reader::new(&sessions[0].body);
+    let id = r.node_id().unwrap();
+    assert_eq!(r.str().unwrap(), Some("sd"));
+    // ClientDescription, as the client sent it.
+    assert_eq!(r.str().unwrap(), Some("urn:fastua:test-client"));
+    r.str().unwrap();
+    r.localized_text().unwrap();
+    r.i32().unwrap();
+    r.str().unwrap();
+    r.str().unwrap();
+    r.skip_string_array().unwrap();
+    r.str().unwrap(); // ServerUri
+    r.str().unwrap(); // EndpointUrl (the test client sends none)
+    r.skip_string_array().unwrap(); // LocaleIds
+    r.f64().unwrap(); // ActualSessionTimeout
+    r.u32().unwrap(); // MaxResponseMessageSize
+    let connected = r.i64().unwrap();
+    assert!(connected > 0 && r.i64().unwrap() >= connected); // ClientLastContactTime
+    assert_eq!(r.u32().unwrap(), 1); // CurrentSubscriptionsCount
+    assert_eq!(r.u32().unwrap(), 0); // CurrentMonitoredItemsCount
+    r.u32().unwrap(); // CurrentPublishRequestsInQueue
+    let total = r.u32().unwrap(); // TotalRequestCount.TotalCount
+    assert!(total >= 3, "{total} requests counted"); // Activate, Read, CreateSubscription
+    r.u32().unwrap();
+    assert_eq!(r.u32().unwrap(), 0); // UnauthorizedRequestCount
+
+    let security = objects(read(&mut c, 3708));
+    assert_eq!((security.len(), security[0].type_id.clone()), (1, NodeId::ns0(870)));
+    assert_eq!(Reader::new(&security[0].body).node_id().unwrap(), id);
+
+    let subs = objects(read(&mut c, 2290));
+    assert_eq!((subs.len(), subs[0].type_id.clone()), (1, NodeId::ns0(876)));
+    let mut r = Reader::new(&subs[0].body);
+    assert_eq!(r.node_id().unwrap(), id);
+    r.u32().unwrap(); // SubscriptionId
+    r.u8().unwrap();
+    assert_eq!(r.f64().unwrap(), 100.0); // PublishingInterval
+    c.close().unwrap();
+
+    let mut c = Client::connect(&addr, "opc.tcp://x").unwrap();
+    c.create_session("sd2").unwrap();
+    assert_eq!(objects(read(&mut c, 3707)).len(), 1);
+    assert!(objects(read(&mut c, 2290)).is_empty());
+}

@@ -36,7 +36,8 @@ const USAGE: &str = "usage: fastua [options]
   --min-sampling-interval MS     fastest monitored item sampling interval (default: 1, minimum 0.05)
   --history-dir DIR       keep the history of historized variables in DIR across restarts
                           (written every second by a background thread)
-  --event-history N       keep the last N events for HistoryRead on the Server object (default: 0, off)";
+  --event-history N       keep the last N events for HistoryRead on the Server object (default: 0, off)
+  --session-diagnostics   count requests per session for SessionDiagnosticsArray (EnabledFlag true)";
 
 fn fail(msg: String) -> ! {
     eprintln!("{msg}");
@@ -101,6 +102,7 @@ fn main() {
     let mut min_publishing: Option<f64> = None;
     let mut min_sampling: Option<f64> = None;
     let mut event_history = 0usize;
+    let mut session_diagnostics = false;
     let mut history_dir: Option<PathBuf> = None;
     let mut https_listen: Option<String> = None;
     let mut https_endpoint: Option<String> = None;
@@ -159,6 +161,7 @@ fn main() {
                 let v = value("--event-history");
                 event_history = v.parse().unwrap_or_else(|_| fail(format!("invalid --event-history '{v}'\n\n{USAGE}")));
             }
+            "--session-diagnostics" => session_diagnostics = true,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -224,6 +227,7 @@ fn main() {
     config.anonymous = anonymous;
     config.x509_users = x509_users;
     config.busy_poll = busy_poll;
+    config.session_diagnostics = session_diagnostics;
     config.busy_poll_threads = busy_poll_threads;
     config.limits = limits;
     let https = https_listen.as_ref().map(|addr| {

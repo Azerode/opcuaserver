@@ -76,7 +76,17 @@ fn main() {
     }
 
     // ---- 1. service layer
-    let session = server.create_session("bench".into(), 1, 60_000.0, Security::NONE, vec![], vec![]).unwrap();
+    let session = server
+        .create_session(
+            "bench".into(),
+            1,
+            60_000.0,
+            Security::NONE,
+            vec![],
+            vec![],
+            fastua::server::SessionDiag::new(&[], None, None, 0),
+        )
+        .unwrap();
     session.activated.store(true, Ordering::Release);
     for batch in [1usize, 10, 100] {
         let mut req = Vec::new();
