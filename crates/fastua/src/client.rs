@@ -4,7 +4,7 @@
 
 use crate::codec::{Reader, Writer};
 use crate::crypto::{self, ChannelKeys, Mode, Policy, PrivateKey, AES_BLOCK, SYM_SIGNATURE_LEN};
-use crate::ecc::{self, EccKeys, SigningKey, TAG_LEN};
+use crate::ecc::{self, EccKeys, LegacyKeys, SigningKey, TAG_LEN};
 use crate::pki::CertInfo;
 use crate::server::SECURITY_POLICY_NONE;
 use crate::types::*;
@@ -145,6 +145,8 @@ struct Secure {
     /// ECC: channel keys (server view: we seal with `remote`, open with
     /// `local`), IKM accumulator and ChannelThumbprint.
     ecc_keys: Option<EccKeys>,
+    /// Deprecated ECC policies (server view, like `ecc_keys`).
+    legacy_keys: Option<LegacyKeys>,
     ikm: Vec<u8>,
     thumbprint: Vec<u8>,
 }
@@ -211,6 +213,7 @@ impl Client {
             server,
             keys: None,
             ecc_keys: None,
+            legacy_keys: None,
             ikm,
             thumbprint: Vec::new(),
         };
@@ -365,6 +368,23 @@ impl Client {
             self.last_rx_seq = u32::from_le_bytes(self.rx[8..12].try_into().unwrap());
             return Ok(());
         }
+        if let Some(k) = &sec.legacy_keys {
+            let k = &k.local;
+            if sec.mode == Mode::SignAndEncrypt {
+                k.decrypt(&mut self.rx[8..]).map_err(|_| bad())?;
+            }
+            let end = self.rx.len().checked_sub(k.sig_len()).filter(|&e| e >= 16).ok_or_else(bad)?;
+            if !k.verify_parts(&[hdr, &self.rx[..end]], &self.rx[end..]) {
+                return Err(invalid("response signature invalid"));
+            }
+            let end = if sec.mode == Mode::SignAndEncrypt {
+                8 + crate::channel::strip_padding(&self.rx[8..end], false).ok_or_else(bad)?
+            } else {
+                end
+            };
+            self.rx.truncate(end);
+            return Ok(());
+        }
         let keys = &sec.keys.as_ref().ok_or_else(|| invalid("no keys"))?.local;
         if sec.mode == Mode::SignAndEncrypt {
             keys.decrypt(&mut self.rx[8..]).map_err(|_| bad())?;
@@ -512,7 +532,7 @@ impl Client {
                 let end = self.rx.len().checked_sub(suite.signature_len()).ok_or_else(p)?;
                 let mut signed = hdr.to_vec();
                 signed.extend_from_slice(&self.rx[..end]);
-                let first = sec.thumbprint.is_empty();
+                let first = sec.thumbprint.is_empty() && suite.is_aead();
                 if first {
                     signed.extend_from_slice(&request_sig);
                 }
@@ -554,6 +574,12 @@ impl Client {
         let server_nonce = r.bytes().map_err(|_| p())?.unwrap_or(&[]).to_vec();
         if let Some(sec) = &mut self.sec {
             match (policy.ecc(), eph) {
+                (Some(suite), Some(eph)) if !suite.is_aead() => {
+                    let secret = eph.agree(suite, &server_nonce).map_err(|_| p())?;
+                    let encrypt = mode == Mode::SignAndEncrypt;
+                    let keys = LegacyKeys::derive(suite, &secret, &client_nonce, &server_nonce, encrypt);
+                    sec.legacy_keys = Some(keys.map_err(|_| p())?);
+                }
                 (Some(suite), Some(eph)) => {
                     let secret = eph.agree(suite, &server_nonce).map_err(|_| p())?;
                     let keys = EccKeys::derive(suite, &mut sec.ikm, &secret, &client_nonce, &server_nonce);
@@ -609,12 +635,14 @@ impl Client {
             self.handle += 1;
             return;
         }
+        let legacy = self.sec.as_ref().and_then(|s| s.legacy_keys.as_ref());
+        let sym_sig = legacy.map_or(SYM_SIGNATURE_LEN, |k| k.remote.sig_len());
         if mode == Mode::SignAndEncrypt {
             let plain = tx.len() - start - SYM_CLEAR_LEN;
-            let (pad, _) = crypto::padding(plain, SYM_SIGNATURE_LEN, AES_BLOCK, false);
+            let (pad, _) = crypto::padding(plain, sym_sig, AES_BLOCK, false);
             tx.extend(std::iter::repeat_n(pad as u8, pad + 1));
         }
-        let sig_len = if mode == Mode::None { 0 } else { SYM_SIGNATURE_LEN };
+        let sig_len = if mode == Mode::None { 0 } else { sym_sig };
         let size = (tx.len() - start + sig_len) as u32;
         let h = &mut tx[start..start + 24];
         h[0..4].copy_from_slice(b"MSGF");
@@ -626,7 +654,13 @@ impl Client {
         self.seq += 1;
         self.request_id += 1;
         self.handle += 1;
-        if mode != Mode::None {
+        if let (Some(k), true) = (legacy, mode != Mode::None) {
+            let sig = k.remote.sign_parts(&[&tx[start..]]);
+            tx.extend_from_slice(sig.as_ref());
+            if mode == Mode::SignAndEncrypt {
+                k.remote.encrypt(&mut tx[start + SYM_CLEAR_LEN..]).expect("encrypt");
+            }
+        } else if mode != Mode::None {
             let keys = &self.sec.as_ref().unwrap().keys.as_ref().expect("channel keys").remote;
             let sig = keys.sign(&tx[start..]);
             tx.extend_from_slice(&sig);
@@ -749,6 +783,18 @@ impl Client {
         let username_policy = token_policy(1, crate::server::USERNAME_POLICY_ID);
 
         let signature = match &self.sec {
+            Some(sec) if sec.policy.ecc().is_some_and(|s| !s.is_aead()) => {
+                // Deprecated policies: the RSA-style data, no algorithm.
+                let suite = sec.policy.ecc().unwrap();
+                r.array(0, |r| r.bytes().map(|_| ())).map_err(|_| invalid("bad software certificates"))?;
+                r.str().map_err(|_| invalid("bad signature"))?;
+                let server_sig = r.bytes().map_err(|_| invalid("bad signature"))?.unwrap_or(&[]).to_vec();
+                suite
+                    .verify(&sec.server.rsa_public_key, &[&sec.cert[..], &client_nonce].concat(), &server_sig)
+                    .map_err(|_| invalid("server signature invalid"))?;
+                let data = [&sec.server.der[..], &server_nonce].concat();
+                Some((None, sec.ecc().sign(&data).map_err(|_| invalid("signing failed"))?))
+            }
             Some(sec) if sec.policy.is_ecc() => {
                 // Channel-bound signatures (SecureChannelEnhancements).
                 let suite = sec.policy.ecc().unwrap();
@@ -1253,7 +1299,6 @@ fn ecc_secret(suite: ecc::Suite, sec: &Secure, receiver: &[u8], nonce: &[u8], se
     let e = |_| invalid("EccEncryptedSecret");
     let eph = ecc::Ephemeral::generate(suite).map_err(e)?;
     let sender = eph.public.clone();
-    let keys = eph.secret_keys(suite, receiver, &sender, receiver).map_err(e)?;
     let mut plain = Vec::new();
     {
         let mut w = Writer::new(&mut plain);
@@ -1279,11 +1324,18 @@ fn ecc_secret(suite: ecc::Suite, sec: &Secure, receiver: &[u8], nonce: &[u8], se
     w.bytes(Some(&sender));
     w.bytes(Some(receiver));
     let payload_at = w.len();
-    let len = (payload_at + plain.len() + ecc::TAG_LEN + suite.signature_len() - 9) as u32;
+    let tag_len = if suite.is_aead() { ecc::TAG_LEN } else { 0 };
+    let len = (payload_at + plain.len() + tag_len + suite.signature_len() - 9) as u32;
     w.patch_u32(5, len);
-    let tag = keys.seal(0, 0, &out, &mut plain).map_err(e)?;
-    out.extend_from_slice(&plain);
-    out.extend_from_slice(&tag);
+    if suite.is_aead() {
+        let keys = eph.secret_keys(suite, receiver, &sender, receiver).map_err(e)?;
+        let tag = keys.seal(0, 0, &out, &mut plain).map_err(e)?;
+        out.extend_from_slice(&plain);
+        out.extend_from_slice(&tag);
+    } else {
+        eph.secret_cbc(suite, receiver, &sender, receiver).map_err(e)?.encrypt(&mut plain).map_err(e)?;
+        out.extend_from_slice(&plain);
+    }
     let sig = sec.ecc().sign(&out).map_err(e)?;
     out.extend_from_slice(&sig);
     Ok(out)

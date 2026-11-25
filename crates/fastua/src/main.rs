@@ -18,12 +18,14 @@ const USAGE: &str = "usage: fastua [options]
   --https-listen ADDR:PORT   also serve the HTTPS transport (opc.https, https-uabinary)
                           with the application certificate as TLS certificate
   --https-endpoint URL    HTTPS endpoint URL advertised (default: opc.https://<hostname>:<port>)
-  --endpoints LIST        comma-separated endpoints to offer (default: all):
+  --endpoints LIST        comma-separated endpoints to offer (default: all but the deprecated ones):
                             none, basic256sha256-sign, basic256sha256-encrypt,
                             aes128-sign, aes128-encrypt, aes256-sign, aes256-encrypt,
                             ecc-<curve>-<cipher>-sign|encrypt with curve nistp256,
                             nistp384 or curve25519 and cipher aesgcm or chachapoly
-                            (e.g. ecc-nistp256-aesgcm-encrypt)
+                            (e.g. ecc-nistp256-aesgcm-encrypt), the deprecated
+                            ecc-nistp256-sign|encrypt, ecc-nistp384-sign|encrypt,
+                            and default (the default list)
   --users FILE            users file enabling user name / password login
   --anonymous off|read|write   rights of anonymous users (default: read)
   --x509-users read|write      rights of users with a trusted certificate (default: write)
@@ -46,22 +48,28 @@ fn fail(msg: String) -> ! {
 
 fn parse_endpoints(list: &str) -> Vec<(Policy, Mode)> {
     list.split(',')
-        .map(|e| match e.trim().to_ascii_lowercase().as_str() {
-            "none" => (Policy::None, Mode::None),
-            "basic256sha256-sign" => (Policy::Basic256Sha256, Mode::Sign),
-            "basic256sha256-encrypt" => (Policy::Basic256Sha256, Mode::SignAndEncrypt),
-            "aes128-sign" => (Policy::Aes128Sha256RsaOaep, Mode::Sign),
-            "aes128-encrypt" => (Policy::Aes128Sha256RsaOaep, Mode::SignAndEncrypt),
-            "aes256-sign" => (Policy::Aes256Sha256RsaPss, Mode::Sign),
-            "aes256-encrypt" => (Policy::Aes256Sha256RsaPss, Mode::SignAndEncrypt),
-            other => {
-                parse_ecc_endpoint(other).unwrap_or_else(|| fail(format!("unknown endpoint '{other}'\n\n{USAGE}")))
-            }
+        .flat_map(|e| match e.trim().to_ascii_lowercase().as_str() {
+            "default" => ServerConfig::all_endpoints(String::new(), String::new()).endpoints,
+            other => vec![parse_endpoint(other)],
         })
         .collect()
 }
 
-/// `ecc-<curve>-<cipher>-sign|encrypt`.
+fn parse_endpoint(name: &str) -> (Policy, Mode) {
+    match name {
+        "none" => (Policy::None, Mode::None),
+        "basic256sha256-sign" => (Policy::Basic256Sha256, Mode::Sign),
+        "basic256sha256-encrypt" => (Policy::Basic256Sha256, Mode::SignAndEncrypt),
+        "aes128-sign" => (Policy::Aes128Sha256RsaOaep, Mode::Sign),
+        "aes128-encrypt" => (Policy::Aes128Sha256RsaOaep, Mode::SignAndEncrypt),
+        "aes256-sign" => (Policy::Aes256Sha256RsaPss, Mode::Sign),
+        "aes256-encrypt" => (Policy::Aes256Sha256RsaPss, Mode::SignAndEncrypt),
+        other => parse_ecc_endpoint(other).unwrap_or_else(|| fail(format!("unknown endpoint '{other}'\n\n{USAGE}"))),
+    }
+}
+
+/// `ecc-<curve>-<cipher>-sign|encrypt`, or `ecc-<curve>-sign|encrypt` for
+/// the deprecated ECC_nistP256 / ECC_nistP384.
 fn parse_ecc_endpoint(name: &str) -> Option<(Policy, Mode)> {
     let rest = name.strip_prefix("ecc-")?;
     let (suite, mode) = rest.rsplit_once('-')?;
@@ -70,7 +78,7 @@ fn parse_ecc_endpoint(name: &str) -> Option<(Policy, Mode)> {
         "encrypt" => Mode::SignAndEncrypt,
         _ => return None,
     };
-    let suite = fastua::ecc::Suite::ALL.into_iter().find(|s| {
+    let suite = fastua::ecc::Suite::every().find(|s| {
         let uri = s.uri().rsplit_once("#ECC_").map(|(_, n)| n.to_ascii_lowercase().replace('_', "-"));
         uri.as_deref() == Some(suite)
     })?;

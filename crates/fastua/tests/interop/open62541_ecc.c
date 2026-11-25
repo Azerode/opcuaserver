@@ -1,10 +1,11 @@
-/* Interoperability check of the ECC AEAD security policies against the
+/* Interoperability check of the ECC security policies against the
  * open62541 client (the reference implementation of the
- * SecureChannelEnhancements).
+ * SecureChannelEnhancements): the AEAD policies and the deprecated
+ * ECC_nistP256 / ECC_nistP384 (AES-CBC + HMAC, no enhancements).
  *
  * usage: open62541_ecc <opc.tcp://host:port> <trusted user certificates dir>
  *
- * For every ECC_* AEAD policy and both secure modes: anonymous session, reads,
+ * For every ECC_* policy and both secure modes: anonymous session, reads,
  * a browse and a large read (multi-chunk response). Then, per policy, an X.509
  * user token on the same curve (channel-bound user token signature) and a user
  * name / password (EccEncryptedSecret), and per curve a security token renewal
@@ -16,6 +17,7 @@
 #include <open62541/plugin/certificategroup_default.h>
 #include <open62541/plugin/create_certificate.h>
 #include <open62541/plugin/log_stdout.h>
+#include <open62541/plugin/securitypolicy_default.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,11 +37,40 @@ static void check(const char *label, int ok, const char *detail) {
 }
 
 typedef UA_StatusCode (*AddPolicy)(UA_ClientConfig *, const UA_ByteString *, const UA_ByteString *);
+typedef UA_StatusCode (*NewPolicy)(UA_SecurityPolicy *, const UA_ApplicationType, const UA_ByteString,
+                                   const UA_ByteString, const UA_Logger *);
+
+/* open62541 has no client helper for the deprecated policies (and does not
+ * add them for user certificates): append them as
+ * UA_ServerConfig_addSecurityPolicyEccNistP256 does (before connecting, no
+ * channel points into the arrays yet). */
+static UA_StatusCode appendPolicy(UA_ClientConfig *cc, UA_SecurityPolicy **policies, size_t *size,
+                                  NewPolicy make, const UA_ByteString *cert, const UA_ByteString *key) {
+    UA_SecurityPolicy *tmp = (UA_SecurityPolicy *)UA_realloc(*policies, sizeof(UA_SecurityPolicy) * (*size + 1));
+    if(!tmp)
+        return UA_STATUSCODE_BADOUTOFMEMORY;
+    *policies = tmp;
+    UA_StatusCode res = make(&tmp[*size], UA_APPLICATIONTYPE_CLIENT, *cert, *key, cc->logging);
+    if(res == UA_STATUSCODE_GOOD)
+        (*size)++;
+    return res;
+}
+
+static UA_StatusCode addNistP256(UA_ClientConfig *cc, const UA_ByteString *cert, const UA_ByteString *key) {
+    return appendPolicy(cc, &cc->securityPolicies, &cc->securityPoliciesSize, UA_SecurityPolicy_EccNistP256,
+                        cert, key);
+}
+
+static UA_StatusCode addNistP384(UA_ClientConfig *cc, const UA_ByteString *cert, const UA_ByteString *key) {
+    return appendPolicy(cc, &cc->securityPolicies, &cc->securityPoliciesSize, UA_SecurityPolicy_EccNistP384,
+                        cert, key);
+}
 
 static const struct {
     const char *name;
     const char *curve; /* UA_CreateCertificate "ecc-curve" */
     AddPolicy add;
+    NewPolicy deprecated; /* the user certificate's policy, deprecated ones only */
 } POLICIES[] = {
     {"nistP256_AesGcm", "prime256v1", UA_ClientConfig_addSecurityPolicyEccNistP256AesGcm},
     {"nistP256_ChaChaPoly", "prime256v1", UA_ClientConfig_addSecurityPolicyEccNistP256ChaChaPoly},
@@ -47,6 +78,9 @@ static const struct {
     {"nistP384_ChaChaPoly", "secp384r1", UA_ClientConfig_addSecurityPolicyEccNistP384ChaChaPoly},
     {"curve25519_AesGcm", "ed25519", UA_ClientConfig_addSecurityPolicyEccCurve25519AesGcm},
     {"curve25519_ChaChaPoly", "ed25519", UA_ClientConfig_addSecurityPolicyEccCurve25519ChaChaPoly},
+    /* Deprecated. */
+    {"nistP256", "prime256v1", addNistP256, UA_SecurityPolicy_EccNistP256},
+    {"nistP384", "secp384r1", addNistP384, UA_SecurityPolicy_EccNistP384},
 };
 #define NPOLICIES (sizeof(POLICIES) / sizeof(POLICIES[0]))
 
@@ -104,6 +138,12 @@ static UA_Client *newClient(size_t p, UA_MessageSecurityMode mode, const UA_Byte
     if(lifetime)
         cc->secureChannelLifeTime = lifetime;
     if(userCert && UA_ClientConfig_setAuthenticationCert(cc, *userCert, *userKey) != UA_STATUSCODE_GOOD) {
+        UA_Client_delete(client);
+        return NULL;
+    }
+    if(userCert && POLICIES[p].deprecated &&
+       appendPolicy(cc, &cc->authSecurityPolicies, &cc->authSecurityPoliciesSize, POLICIES[p].deprecated, userCert,
+                    userKey) != UA_STATUSCODE_GOOD) {
         UA_Client_delete(client);
         return NULL;
     }
@@ -246,9 +286,10 @@ int main(int argc, char *argv[]) {
             UA_Client_delete(client);
         }
 
-        /* Token renewal once per curve: the server's minimum lifetime is 10 s,
-         * the client renews at 75 % of it. */
-        if(strstr(POLICIES[p].name, "AesGcm")) {
+        /* Token renewal once per curve and for the deprecated policies (no
+         * IKM chaining): the server's minimum lifetime is 10 s, the client
+         * renews at 75 % of it. */
+        if(strstr(POLICIES[p].name, "AesGcm") || !strchr(POLICIES[p].name, '_')) {
             snprintf(label, sizeof(label), "ECC_%s token renewal", POLICIES[p].name);
             client = newClient(p, modes[1], &cert, &key, NULL, NULL, 10000);
             res = client ? UA_Client_connect(client, url) : UA_STATUSCODE_BADINTERNALERROR;

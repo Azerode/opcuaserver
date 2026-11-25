@@ -36,8 +36,7 @@ pub enum Policy {
     Basic256Sha256,
     Aes128Sha256RsaOaep,
     Aes256Sha256RsaPss,
-    /// ECC_* AEAD policies (ephemeral key agreement, no asymmetric
-    /// encryption).
+    /// ECC_* policies (ephemeral key agreement, no asymmetric encryption).
     Ecc(crate::ecc::Suite),
 }
 
@@ -157,6 +156,22 @@ impl Policy {
             Policy::Aes128Sha256RsaOaep => 16,
             _ => 32,
         }
+    }
+
+    /// Length of a symmetric signature: HMAC-SHA256, or for ECC the AEAD
+    /// tag or the HMAC of a deprecated policy.
+    #[inline]
+    pub fn sym_signature_len(self) -> usize {
+        match self {
+            Policy::Ecc(s) => s.sym_signature_len(),
+            _ => SYM_SIGNATURE_LEN,
+        }
+    }
+
+    /// An ECC AEAD policy (ECC_*_AesGcm / ECC_*_ChaChaPoly).
+    #[inline]
+    pub fn is_aead(self) -> bool {
+        matches!(self, Policy::Ecc(s) if s.is_aead())
     }
 
     pub fn nonce_len(self) -> usize {

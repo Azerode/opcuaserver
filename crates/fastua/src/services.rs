@@ -176,7 +176,8 @@ fn write_ecdh_key(ctx: &Ctx, h: &RequestHeader, s: &Session, w: &mut Writer) -> 
 
 /// Decrypts an EccEncryptedSecret (Part 4 §7.41.2.3) with the session's
 /// ephemeral key: signed by the client's application key, AEAD-encrypted
-/// `nonce | secret | padding | padding size`.
+/// (AES-CBC for the deprecated policies) `nonce | secret | padding |
+/// padding size`.
 fn decrypt_ecc_secret(ctx: &Ctx, s: &Session, data: &[u8], nonce: &[u8]) -> Result<Vec<u8>, u32> {
     let bad = status::BAD_IDENTITY_TOKEN_INVALID;
     let suite = ctx.security.policy.ecc().ok_or(bad)?;
@@ -200,7 +201,8 @@ fn decrypt_ecc_secret(ctx: &Ctx, s: &Session, data: &[u8], nonce: &[u8]) -> Resu
         return Err(bad);
     }
     let sig_len = suite.signature_len();
-    if end != data.len() || end < r.position() + sig_len + crate::ecc::TAG_LEN {
+    let tag_len = if suite.is_aead() { crate::ecc::TAG_LEN } else { 0 };
+    if end != data.len() || end < r.position() + sig_len + tag_len {
         return Err(bad);
     }
     let signed = end - sig_len;
@@ -209,16 +211,21 @@ fn decrypt_ecc_secret(ctx: &Ctx, s: &Session, data: &[u8], nonce: &[u8]) -> Resu
     let sender = r.bytes().map_err(|_| bad)?.unwrap_or(&[]);
     let receiver = r.bytes().map_err(|_| bad)?.unwrap_or(&[]);
     let payload_at = r.position();
-    if payload_at - keys_at != key_len as usize || payload_at + crate::ecc::TAG_LEN > signed {
+    if payload_at - keys_at != key_len as usize || payload_at + tag_len > signed {
         return Err(bad);
     }
     if receiver != eph.public.as_slice() {
         return Err(bad);
     }
-    let keys = eph.secret_keys(suite, sender, sender, receiver).map_err(|_| bad)?;
-    let tag_at = signed - crate::ecc::TAG_LEN;
+    let tag_at = signed - tag_len;
     let mut plain = data[payload_at..tag_at].to_vec();
-    keys.open(0, 0, &data[..payload_at], &mut plain, &data[tag_at..signed]).map_err(|_| bad)?;
+    if suite.is_aead() {
+        let keys = eph.secret_keys(suite, sender, sender, receiver).map_err(|_| bad)?;
+        keys.open(0, 0, &data[..payload_at], &mut plain, &data[tag_at..signed]).map_err(|_| bad)?;
+    } else {
+        let cbc = eph.secret_cbc(suite, sender, sender, receiver).map_err(|_| bad)?;
+        cbc.decrypt(&mut plain).map_err(|_| bad)?;
+    }
     // nonce | secret | padding (n bytes of n) | n (UInt16)
     let mut p = Reader::new(&plain);
     let got_nonce = p.bytes().map_err(|_| bad)?.unwrap_or(&[]);
@@ -495,8 +502,13 @@ fn create_session(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writ
             Policy::Ecc(suite) => {
                 // Channel-bound (SecureChannelEnhancements): ChannelThumbprint |
                 // clientNonce | H(server cert) | H(client cert) | serverNonce.
+                // Deprecated policies: client certificate | clientNonce.
                 let own = pki.ecc_own(suite.curve).ok_or(status::BAD_INTERNAL_ERROR)?;
-                let data = ecc_signature_data(&security, &client_nonce, &[&own.cert_der, &channel_cert.der], &nonce)?;
+                let data = if suite.is_aead() {
+                    ecc_signature_data(&security, &client_nonce, &[&own.cert_der, &channel_cert.der], &nonce)?
+                } else {
+                    [&channel_cert.der[..], &client_nonce].concat()
+                };
                 own.key.sign(&data).map_err(|_| status::BAD_INTERNAL_ERROR)?
             }
             p => {
@@ -663,10 +675,15 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
     // Proof of possession of the client certificate's private key.
     if let Some(cert) = &ctx.security.client_cert {
         let ok = match ctx.security.policy {
-            // Channel-bound; the algorithm field is ignored.
+            // Channel-bound (deprecated policies: server certificate |
+            // serverNonce); the algorithm field is ignored.
             Policy::Ecc(suite) => {
                 let own = &pki.ecc_own(suite.curve).ok_or(status::BAD_INTERNAL_ERROR)?.cert_der;
-                let data = ecc_signature_data(ctx.security, &nonce, &[own, own, &cert.der], &s.client_nonce)?;
+                let data = if suite.is_aead() {
+                    ecc_signature_data(ctx.security, &nonce, &[own, own, &cert.der], &s.client_nonce)?
+                } else {
+                    [&own[..], &nonce].concat()
+                };
                 suite.verify(&cert.rsa_public_key, &data, &client_sig).is_ok()
             }
             policy => {
@@ -733,7 +750,11 @@ fn activate_session_inner(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &
                 Policy::Ecc(suite) => {
                     let own = &pki.ecc_own(suite.curve).ok_or(status::BAD_INTERNAL_ERROR)?.cert_der;
                     let client = &ctx.security.client_cert.as_ref().ok_or(status::BAD_SECURITY_CHECKS_FAILED)?.der;
-                    let data = ecc_signature_data(ctx.security, &nonce, &[own, own, client, client], &s.client_nonce)?;
+                    let data = if suite.is_aead() {
+                        ecc_signature_data(ctx.security, &nonce, &[own, own, client, client], &s.client_nonce)?
+                    } else {
+                        [&own[..], &nonce].concat()
+                    };
                     info.curve == Some(suite.curve) && suite.verify(&info.rsa_public_key, &data, &user_sig).is_ok()
                 }
                 policy => {

@@ -116,7 +116,9 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
-    /// Every supported endpoint, anonymous users read-only.
+    /// Every supported endpoint but the deprecated ECC_nistP256 /
+    /// ECC_nistP384 ones (offered only when listed), anonymous users
+    /// read-only.
     pub fn all_endpoints(listen: String, endpoint_url: String) -> ServerConfig {
         let mut endpoints = vec![(Policy::None, Mode::None)];
         let ecc = crate::ecc::Suite::ALL.into_iter().map(Policy::Ecc);

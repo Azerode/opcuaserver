@@ -427,7 +427,7 @@ events).
 
 ### Endpoints
 
-By default the server offers nineteen endpoints. Use `--endpoints` to choose a subset (comma-separated):
+By default the server offers nineteen endpoints. Use `--endpoints` to choose a subset (comma-separated; `default` stands for the default list, so `default,ecc-nistp256-encrypt` adds one deprecated endpoint):
 
 | Name | SecurityPolicy | Mode |
 |---|---|---|
@@ -441,6 +441,8 @@ By default the server offers nineteen endpoints. Use `--endpoints` to choose a s
 | `ecc-nistp384-chachapoly-sign`, `…-encrypt` | ECC_nistP384_ChaChaPoly | Sign / SignAndEncrypt |
 | `ecc-curve25519-aesgcm-sign`, `…-encrypt` | ECC_curve25519_AesGcm | Sign / SignAndEncrypt |
 | `ecc-curve25519-chachapoly-sign`, `…-encrypt` | ECC_curve25519_ChaChaPoly | Sign / SignAndEncrypt |
+| `ecc-nistp256-sign`, `ecc-nistp256-encrypt` | ECC_nistP256 (deprecated, not offered by default) | Sign / SignAndEncrypt |
+| `ecc-nistp384-sign`, `ecc-nistp384-encrypt` | ECC_nistP384 (deprecated, not offered by default) | Sign / SignAndEncrypt |
 
 Cryptography is provided by aws-lc-rs: RSA-OAEP, PKCS#1 v1.5 and PSS signatures, AES-CBC, HMAC-SHA256 and P_SHA256. Client keys of 2048 to 4096 bits are accepted.
 
@@ -451,6 +453,13 @@ The ECC policies follow OPC UA 1.05.04 and later with the SecureChannelEnhanceme
 - **Messages:** AES-GCM (128-bit for P-256 and curve25519, 256-bit for P-384) or ChaCha20-Poly1305, with a 16-byte tag and no padding. The IV is the derived IV masked with the TokenId and the previous sequence number. Sign mode authenticates the whole chunk. Sequence numbers start at 0 and wrap from 2³²−1 to 0.
 - **Channel binding:** the server signs its first OpenSecureChannel response together with the client's request signature; that signature is the ChannelThumbprint, prepended to the CreateSession and ActivateSession signatures, which cover certificate hashes instead of certificates. The SignatureData algorithm is left empty.
 - **Users:** anonymous, X.509 (a user certificate on the policy's curve) and user name. When the client asks for it (`ECDHPolicyUri` in the request's AdditionalHeader), CreateSession and ActivateSession return a fresh ephemeral key signed with our key (`ECDHKey`). The password comes back as an EccEncryptedSecret: signed by the client's application key, AEAD-encrypted with keys from ECDH with that ephemeral key and HKDF (label `opcua-secret`), and bound to the session's server nonce. Each ephemeral key decrypts one secret.
+
+The deprecated ECC_nistP256 and ECC_nistP384 (OPC UA 1.05.00 to 1.05.03) are offered only when listed in `--endpoints`, for older clients. They share the OpenSecureChannel, nonces, HKDF and ephemeral keys above, without the SecureChannelEnhancements:
+
+- **Keys:** HKDF over each exchange's shared secret (no IKM chaining): signing key ‖ encrypting key ‖ IV, the signing key alone in Sign mode (L counts only what is derived).
+- **Messages:** like the RSA policies: AES-128-CBC with HMAC-SHA256 (P-256) or AES-256-CBC with HMAC-SHA384 (P-384, 48-byte signatures), PKCS-style padding when encrypting. Sequence numbers as for the AEAD policies.
+- **Sessions:** the RSA-style signatures (client certificate ‖ client nonce, server certificate ‖ server nonce) made with ECDSA, no ChannelThumbprint; the EccEncryptedSecret payload is AES-CBC encrypted, without a tag.
+- **Interoperability:** checked in CI against the open62541 client (anonymous, X.509 and user name logins, both modes, token renewal), like the AEAD policies.
 
 ### Certificates (`--pki DIR`, default `pki`)
 
@@ -548,5 +557,3 @@ with OperationLimits, every Subscription and MonitoredItem service (see
 those elements are compared and reported, through the Variant path) and events with session audit (see
 [Events](#events)), alarms and conditions (see
 [Alarms and conditions](#alarms-and-conditions)).
-
-Not yet: the deprecated non-AEAD ECC policies.

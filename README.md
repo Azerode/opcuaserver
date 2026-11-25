@@ -9,6 +9,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
 - **Transport:** UA TCP binary (HEL/ACK/ERR, chunking both ways, pipelined requests).
 - **Security:** SecureChannel with SecurityPolicy None, Basic256Sha256, Aes128_Sha256_RsaOaep and Aes256_Sha256_RsaPss, in Sign and SignAndEncrypt modes.
   - ECC policies (OPC UA 1.05.04+): ECC_nistP256, ECC_nistP384 and ECC_curve25519, each with AesGcm and ChaChaPoly. They use ephemeral ECDH / X25519 key agreement, HKDF, ECDSA / Ed25519 signatures and AEAD messages, with the SecureChannelEnhancements (channel-bound session signatures, IKM chaining on renewal). A certificate per curve is created in the PKI. Anonymous, X.509 and user name logins work on ECC endpoints; the password travels as an EccEncryptedSecret for an ephemeral key the server sends in CreateSession / ActivateSession.
+  - Deprecated ECC_nistP256 and ECC_nistP384 (1.05.00 to 1.05.03, AES-CBC + HMAC-SHA256 / SHA384, no SecureChannelEnhancements) for older clients, offered only when listed in `--endpoints`.
   - Mutual certificate authentication.
   - Token renewal and lifetime, sequence checks.
   - A PKI with chain, CRL and ApplicationUri validation.
@@ -50,7 +51,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: the deprecated non-AEAD ECC policies, HTTPS with client certificates or the JSON encoding.
+Not yet: HTTPS with client certificates or the JSON encoding.
 
 ## Build and run
 
@@ -72,7 +73,7 @@ Main options (`fastua --help` lists them all):
 | `--config DIR` | Namespace files, watched for changes (default `config/machines`). |
 | `--listen ADDR:PORT` | Address to bind (default `0.0.0.0:4840`). |
 | `--endpoint URL`, `--application-uri URI` | Advertised endpoint URL and ApplicationUri. |
-| `--endpoints LIST` | Endpoints to offer: `none`, `basic256sha256-sign`, `basic256sha256-encrypt`, `aes128-sign`, `aes128-encrypt`, `aes256-sign`, `aes256-encrypt`, `ecc-<curve>-<cipher>-sign\|encrypt` with curve `nistp256`, `nistp384` or `curve25519` and cipher `aesgcm` or `chachapoly` (default: all). |
+| `--endpoints LIST` | Endpoints to offer: `none`, `basic256sha256-sign`, `basic256sha256-encrypt`, `aes128-sign`, `aes128-encrypt`, `aes256-sign`, `aes256-encrypt`, `ecc-<curve>-<cipher>-sign\|encrypt` with curve `nistp256`, `nistp384` or `curve25519` and cipher `aesgcm` or `chachapoly`, the deprecated `ecc-nistp256-sign\|encrypt` and `ecc-nistp384-sign\|encrypt`, and `default` (default: all but the deprecated ones). |
 | `--pki DIR` | Certificate store (default `pki`). A self-signed certificate is created if missing. |
 | `--users FILE` | Enables user name / password login. |
 | `--anonymous off\|read\|write`, `--x509-users read\|write` | Rights of anonymous users and of certificate users. |

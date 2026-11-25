@@ -24,10 +24,20 @@ fn start_with(dir: &std::path::Path, limits: Limits, busy_poll: std::time::Durat
     config.limits = limits;
     config.anonymous = Some(Access::ReadWrite);
     config.busy_poll = busy_poll;
+    with_deprecated_ecc(&mut config);
     let pki = Pki::open(&dir.join("pki"), "urn:test:fastua", "localhost", false).unwrap();
     let server = Server::new(store, config, pki, Users::default());
     std::thread::spawn(move || server.serve(listener));
     addr
+}
+
+/// Adds the deprecated ECC_nistP256 / ECC_nistP384 endpoints (opt-in).
+fn with_deprecated_ecc(config: &mut ServerConfig) {
+    use fastua::crypto::{Mode, Policy};
+    for s in fastua::ecc::Suite::LEGACY {
+        config.endpoints.push((Policy::Ecc(s), Mode::Sign));
+        config.endpoints.push((Policy::Ecc(s), Mode::SignAndEncrypt));
+    }
 }
 
 fn temp_config(name: &str, body: &str) -> PathBuf {
@@ -225,8 +235,9 @@ fn secure_channels_end_to_end() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Every ECC AEAD policy and mode: channel-bound session signatures, read,
-/// write, multi-chunk responses, pipelining and a token renewal (IKM chaining).
+/// Every ECC policy and mode (AEAD and deprecated CBC): session signatures
+/// (channel-bound for AEAD), read, write, multi-chunk responses, pipelining
+/// and a token renewal (IKM chaining for AEAD).
 #[test]
 fn ecc_channels_end_to_end() {
     use fastua::crypto::{Mode, Policy};
@@ -245,7 +256,7 @@ fn ecc_channels_end_to_end() {
             Curve::Curve25519 => "curve25519",
         };
         let server_cert = std::fs::read(dir.join(format!("pki/own/certs/fastua_{name}.der"))).unwrap();
-        for suite in Suite::ALL.into_iter().filter(|s| s.curve == curve) {
+        for suite in Suite::every().filter(|s| s.curve == curve) {
             let policy = Policy::Ecc(suite);
             for mode in [Mode::Sign, Mode::SignAndEncrypt] {
                 let mut c = Client::connect_secure(&addr, &url, policy, mode, &cert, &key, &server_cert)
@@ -290,13 +301,14 @@ fn ecc_user_name_login() {
     let addr = listener.local_addr().unwrap().to_string();
     let mut config = ServerConfig::all_endpoints(addr.clone(), format!("opc.tcp://{addr}"));
     config.anonymous = None;
+    with_deprecated_ecc(&mut config);
     let pki = Pki::open(&dir.join("pki"), "urn:test:fastua", "localhost", false).unwrap();
     let server = Server::new(store, config, pki, Users::load(&users).unwrap());
     std::thread::spawn(move || server.serve(listener));
     let trusted = dir.join("pki/trusted/certs");
     std::fs::create_dir_all(&trusted).unwrap();
     let url = format!("opc.tcp://{addr}");
-    for suite in Suite::ALL {
+    for suite in Suite::every() {
         let (cert, key) =
             fastua::pki::generate_self_signed_ecc(suite.curve, "urn:fastua:test-client", "localhost").unwrap();
         std::fs::write(trusted.join(format!("client-{suite:?}.der")), &cert).unwrap();
