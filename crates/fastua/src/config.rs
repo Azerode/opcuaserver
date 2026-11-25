@@ -80,6 +80,9 @@ struct RawAlarm {
     message: Option<String>,
     #[serde(rename = "Deadband", default)]
     deadband: f64,
+    /// Longest TimedShelve, in milliseconds.
+    #[serde(rename = "MaxTimeShelved")]
+    max_time_shelved: Option<f64>,
 }
 
 /// `{"Low": 0, "High": 100}` or `[0, 100]`.
@@ -243,7 +246,16 @@ fn parse_alarm(a: RawAlarm, data_type: u8) -> Result<crate::alarms::AlarmConfig,
     if !(1..=1000).contains(&severity) {
         return Err("Severity must be 1..1000".into());
     }
-    Ok(AlarmConfig { kind, severity, message: a.message, deadband: a.deadband })
+    if a.max_time_shelved.is_some_and(|m| !(m > 0.0 && m.is_finite())) {
+        return Err("MaxTimeShelved must be > 0 (milliseconds)".into());
+    }
+    Ok(AlarmConfig {
+        kind,
+        severity,
+        message: a.message,
+        deadband: a.deadband,
+        max_time_shelved_ms: a.max_time_shelved,
+    })
 }
 
 /// Lists config files in a stable order (so namespace indexes assigned on

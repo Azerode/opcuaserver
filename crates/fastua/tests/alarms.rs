@@ -235,3 +235,61 @@ fn limit_alarm_acknowledge_and_refresh() {
     assert_eq!(text(&last[8]), "Low");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn shelving_and_branches() {
+    let (addr, dir) = start("shelve");
+    let mut c = Client::connect(&addr, &format!("opc.tcp://{addr}")).unwrap();
+    c.create_session("operator").unwrap();
+    let temp = NodeId::Numeric(2, 1);
+    let temp_alarm = NodeId::String(2, "__alarm/i=1".into());
+    let shelving = NodeId::String(2, "__alarm/i=1/ShelvingState".into());
+    // The ShelvingState object of the condition.
+    let v = c.read(&[(shelving.clone(), 3)]).unwrap();
+    assert_eq!(
+        v[0].value,
+        Some(Variant::QualifiedName(Box::new(QualifiedName { ns: 0, name: "ShelvingState".into() })))
+    );
+
+    let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
+    let fields =
+        ["EventId", "BranchId", "Retain", "SuppressedOrShelved", "ShelvingState/CurrentState", "AckedState/Id"];
+    let mut spec = MonitorSpec::events(SERVER, 1, &fields);
+    spec.event_where =
+        vec![(14, vec![FilterOperand::Literal(Variant::NodeId(Box::new(NodeId::ns0(ALARM_CONDITION_TYPE))))])];
+    assert_eq!(c.monitor(sub, &[spec]).unwrap()[0].0, status::GOOD);
+
+    // TimedShelve2 on the ShelvingState object, with a comment.
+    let args = [Variant::Double(60_000.0), comment("maintenance")];
+    assert_eq!(call(&mut c, &shelving, TIMED_SHELVE2, &args).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!(ev[0][3], Variant::Boolean(true));
+    assert_eq!(text(&ev[0][4]), "TimedShelved");
+    assert_eq!(call(&mut c, &shelving, TIMED_SHELVE, &[Variant::Double(1.0)]).0, BAD_CONDITION_ALREADY_SHELVED);
+    assert_eq!(call(&mut c, &shelving, TIMED_SHELVE, &[]).0, BAD_ARGUMENTS_MISSING);
+    assert_eq!(call(&mut c, &shelving, UNSHELVE, &[]).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][3], text(&ev[0][4]).as_str()), (&Variant::Boolean(false), "Unshelved"));
+    assert_eq!(call(&mut c, &shelving, UNSHELVE2, &[comment("")]).0, BAD_CONDITION_NOT_SHELVED);
+
+    // Active, back to normal unacknowledged, active again: the first
+    // occurrence becomes a branch with its own BranchId and EventId.
+    for v in [85.0, 50.0, 85.0] {
+        c.write(&[(temp.clone(), Variant::Double(v))]).unwrap();
+    }
+    let ev = collect(&mut c, 4);
+    assert_eq!(ev.len(), 4, "{ev:?}");
+    let null = Variant::NodeId(Box::new(NodeId::NULL));
+    let branch = ev.iter().find(|e| e[1] != null).expect("branch event");
+    assert_eq!(branch[2], Variant::Boolean(true));
+    let main = ev.last().unwrap();
+    assert_eq!(main[1], null);
+    assert_eq!(call(&mut c, &temp_alarm, ACKNOWLEDGE, &[branch[0].clone(), comment("")]).0, status::GOOD);
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][1], &ev[0][5]), (&branch[1], &Variant::Boolean(true)));
+    assert_eq!(call(&mut c, &temp_alarm, CONFIRM, &[ev[0][0].clone(), comment("")]).0, status::GOOD);
+    // Acknowledged and confirmed: reported once more with Retain false.
+    let ev = collect(&mut c, 1);
+    assert_eq!((&ev[0][1], &ev[0][2]), (&branch[1], &Variant::Boolean(false)));
+    let _ = std::fs::remove_dir_all(dir);
+}

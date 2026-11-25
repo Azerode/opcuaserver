@@ -576,6 +576,8 @@ impl Server {
             std::thread::Builder::new().name("fastua-sessions".into()).spawn(move || loop {
                 std::thread::sleep(Duration::from_secs(1));
                 server.expire_sessions();
+                // Timed shelves end on time (to the second).
+                server.store.load().alarms.tick(crate::types::now_ticks());
             })?;
         }
         if !self.config.busy_poll.is_zero() {

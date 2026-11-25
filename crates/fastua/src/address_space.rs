@@ -586,6 +586,8 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
         (at::TWO_STATE_VARIABLE_TYPE, "TwoStateVariableType", at::STATE_VARIABLE_TYPE, false),
         (at::FINITE_STATE_VARIABLE_TYPE, "FiniteStateVariableType", at::STATE_VARIABLE_TYPE, false),
         (at::CONDITION_VARIABLE_TYPE, "ConditionVariableType", ids::BASE_DATA_VARIABLE_TYPE, false),
+        (at::TRANSITION_VARIABLE_TYPE, "TransitionVariableType", ids::BASE_DATA_VARIABLE_TYPE, false),
+        (at::FINITE_TRANSITION_VARIABLE_TYPE, "FiniteTransitionVariableType", at::TRANSITION_VARIABLE_TYPE, false),
     ] {
         b.ns0(id, name, vt(21, -1, abs));
         b.subtype(parent, id);
@@ -599,6 +601,7 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
             at::FINITE_STATE_MACHINE_TYPE,
             false,
         ),
+        (at::SHELVED_STATE_MACHINE_TYPE, "ShelvedStateMachineType", at::FINITE_STATE_MACHINE_TYPE, false),
         (at::BASE_CONDITION_CLASS_TYPE, "BaseConditionClassType", ids::BASE_OBJECT_TYPE, true),
         (at::PROCESS_CONDITION_CLASS_TYPE, "ProcessConditionClassType", at::BASE_CONDITION_CLASS_TYPE, true),
     ] {
@@ -622,10 +625,17 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
                 .iter()
                 .any(|f| f.1.len() > name.len() && f.1.starts_with(name) && f.1.as_bytes()[name.len()] == b'/');
             if data_type == 0 {
-                b.object(decl, leaf, parent, at::EXCLUSIVE_LIMIT_STATE_MACHINE_TYPE);
+                let type_def = if leaf == "ShelvingState" {
+                    at::SHELVED_STATE_MACHINE_TYPE
+                } else {
+                    at::EXCLUSIVE_LIMIT_STATE_MACHINE_TYPE
+                };
+                b.object(decl, leaf, parent, type_def);
             } else if has_children {
                 let type_def = if leaf == "CurrentState" {
                     at::FINITE_STATE_VARIABLE_TYPE
+                } else if leaf == "LastTransition" {
+                    at::FINITE_TRANSITION_VARIABLE_TYPE
                 } else if leaf.ends_with("State") {
                     at::TWO_STATE_VARIABLE_TYPE
                 } else {
@@ -636,7 +646,16 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
                 b.property(decl, leaf, parent, data_type, rank, ValueSource::Static(Variant::Empty));
             }
             let d = b.idx(decl);
-            b.link(d, ids::HAS_MODELLING_RULE, mandatory);
+            // Optional parts of AlarmConditionType (Part 9 §5.8.2).
+            let optional = matches!(
+                name,
+                "ShelvingState"
+                    | "MaxTimeShelved"
+                    | "ShelvingState/LastTransition"
+                    | "ShelvingState/LastTransition/TransitionTime"
+            );
+            let rule = if optional { b.idx(ids::MODELLING_RULE_OPTIONAL) } else { mandatory };
+            b.link(d, ids::HAS_MODELLING_RULE, rule);
         }
     }
     // Condition methods (Part 9 §5.5, §5.7).
@@ -1141,6 +1160,23 @@ pub fn build(
                     let td = b.idx(a.type_id());
                     b.link(cond, ids::HAS_TYPE_DEFINITION, td);
                     b.link(var, ids::HAS_CONDITION, cond);
+                    // Target of the shelving methods (Part 9 §5.8.10).
+                    let shelving = b
+                        .add(Node {
+                            id: NodeId::String(
+                                ns,
+                                format!("__alarm/{}{}", it.node_id, crate::alarms::SHELVING_STATE_SUFFIX).into(),
+                            ),
+                            browse_name: QualifiedName { ns: 0, name: "ShelvingState".into() },
+                            display_name: LocalizedText::new("ShelvingState"),
+                            description: None,
+                            refs: Vec::with_capacity(2),
+                            kind: NodeKind::Object { event_notifier: 0 },
+                        })
+                        .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
+                    let sst = b.idx(crate::alarms::types::SHELVED_STATE_MACHINE_TYPE);
+                    b.link(cond, ids::HAS_COMPONENT, shelving);
+                    b.link(shelving, ids::HAS_TYPE_DEFINITION, sst);
                 }
                 let Some((low, high)) = it.eu_range else {
                     b.link(var, ids::HAS_TYPE_DEFINITION, bdv_type);

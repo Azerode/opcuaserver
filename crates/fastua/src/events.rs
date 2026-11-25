@@ -105,6 +105,14 @@ pub mod types {
     pub const ACTIVE_STATE_TRANSITION_TIME: u32 = 9165;
     pub const INPUT_NODE: u32 = 11120;
     pub const SUPPRESSED_OR_SHELVED: u32 = 9215;
+    pub const MAX_TIME_SHELVED: u32 = 9216;
+    pub const SHELVING_STATE: u32 = 9178;
+    pub const SHELVING_STATE_CURRENT_STATE: u32 = 9179;
+    pub const SHELVING_STATE_CURRENT_STATE_ID: u32 = 9180;
+    pub const SHELVING_STATE_LAST_TRANSITION: u32 = 9184;
+    pub const SHELVING_STATE_LAST_TRANSITION_ID: u32 = 9185;
+    pub const SHELVING_STATE_LAST_TRANSITION_TIME: u32 = 9188;
+    pub const SHELVING_STATE_UNSHELVE_TIME: u32 = 9189;
     pub const HIGH_HIGH_LIMIT: u32 = 11124;
     pub const HIGH_LIMIT: u32 = 11125;
     pub const LOW_LIMIT: u32 = 11126;
@@ -337,7 +345,20 @@ pub const EVENT_TYPES: &[EventTypeDef] = &[
             (ACTIVE_STATE_EFFECTIVE_DISPLAY_NAME, "ActiveState/EffectiveDisplayName", 21, -1),
             (ACTIVE_STATE_TRANSITION_TIME, "ActiveState/TransitionTime", crate::types::ids::UTC_TIME, -1),
             (INPUT_NODE, "InputNode", 17, -1),
+            (SHELVING_STATE, "ShelvingState", 0, -1),
+            (SHELVING_STATE_CURRENT_STATE, "ShelvingState/CurrentState", 21, -1),
+            (SHELVING_STATE_CURRENT_STATE_ID, "ShelvingState/CurrentState/Id", 17, -1),
+            (SHELVING_STATE_LAST_TRANSITION, "ShelvingState/LastTransition", 21, -1),
+            (SHELVING_STATE_LAST_TRANSITION_ID, "ShelvingState/LastTransition/Id", 17, -1),
+            (
+                SHELVING_STATE_LAST_TRANSITION_TIME,
+                "ShelvingState/LastTransition/TransitionTime",
+                crate::types::ids::UTC_TIME,
+                -1,
+            ),
+            (SHELVING_STATE_UNSHELVE_TIME, "ShelvingState/UnshelveTime", 290, -1),
             (SUPPRESSED_OR_SHELVED, "SuppressedOrShelved", 1, -1),
+            (MAX_TIME_SHELVED, "MaxTimeShelved", 290, -1),
         ],
     },
     EventTypeDef {

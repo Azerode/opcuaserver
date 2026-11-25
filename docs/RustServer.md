@@ -366,10 +366,30 @@ An item with an `Alarm` gets a condition object `<Name>Alarm`
   (or one event item) only. RefreshStart and RefreshEnd go through whatever
   the where clause is, so a client filtering on its alarm types still sees
   them.
+- **Shelving (Part 9 §5.8.10):** each condition has a ShelvingState object
+  (`ns=<ns>;s=__alarm/<NodeId>/ShelvingState`, ShelvedStateMachineType).
+  TimedShelve (ShelvingTime in ms), OneShotShelve and Unshelve, plus the
+  1.05 TimedShelve2 / OneShotShelve2 / Unshelve2 with a comment, are called
+  on it (or on the condition). A timed shelve ends by itself (checked every
+  second); a one-shot shelve ends when the alarm returns to normal. Errors:
+  `BadConditionAlreadyShelved`, `BadConditionNotShelved`,
+  `BadShelvingTimeOutOfRange` (not positive, or above the item's
+  `MaxTimeShelved`). Events carry ShelvingState/CurrentState (and Id),
+  LastTransition (Id, TransitionTime), UnshelveTime (ms left),
+  SuppressedOrShelved and MaxTimeShelved. A shelved alarm still raises its
+  events: clients hide it on SuppressedOrShelved.
+- **Branches (Part 9 §4.4):** an alarm that becomes active again while its
+  previous occurrence is not yet acknowledged and confirmed keeps that
+  occurrence as a branch (a more severe limit is the same occurrence). The
+  branch is reported at once with its BranchId, keeps its state and its own
+  EventIds: Acknowledge, Confirm and AddComment with a branch's EventId act
+  on it only. Once acknowledged and confirmed it is reported with Retain
+  false and deleted. ConditionRefresh reports retained branches after their
+  condition; disabling a condition drops them; at most 64 per condition.
 - **Reloads:** condition states survive reloads; new limits or severity
   apply at the next evaluation; a removed alarm disappears.
 
-Not yet: branches, shelving, suppression, dialog conditions and the
+Not yet: suppression, dialog conditions and the
 condition's state variables as browsable nodes (their values travel in the
 events).
 
@@ -472,4 +492,4 @@ those elements are compared and reported, through the Variant path) and events w
 [Events](#events)), alarms and conditions (see
 [Alarms and conditions](#alarms-and-conditions)).
 
-Not yet: condition branches and shelving, the deprecated non-AEAD ECC policies.
+Not yet: the deprecated non-AEAD ECC policies.
