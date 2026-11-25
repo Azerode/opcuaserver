@@ -108,8 +108,8 @@ The numbers below were measured by CI on GitHub runners. Run `cargo run --releas
 | Server crypto per Read, Sign | ~290 ns | ~280 ns |
 | Server crypto per Read, SignAndEncrypt | ~410 ns | ~410 ns |
 | Round trip p50, SignAndEncrypt, `--busy-poll` | 8.8 µs | 9.7 µs |
-| Server crypto per Read, ECC_nistP256_AesGcm SignAndEncrypt | ECC_CI_X | ECC_CI_A |
-| Server crypto per Read, ECC_nistP256_ChaChaPoly SignAndEncrypt | CHA_CI_X | CHA_CI_A |
+| Server crypto per Read, ECC_nistP256_AesGcm SignAndEncrypt | ~135 ns | ~200 ns |
+| Server crypto per Read, ECC_nistP256_ChaChaPoly SignAndEncrypt | ~365 ns | ~540 ns |
 | Subscription sampling pass, unchanged value | 0.02 ns/item | 0.02 ns/item |
 | Subscription sampling pass, 1 % of values changed | 1.1 ns/item | 2.7 ns/item |
 | Subscription changed value (sample + queue + encode) | 22 ns/item | 26 ns/item |
