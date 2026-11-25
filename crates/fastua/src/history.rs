@@ -868,6 +868,11 @@ fn user_name(identity: &str) -> Arc<str> {
     identity.strip_prefix("user:").unwrap_or(identity).into()
 }
 
+use crate::events::types::*;
+
+/// (event type, updated node, fields) of an AuditHistoryUpdateEvent.
+type AuditReport = (u32, NodeId, Vec<(u32, Variant)>);
+
 pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
     let s = session(ctx, h, true)?;
     let can_write = s.can_write.load(Ordering::Relaxed);
@@ -878,12 +883,15 @@ pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w
     }
     check_count(ctx, n)?;
     let space = ctx.server.store.cached(ctx.space);
+    let audit = space.events.active();
     let now = now_ticks();
     begin(w, ids::HISTORY_UPDATE_RESPONSE, h);
     w.i32(n as i32);
     for _ in 0..n {
         let (type_id, _enc, body) = r.extension_object_raw().map_err(decode_err)?;
         let mut b = Reader::new(body);
+        // What the AuditHistoryUpdateEvent reports: (event type, node, fields).
+        let mut report: Option<AuditReport> = None;
         let (code, ops) = (|| -> Result<(u32, Vec<u32>), u32> {
             let bad = |_| status::BAD_HISTORY_OPERATION_INVALID;
             match type_id.as_ns0() {
@@ -891,6 +899,13 @@ pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w
                     let id = b.node_id().map_err(bad)?;
                     let mode = b.u32().map_err(bad)?;
                     let values = b.array(1, |r| r.data_value()).map_err(bad)?;
+                    if audit {
+                        let fields = vec![
+                            (HISTORY_VALUE_UPDATED_NODE, Variant::NodeId(Box::new(id.clone()))),
+                            (HISTORY_PERFORM_INSERT_REPLACE, Variant::Int32(mode as i32)),
+                        ];
+                        report = Some((AUDIT_HISTORY_VALUE_UPDATE_EVENT_TYPE, id.clone(), fields));
+                    }
                     let hist = check_update(space, &id, can_write)?;
                     if !(UPDATE_INSERT..=UPDATE_UPDATE).contains(&mode) {
                         return Err(status::BAD_HISTORY_OPERATION_INVALID);
@@ -921,6 +936,15 @@ pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w
                     let modified = b.bool().map_err(bad)?;
                     let start = b.i64().map_err(bad)?;
                     let end = b.i64().map_err(bad)?;
+                    if audit {
+                        let fields = vec![
+                            (HISTORY_DELETE_UPDATED_NODE, Variant::NodeId(Box::new(id.clone()))),
+                            (HISTORY_IS_DELETE_MODIFIED, Variant::Boolean(modified)),
+                            (HISTORY_START_TIME, Variant::DateTime(start)),
+                            (HISTORY_END_TIME, Variant::DateTime(end)),
+                        ];
+                        report = Some((AUDIT_HISTORY_RAW_MODIFY_DELETE_EVENT_TYPE, id.clone(), fields));
+                    }
                     let hist = check_update(space, &id, can_write)?;
                     if start == 0 || end == 0 {
                         return Err(status::BAD_INVALID_TIMESTAMP_ARGUMENT);
@@ -931,6 +955,19 @@ pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w
                 Some(ids::DELETE_AT_TIME_DETAILS_ENCODING) => {
                     let id = b.node_id().map_err(bad)?;
                     let times = b.array(8, |r| r.i64()).map_err(bad)?;
+                    if audit {
+                        let req = times.iter().map(|&t| Variant::DateTime(t)).collect();
+                        let req = Variant::Array(Box::new(VariantArray {
+                            type_id: builtin::DATETIME,
+                            items: req,
+                            dims: None,
+                        }));
+                        let fields = vec![
+                            (HISTORY_DELETE_UPDATED_NODE, Variant::NodeId(Box::new(id.clone()))),
+                            (HISTORY_REQ_TIMES, req),
+                        ];
+                        report = Some((AUDIT_HISTORY_AT_TIME_DELETE_EVENT_TYPE, id.clone(), fields));
+                    }
                     let hist = check_update(space, &id, can_write)?;
                     Ok((status::GOOD, times.into_iter().map(|t| hist.delete_at(t, &user, now)).collect()))
                 }
@@ -941,6 +978,21 @@ pub(crate) fn history_update(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w
             }
         })()
         .unwrap_or_else(|code| (code, Vec::new()));
+        if let Some((ty, node, fields)) = report {
+            let ok = status::is_good(code) && ops.iter().all(|&c| status::is_good(c));
+            let name = space.get(&node).map_or_else(|| node.to_string(), |n| n.browse_name.name.to_string());
+            let message = format!("History update of {name}{}", if ok { "" } else { " failed" });
+            // The DataType of the details: its binary encoding id minus 2
+            // (UpdateDataDetails 680/682, DeleteRawModifiedDetails 686/688, ...).
+            let param = Variant::NodeId(Box::new(NodeId::ns0(type_id.as_ns0().unwrap_or(2) - 2)));
+            ctx.server.audit_event(ty, &s, (node, &name), &message, ok, |mut e| {
+                e = e.with(HISTORY_PARAMETER_DATA_TYPE_ID, param);
+                for (decl, v) in fields {
+                    e = e.with(decl, v);
+                }
+                e
+            });
+        }
         w.u32(code);
         w.i32(ops.len() as i32);
         for c in ops {

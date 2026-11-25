@@ -5,7 +5,7 @@
 use fastua::address_space::ServerInfo;
 use fastua::alarms::codes::*;
 use fastua::alarms::types::*;
-use fastua::client::{Client, MonitorSpec};
+use fastua::client::{Client, FilterOperand, MonitorSpec};
 use fastua::events::types::*;
 use fastua::pki::Pki;
 use fastua::reload::Store;
@@ -131,7 +131,13 @@ fn limit_alarm_acknowledge_and_refresh() {
     assert_eq!(name[0].value, Some(Variant::QualifiedName(Box::new(QualifiedName { ns, name: "TempAlarm".into() }))));
 
     let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
-    let r = c.monitor(sub, &[MonitorSpec::events(SERVER, 1, &FIELDS)]).unwrap();
+    // Everything but the audit events of the writes below: Not(OfType(AuditEventType)).
+    let mut spec = MonitorSpec::events(SERVER, 1, &FIELDS);
+    spec.event_where = vec![
+        (7, vec![FilterOperand::Element(1)]),
+        (14, vec![FilterOperand::Literal(Variant::NodeId(Box::new(NodeId::ns0(AUDIT_EVENT_TYPE))))]),
+    ];
+    let r = c.monitor(sub, &[spec]).unwrap();
     assert_eq!(r[0].0, status::GOOD);
     let item = r[0].1;
 

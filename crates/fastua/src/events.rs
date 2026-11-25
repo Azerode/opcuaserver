@@ -21,6 +21,13 @@ pub mod types {
     pub const AUDIT_SESSION_EVENT_TYPE: u32 = 2069;
     pub const AUDIT_CREATE_SESSION_EVENT_TYPE: u32 = 2071;
     pub const AUDIT_ACTIVATE_SESSION_EVENT_TYPE: u32 = 2075;
+    pub const AUDIT_UPDATE_EVENT_TYPE: u32 = 2099;
+    pub const AUDIT_WRITE_UPDATE_EVENT_TYPE: u32 = 2100;
+    pub const AUDIT_HISTORY_UPDATE_EVENT_TYPE: u32 = 2104;
+    pub const AUDIT_HISTORY_VALUE_UPDATE_EVENT_TYPE: u32 = 3006;
+    pub const AUDIT_HISTORY_DELETE_EVENT_TYPE: u32 = 3012;
+    pub const AUDIT_HISTORY_RAW_MODIFY_DELETE_EVENT_TYPE: u32 = 3014;
+    pub const AUDIT_HISTORY_AT_TIME_DELETE_EVENT_TYPE: u32 = 3019;
     pub const SYSTEM_EVENT_TYPE: u32 = 2130;
     pub const BASE_MODEL_CHANGE_EVENT_TYPE: u32 = 2132;
     pub const EVENT_QUEUE_OVERFLOW_EVENT_TYPE: u32 = 3035;
@@ -44,6 +51,18 @@ pub mod types {
     pub const CLIENT_CERTIFICATE_THUMBPRINT: u32 = 2746;
     pub const REVISED_SESSION_TIMEOUT: u32 = 2074;
     pub const ACTIVATE_SECURE_CHANNEL_ID: u32 = 11485;
+    pub const WRITE_ATTRIBUTE_ID: u32 = 2750;
+    pub const WRITE_INDEX_RANGE: u32 = 2101;
+    pub const WRITE_OLD_VALUE: u32 = 2102;
+    pub const WRITE_NEW_VALUE: u32 = 2103;
+    pub const HISTORY_PARAMETER_DATA_TYPE_ID: u32 = 2751;
+    pub const HISTORY_VALUE_UPDATED_NODE: u32 = 3026;
+    pub const HISTORY_PERFORM_INSERT_REPLACE: u32 = 3031;
+    pub const HISTORY_DELETE_UPDATED_NODE: u32 = 3027;
+    pub const HISTORY_IS_DELETE_MODIFIED: u32 = 3015;
+    pub const HISTORY_START_TIME: u32 = 3016;
+    pub const HISTORY_END_TIME: u32 = 3017;
+    pub const HISTORY_REQ_TIMES: u32 = 3020;
 
     /// Duration data type.
     pub const DURATION: u32 = 290;
@@ -171,6 +190,67 @@ pub const EVENT_TYPES: &[EventTypeDef] = &[
         parent: AUDIT_SESSION_EVENT_TYPE,
         is_abstract: true,
         fields: &[(ACTIVATE_SECURE_CHANNEL_ID, "SecureChannelId", 12, -1)],
+    },
+    EventTypeDef {
+        id: AUDIT_UPDATE_EVENT_TYPE,
+        name: "AuditUpdateEventType",
+        parent: AUDIT_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[],
+    },
+    EventTypeDef {
+        id: AUDIT_WRITE_UPDATE_EVENT_TYPE,
+        name: "AuditWriteUpdateEventType",
+        parent: AUDIT_UPDATE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[
+            (WRITE_ATTRIBUTE_ID, "AttributeId", 7, -1),
+            (WRITE_INDEX_RANGE, "IndexRange", 291, -1),
+            (WRITE_OLD_VALUE, "OldValue", 24, -1),
+            (WRITE_NEW_VALUE, "NewValue", 24, -1),
+        ],
+    },
+    EventTypeDef {
+        id: AUDIT_HISTORY_UPDATE_EVENT_TYPE,
+        name: "AuditHistoryUpdateEventType",
+        parent: AUDIT_UPDATE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[(HISTORY_PARAMETER_DATA_TYPE_ID, "ParameterDataTypeId", 17, -1)],
+    },
+    EventTypeDef {
+        id: AUDIT_HISTORY_VALUE_UPDATE_EVENT_TYPE,
+        name: "AuditHistoryValueUpdateEventType",
+        parent: AUDIT_HISTORY_UPDATE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[
+            (HISTORY_VALUE_UPDATED_NODE, "UpdatedNode", 17, -1),
+            (HISTORY_PERFORM_INSERT_REPLACE, "PerformInsertReplace", 11293, -1),
+        ],
+    },
+    EventTypeDef {
+        id: AUDIT_HISTORY_DELETE_EVENT_TYPE,
+        name: "AuditHistoryDeleteEventType",
+        parent: AUDIT_HISTORY_UPDATE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[(HISTORY_DELETE_UPDATED_NODE, "UpdatedNode", 17, -1)],
+    },
+    EventTypeDef {
+        id: AUDIT_HISTORY_RAW_MODIFY_DELETE_EVENT_TYPE,
+        name: "AuditHistoryRawModifyDeleteEventType",
+        parent: AUDIT_HISTORY_DELETE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[
+            (HISTORY_IS_DELETE_MODIFIED, "IsDeleteModified", 1, -1),
+            (HISTORY_START_TIME, "StartTime", crate::types::ids::UTC_TIME, -1),
+            (HISTORY_END_TIME, "EndTime", crate::types::ids::UTC_TIME, -1),
+        ],
+    },
+    EventTypeDef {
+        id: AUDIT_HISTORY_AT_TIME_DELETE_EVENT_TYPE,
+        name: "AuditHistoryAtTimeDeleteEventType",
+        parent: AUDIT_HISTORY_DELETE_EVENT_TYPE,
+        is_abstract: true,
+        fields: &[(HISTORY_REQ_TIMES, "ReqTimes", crate::types::ids::UTC_TIME, 1)],
     },
     EventTypeDef {
         id: SYSTEM_EVENT_TYPE,

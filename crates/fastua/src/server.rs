@@ -492,26 +492,36 @@ impl Server {
     /// Raises an AuditSessionEventType (or subtype) for `s` when someone
     /// subscribes to events. `extra` adds the subtype's fields.
     pub fn session_event(&self, type_id: u32, s: &Session, action: &str, ok: bool, extra: impl FnOnce(Event) -> Event) {
+        let outcome = if ok { "succeeded" } else { "failed" };
+        let message = format!("{action} of session '{}' {outcome}", s.name);
+        self.audit_event(type_id, s, (NodeId::ns0(ids::SERVER), action), &message, ok, |e| {
+            extra(e.with(crate::events::types::SESSION_ID, Variant::NodeId(Box::new(s.id.clone()))))
+        });
+    }
+
+    /// Raises an AuditEventType (or subtype) on behalf of session `s`, when
+    /// someone subscribes to events. `source` is (SourceNode, SourceName).
+    pub fn audit_event(
+        &self,
+        type_id: u32,
+        s: &Session,
+        source: (NodeId, &str),
+        message: &str,
+        ok: bool,
+        extra: impl FnOnce(Event) -> Event,
+    ) {
         use crate::events::types::*;
         let space = self.store.load();
         if !space.events.active() {
             return;
         }
         let user = s.identity.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let outcome = if ok { "succeeded" } else { "failed" };
-        let ev = Event::new(
-            type_id,
-            NodeId::ns0(ids::SERVER),
-            action,
-            &format!("{action} of session '{}' {outcome}", s.name),
-            if ok { 100 } else { 500 },
-        )
-        .with(ACTION_TIME_STAMP, Variant::DateTime(now_ticks()))
-        .with(STATUS, Variant::Boolean(ok))
-        .with(SERVER_ID, Variant::string(&self.store.info().application_uri))
-        .with(CLIENT_AUDIT_ENTRY_ID, Variant::String(None))
-        .with(CLIENT_USER_ID, Variant::string(&user))
-        .with(SESSION_ID, Variant::NodeId(Box::new(s.id.clone())));
+        let ev = Event::new(type_id, source.0, source.1, message, if ok { 100 } else { 500 })
+            .with(ACTION_TIME_STAMP, Variant::DateTime(now_ticks()))
+            .with(STATUS, Variant::Boolean(ok))
+            .with(SERVER_ID, Variant::string(&self.store.info().application_uri))
+            .with(CLIENT_AUDIT_ENTRY_ID, Variant::String(None))
+            .with(CLIENT_USER_ID, Variant::string(&user));
         space.events.emit(extra(ev));
     }
 

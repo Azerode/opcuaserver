@@ -29,7 +29,7 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
 - **Events:** the Server object is an event notifier.
   - EventFilter select clauses and where clauses (comparisons, Like, Between, InList, And / Or / Not, OfType, bitwise operators), with per clause results.
   - Event queues with both overflow policies and EventQueueOverflow events.
-  - Server events: session audit (create, activate, close, timeout), configuration reloaded (BaseModelChangeEventType) and configuration rejected (SystemEventType).
+  - Server events: session audit (create, activate, close, timeout), write audit (AuditWriteUpdateEventType with old and new values, for every Write operation), history update audit (AuditHistoryValueUpdate / RawModifyDelete / AtTimeDelete), configuration reloaded (BaseModelChangeEventType) and configuration rejected (SystemEventType).
 - **Historical access:** variables marked `Historizing` keep their last values (10 000 by default) in memory.
   - HistoryRead: raw values (with bounds, forward and reverse), modified values, values at given times (interpolated), with continuation points.
   - HistoryUpdate: insert, replace, update, delete a range, delete at times; every change goes to the modified history with its user.

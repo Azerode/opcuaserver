@@ -196,6 +196,14 @@ EventNotifier attribute with an EventFilter receives every server event.
   - Session audit: `Session/CreateSession`, `Session/ActivateSession` (also on
     failure, with `Status = false`), `Session/CloseSession` and
     `Session/Timeout`, with SessionId, ClientUserId and the subtype's fields.
+  - Write audit: one AuditWriteUpdateEventType per Write operation, successful
+    or not (`Status`), with AttributeId, IndexRange, OldValue and NewValue; the
+    source is the written node. Only built while someone subscribes to events:
+    otherwise a Write pays one relaxed atomic load.
+  - History update audit: AuditHistoryValueUpdateEventType (insert / replace /
+    update, PerformInsertReplace), AuditHistoryRawModifyDeleteEventType and
+    AuditHistoryAtTimeDeleteEventType, with UpdatedNode and
+    ParameterDataTypeId. OldValues / NewValues are not filled.
   - Configuration reloaded: BaseModelChangeEventType, severity 100.
   - Configuration rejected: SystemEventType, severity 700, the parse error in
     the Message.

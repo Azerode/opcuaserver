@@ -1133,6 +1133,10 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
     let n = r.length(11).map_err(decode_err)?.unwrap_or(0);
     check_count(ctx, n)?;
     let space = ctx.server.store.cached(ctx.space);
+    // AuditWriteUpdateEvents only while someone subscribes to events: one
+    // relaxed load per request otherwise.
+    let audit = space.events.active();
+    let auditor = if audit { ctx.session.clone() } else { None };
     let now = now_ticks(); // server timestamp of the written values
     begin(w, ids::WRITE_RESPONSE, h);
     w.i32(n as i32);
@@ -1141,6 +1145,7 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
         let attribute = r.u32().map_err(decode_err)?;
         let range = r.str().map_err(decode_err)?;
         let dv = r.data_value().map_err(decode_err)?;
+        let mut old = Variant::Empty;
         let code = (|| {
             let node = space.get(&id).ok_or(status::BAD_NODE_ID_UNKNOWN)?;
             if attribute == 0 || attribute > attr::ACCESS_LEVEL_EX {
@@ -1168,6 +1173,9 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
             if dv.server_timestamp.is_some() {
                 return Err(status::BAD_WRITE_NOT_SUPPORTED);
             }
+            if audit {
+                old = cell.read().value;
+            }
             if let Some(range) = range.filter(|s| !s.is_empty()) {
                 return write_range(cell, range, &dv, now);
             }
@@ -1181,10 +1189,40 @@ fn write(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SR
             cell.write(v, dv.status.unwrap_or(status::GOOD), dv.source_timestamp.unwrap_or(now), now);
             Ok(())
         })();
-        w.u32(code.err().unwrap_or(status::GOOD));
+        let code = code.err().unwrap_or(status::GOOD);
+        if let Some(s) = &auditor {
+            audit_write(ctx.server, s, space, &id, attribute, range, old, dv.value.unwrap_or_default(), code);
+        }
+        w.u32(code);
     }
     w.empty_array();
     Ok(())
+}
+
+/// Raises an AuditWriteUpdateEventType for one write operation (Part 5 §6.4.24).
+#[cold]
+#[allow(clippy::too_many_arguments)]
+fn audit_write(
+    server: &crate::server::Server,
+    s: &crate::server::Session,
+    space: &AddressSpace,
+    id: &NodeId,
+    attribute: u32,
+    range: Option<&str>,
+    old: Variant,
+    new: Variant,
+    code: u32,
+) {
+    use crate::events::types::*;
+    let ok = status::is_good(code);
+    let name = space.get(id).map_or_else(|| id.to_string(), |n| n.browse_name.name.to_string());
+    let message = if ok { format!("Write of {name}") } else { format!("Write of {name} failed (0x{code:08X})") };
+    server.audit_event(AUDIT_WRITE_UPDATE_EVENT_TYPE, s, (id.clone(), &name), &message, ok, |e| {
+        e.with(WRITE_ATTRIBUTE_ID, Variant::UInt32(attribute))
+            .with(WRITE_INDEX_RANGE, range.map_or(Variant::String(None), Variant::string))
+            .with(WRITE_OLD_VALUE, old)
+            .with(WRITE_NEW_VALUE, new)
+    });
 }
 
 // ---------------------------------------------------------------- View
