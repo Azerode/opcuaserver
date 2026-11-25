@@ -5,10 +5,14 @@ pub mod channel;
 pub mod client;
 pub mod codec;
 pub mod config;
+pub mod crypto;
+pub mod net;
+pub mod pki;
 pub mod reload;
 pub mod server;
 pub mod services;
 pub mod types;
+pub mod users;
 pub mod value;
 
 /// Minimal logger: timestamped line on stderr. Never used on the hot path.

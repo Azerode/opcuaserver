@@ -1,16 +1,39 @@
 //! Core OPC UA built-in types (Part 6, §5.1).
 
 use std::fmt;
-use std::hash::{BuildHasherDefault, Hash, Hasher};
+use std::hash::{BuildHasherDefault, Hasher};
 
 /// OPC UA NodeId. Numeric ids are by far the most common, so they are kept
 /// inline (8 bytes payload, no heap) and hashed with a couple of instructions.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum NodeId {
     Numeric(u16, u32),
     String(u16, Box<str>),
     Guid(u16, [u8; 16]),
     Opaque(u16, Box<[u8]>),
+}
+
+impl std::hash::Hash for NodeId {
+    /// A numeric id is hashed as one 64-bit word (a single multiply with
+    /// `FxHasher`) instead of discriminant + namespace + value.
+    #[inline(always)]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            NodeId::Numeric(ns, v) => state.write_u64((*ns as u64) << 32 | *v as u64),
+            NodeId::String(ns, s) => {
+                state.write_u64(1 << 48 | *ns as u64);
+                state.write(s.as_bytes());
+            }
+            NodeId::Guid(ns, g) => {
+                state.write_u64(2 << 48 | *ns as u64);
+                state.write(g);
+            }
+            NodeId::Opaque(ns, b) => {
+                state.write_u64(3 << 48 | *ns as u64);
+                state.write(b);
+            }
+        }
+    }
 }
 
 impl NodeId {
@@ -135,7 +158,7 @@ fn format_guid(g: &[u8; 16]) -> String {
     )
 }
 
-fn decode_base64(text: &str) -> Option<Vec<u8>> {
+pub fn decode_base64(text: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u32> {
         Some(match c {
             b'A'..=b'Z' => (c - b'A') as u32,
@@ -393,10 +416,27 @@ impl DataValue {
 
 /// UTC "now" as OPC UA DateTime (100 ns ticks since 1601-01-01).
 #[inline]
+#[allow(clippy::unnecessary_cast)] // time_t / c_long are not i64 on every target
 pub fn now_ticks() -> i64 {
     const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
-    let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
-    (d.as_secs() as i64 + EPOCH_DIFF_SECS) * 10_000_000 + (d.subsec_nanos() / 100) as i64
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid pointer; CLOCK_REALTIME always exists (vDSO, no syscall).
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut t) };
+    (t.tv_sec as i64 + EPOCH_DIFF_SECS) * 10_000_000 + t.tv_nsec as i64 / 100
+}
+
+/// Like [`now_ticks`] from `CLOCK_REALTIME_COARSE`: the time of the last
+/// kernel tick (1-4 ms resolution), read without the hardware counter. Used
+/// where the resolution is enough (ResponseHeader timestamps): ~4x cheaper on
+/// aarch64, ~6x on x86_64.
+#[inline]
+#[allow(clippy::unnecessary_cast)] // time_t / c_long are not i64 on every target
+pub fn coarse_now_ticks() -> i64 {
+    const EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid pointer; CLOCK_REALTIME_COARSE exists on every Linux.
+    unsafe { libc::clock_gettime(libc::CLOCK_REALTIME_COARSE, &mut t) };
+    (t.tv_sec as i64 + EPOCH_DIFF_SECS) * 10_000_000 + t.tv_nsec as i64 / 100
 }
 
 /// Well-known namespace 0 node ids (subset used by the server).
