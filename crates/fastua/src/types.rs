@@ -452,6 +452,7 @@ pub mod ids {
     pub const SERVER_STATUS_DATA_TYPE: u32 = 862;
     pub const BUILD_INFO: u32 = 338;
     pub const UTC_TIME: u32 = 294;
+    pub const RANGE: u32 = 884;
 
     // Reference types
     pub const REFERENCES: u32 = 31;
@@ -480,6 +481,8 @@ pub mod ids {
     pub const PROPERTY_TYPE: u32 = 68;
     pub const SERVER_TYPE: u32 = 2004;
     pub const SERVER_STATUS_TYPE: u32 = 2138;
+    pub const DATA_ITEM_TYPE: u32 = 2365;
+    pub const ANALOG_ITEM_TYPE: u32 = 2368;
 
     // Folders
     pub const ROOT_FOLDER: u32 = 84;
@@ -505,6 +508,7 @@ pub mod ids {
     // Binary encodings of structures
     pub const SERVER_STATUS_DATA_TYPE_ENCODING: u32 = 864;
     pub const BUILD_INFO_ENCODING: u32 = 340;
+    pub const RANGE_ENCODING: u32 = 886;
     pub const ANONYMOUS_IDENTITY_TOKEN_ENCODING: u32 = 321;
     pub const USERNAME_IDENTITY_TOKEN_ENCODING: u32 = 324;
     pub const X509_IDENTITY_TOKEN_ENCODING: u32 = 327;

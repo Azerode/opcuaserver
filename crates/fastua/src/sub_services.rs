@@ -270,7 +270,13 @@ fn read_parameters(r: &mut Reader) -> DResult<Result<ItemParams, u32>> {
             match deadband_type {
                 0 => {}
                 1 => p.filter.deadband = if deadband == 0.0 { 0.0 } else { deadband },
-                2 => p.percent_deadband = true,
+                2 => {
+                    if !(0.0..=100.0).contains(&deadband) {
+                        return Ok(Err(BAD_DEADBAND_FILTER_INVALID));
+                    }
+                    p.percent_deadband = true;
+                    p.filter.deadband = deadband;
+                }
                 _ => return Ok(Err(BAD_DEADBAND_FILTER_INVALID)),
             }
             if deadband_type == 1 && !(deadband >= 0.0 && deadband.is_finite()) {
@@ -350,6 +356,7 @@ pub(super) fn modify_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
     let n = r.length(24).map_err(decode_err)?.unwrap_or(0);
     check_count(ctx, n)?;
     let l = ctx.server.limits();
+    let space = ctx.server.store.cached(ctx.space);
     let now = mono_ns();
     let mut st = lock(&s);
     let sub = st.find(sub_id).ok_or(BAD_SUBSCRIPTION_ID_INVALID)?;
@@ -358,7 +365,7 @@ pub(super) fn modify_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
     for _ in 0..n {
         let id = r.u32().map_err(decode_err)?;
         let params = read_parameters(r).map_err(decode_err)?;
-        match params.and_then(|p| sub.modify_item(l, id, ts, &p, now)) {
+        match params.and_then(|p| sub.modify_item(l, space, id, ts, &p, now)) {
             Ok((sampling, queue)) => {
                 w.u32(status::GOOD);
                 w.f64(sampling);

@@ -49,6 +49,21 @@ struct RawItem {
     data_type: String,
     #[serde(rename = "Writable", default = "default_true")]
     writable: bool,
+    #[serde(rename = "EURange", default)]
+    eu_range: Option<RawRange>,
+}
+
+/// `{"Low": 0, "High": 100}` or `[0, 100]`.
+#[derive(Deserialize, Debug)]
+#[serde(untagged)]
+enum RawRange {
+    Object {
+        #[serde(rename = "Low", alias = "low")]
+        low: f64,
+        #[serde(rename = "High", alias = "high")]
+        high: f64,
+    },
+    Pair(f64, f64),
 }
 
 fn default_true() -> bool {
@@ -76,6 +91,9 @@ pub struct ItemConfig {
     pub node_id: NodeId,
     pub data_type: u8,
     pub writable: bool,
+    /// EURange (low, high): the variable becomes an AnalogItemType and
+    /// supports percent deadbands.
+    pub eu_range: Option<(f64, f64)>,
 }
 
 /// Maps a type name (`System.Int16`, `Int16`, `int16`, `Single`…) to a built-in type id.
@@ -118,7 +136,19 @@ pub fn parse_file(path: &Path, text: &str) -> Result<NamespaceConfig, String> {
             let data_type = parse_type(&it.data_type).ok_or_else(|| {
                 format!("{}: item '{}': unsupported type '{}'", path.display(), it.name, it.data_type)
             })?;
-            items.push(ItemConfig { name: it.name, node_id, data_type, writable: it.writable });
+            let eu_range = match it.eu_range {
+                None => None,
+                Some(RawRange::Object { low, high } | RawRange::Pair(low, high)) => {
+                    if !(low.is_finite() && high.is_finite() && low <= high) {
+                        return Err(format!("{}: item '{}': invalid EURange [{low}, {high}]", path.display(), it.name));
+                    }
+                    if crate::value::bits_as_f64(data_type, 0).is_none() {
+                        return Err(format!("{}: item '{}': EURange needs a numeric Type", path.display(), it.name));
+                    }
+                    Some((low, high))
+                }
+            };
+            items.push(ItemConfig { name: it.name, node_id, data_type, writable: it.writable, eu_range });
         }
         groups.push(GroupConfig { name: g.name, items });
     }
@@ -179,12 +209,17 @@ mod tests {
             "Subscriptions": [
               { "Name": "FLAGS", "Items": [
                 { "Name": "PC", "NodeId": "ns=5;i=1000", "Type": "System.Int16" },
-                { "Name": "S", "NodeId": "s=Speed", "Type": "Double", "Writable": false } ] } ] }"#;
+                { "Name": "S", "NodeId": "s=Speed", "Type": "Double", "Writable": false,
+                  "EURange": { "Low": -10, "High": 90 } },
+                { "Name": "T", "NodeId": "i=7", "Type": "Float", "EURange": [0, 5] } ] } ] }"#;
         let ns = parse_file(Path::new("m.json"), text).unwrap();
         assert_eq!(ns.uri, "Machine1");
         assert_eq!(ns.groups[0].items[0].node_id, NodeId::Numeric(0, 1000));
         assert_eq!(ns.groups[0].items[0].data_type, builtin::INT16);
         assert!(!ns.groups[0].items[1].writable);
+        assert_eq!(ns.groups[0].items[0].eu_range, None);
+        assert_eq!(ns.groups[0].items[1].eu_range, Some((-10.0, 90.0)));
+        assert_eq!(ns.groups[0].items[2].eu_range, Some((0.0, 5.0)));
     }
 
     #[test]
@@ -194,6 +229,12 @@ mod tests {
         let bad_type =
             r#"{"Namespace":"x","Subscriptions":[{"Name":"g","Items":[{"Name":"a","NodeId":"i=1","Type":"Quux"}]}]}"#;
         assert!(parse_file(Path::new("a"), bad_type).unwrap_err().contains("unsupported type"));
+        let bad_range = r#"{"Namespace":"x","Subscriptions":[{"Name":"g","Items":[
+            {"Name":"a","NodeId":"i=1","Type":"Double","EURange":[5,1]}]}]}"#;
+        assert!(parse_file(Path::new("a"), bad_range).unwrap_err().contains("EURange"));
+        let text_range = r#"{"Namespace":"x","Subscriptions":[{"Name":"g","Items":[
+            {"Name":"a","NodeId":"i=1","Type":"String","EURange":[0,1]}]}]}"#;
+        assert!(parse_file(Path::new("a"), text_range).unwrap_err().contains("numeric"));
     }
 
     #[test]

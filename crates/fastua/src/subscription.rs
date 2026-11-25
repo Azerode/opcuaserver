@@ -234,7 +234,7 @@ pub struct ItemParams {
     pub client_handle: u32,
     pub sampling_ms: f64,
     pub filter: Filter,
-    /// DataChangeFilter with a deadband other than None / Absolute.
+    /// Percent deadband: `filter.deadband` is a percentage of the EURange.
     pub percent_deadband: bool,
     pub filter_present: bool,
     pub queue_size: u32,
@@ -251,6 +251,8 @@ struct Cold {
     last_var: Option<Variant>,
     /// Items triggered by this one (SetTriggering).
     links: Vec<u32>,
+    /// Percent deadband (0 = none), recomputed when the EURange changes.
+    percent: f64,
 }
 
 pub struct Item {
@@ -486,6 +488,11 @@ impl Item {
 }
 
 /// Resolves what an item samples. `Err` is the per-item status code.
+/// Percent deadband (Part 8, §5.3.2.2): a share of the EURange span.
+fn percent_to_absolute(percent: f64, (low, high): (f64, f64)) -> f64 {
+    percent / 100.0 * (high - low)
+}
+
 fn resolve(space: &AddressSpace, node: &NodeId, attribute: u32, can_write: bool) -> Result<(Source, u8, u8), u32> {
     use crate::services::attr;
     let n = space.get(node).ok_or(status::BAD_NODE_ID_UNKNOWN)?;
@@ -688,23 +695,32 @@ impl Subscription {
     }
 
     /// Checks a filter against the item's data; `Err` is the item status.
-    fn check_filter(attribute: u32, kind: u8, src: &Source, p: &ItemParams) -> Result<(), u32> {
+    /// Validates the filter and returns it with the deadband made absolute.
+    fn check_filter(
+        space: &AddressSpace,
+        node: &NodeId,
+        attribute: u32,
+        kind: u8,
+        src: &Source,
+        p: &ItemParams,
+    ) -> Result<Filter, u32> {
         if !p.filter_present {
-            return Ok(());
+            return Ok(p.filter);
         }
         if attribute != crate::services::attr::VALUE {
             return Err(BAD_FILTER_NOT_ALLOWED);
         }
-        if p.percent_deadband {
-            // Percent deadbands need an EURange (AnalogItems), which the
-            // configured variables do not have.
-            return Err(BAD_MONITORED_ITEM_FILTER_UNSUPPORTED);
-        }
         if p.filter.trigger > TRIGGER_STATUS_VALUE_TIMESTAMP {
             return Err(BAD_MONITORED_ITEM_FILTER_INVALID);
         }
-        if p.filter.deadband != 0.0 {
-            if !(p.filter.deadband > 0.0 && p.filter.deadband.is_finite()) {
+        let mut f = p.filter;
+        if p.percent_deadband {
+            // Only AnalogItems (EURange) support percent deadbands.
+            let range = space.get(node).and_then(|n| n.eu_range(space)).ok_or(BAD_FILTER_NOT_ALLOWED)?;
+            f.deadband = percent_to_absolute(p.filter.deadband, range);
+        }
+        if f.deadband != 0.0 {
+            if !(f.deadband > 0.0 && f.deadband.is_finite()) {
                 return Err(BAD_DEADBAND_FILTER_INVALID);
             }
             let numeric = match src {
@@ -716,7 +732,7 @@ impl Subscription {
                 return Err(BAD_FILTER_NOT_ALLOWED);
             }
         }
-        Ok(())
+        Ok(f)
     }
 
     /// CreateMonitoredItems for one item. Returns (id, revised sampling,
@@ -741,7 +757,8 @@ impl Subscription {
             return Err(BAD_TOO_MANY_MONITORED_ITEMS);
         }
         let (source, kind, size) = resolve(space, &node, attribute, can_write)?;
-        Self::check_filter(attribute, kind, &source, p)?;
+        let filter = Self::check_filter(space, &node, attribute, kind, &source, p)?;
+        let percent = if p.percent_deadband { p.filter.deadband } else { 0.0 };
         let (sampling_ms, queue_size) = Self::revise_item(l, self.params.interval_ms, p);
         let id = self.next_item_id;
         self.next_item_id = self.next_item_id.checked_add(1).unwrap_or(1);
@@ -750,7 +767,7 @@ impl Subscription {
             id,
             client_handle: p.client_handle,
             mode,
-            cold: Box::new(Cold { node, attribute, can_write, last_var: None, links: Vec::new() }),
+            cold: Box::new(Cold { node, attribute, can_write, last_var: None, links: Vec::new(), percent }),
             linked: false,
             source,
             kind,
@@ -761,7 +778,7 @@ impl Subscription {
             group,
             queue_size,
             discard_oldest: p.discard_oldest,
-            filter: p.filter,
+            filter,
             sampled: false,
             last_seq: 0,
             last_status: 0,
@@ -795,6 +812,7 @@ impl Subscription {
     pub fn modify_item(
         &mut self,
         l: &Limits,
+        space: &AddressSpace,
         id: u32,
         ts: (bool, bool),
         p: &ItemParams,
@@ -802,7 +820,7 @@ impl Subscription {
     ) -> Result<(f64, u32), u32> {
         let slot = self.slot(id).ok_or(BAD_MONITORED_ITEM_ID_INVALID)?;
         let it = self.items[slot as usize].as_ref().ok_or(BAD_MONITORED_ITEM_ID_INVALID)?;
-        Self::check_filter(it.cold.attribute, it.kind, &it.source, p)?;
+        let filter = Self::check_filter(space, &it.cold.node, it.cold.attribute, it.kind, &it.source, p)?;
         let (sampling_ms, queue_size) = Self::revise_item(l, self.params.interval_ms, p);
         let old_group = it.group;
         let new_group = if it.sampling_ms == sampling_ms { old_group } else { self.group_for(sampling_ms, now) };
@@ -819,7 +837,8 @@ impl Subscription {
         it.client_handle = p.client_handle;
         it.ts_src = ts.0;
         it.ts_srv = ts.1;
-        it.filter = p.filter;
+        it.filter = filter;
+        it.cold.percent = if p.percent_deadband { p.filter.deadband } else { 0.0 };
         it.discard_oldest = p.discard_oldest;
         it.queue_size = queue_size;
         while it.queue.len() > queue_size {
@@ -951,6 +970,11 @@ impl Subscription {
     fn rebind(&mut self, space: &AddressSpace) {
         self.generation = space.generation;
         for it in self.items.iter_mut().flatten() {
+            if it.cold.percent > 0.0 {
+                if let Some(range) = space.get(&it.cold.node).and_then(|n| n.eu_range(space)) {
+                    it.filter.deadband = percent_to_absolute(it.cold.percent, range);
+                }
+            }
             match resolve(space, &it.cold.node, it.cold.attribute, it.cold.can_write) {
                 Ok((src, kind, size)) => {
                     let same = match (&it.source, &src) {
@@ -1408,6 +1432,7 @@ mod tests {
                 can_write: false,
                 last_var: None,
                 links: Vec::new(),
+                percent: 0.0,
             }),
             linked: false,
             source: Source::Gone,

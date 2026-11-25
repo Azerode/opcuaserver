@@ -16,7 +16,8 @@ const MACHINE: &str = r#"{ "Name": "Press", "Namespace": "urn:press",
   "Subscriptions": [ { "Name": "DATA", "Items": [
     { "Name": "Speed", "NodeId": "ns=7;i=1", "Type": "System.Double" },
     { "Name": "Count", "NodeId": "ns=7;i=2", "Type": "System.Int32" },
-    { "Name": "Label", "NodeId": "ns=7;s=Label", "Type": "String" } ] } ] }"#;
+    { "Name": "Label", "NodeId": "ns=7;s=Label", "Type": "String" },
+    { "Name": "Level", "NodeId": "ns=7;i=3", "Type": "Double", "EURange": { "Low": -50, "High": 150 } } ] } ] }"#;
 
 fn start(name: &str) -> (String, PathBuf) {
     let dir = std::env::temp_dir().join(format!("fastua-sub-{name}-{}", std::process::id()));
@@ -44,6 +45,7 @@ fn client(addr: &str) -> Client {
 
 const SPEED: NodeId = NodeId::Numeric(2, 1);
 const COUNT: NodeId = NodeId::Numeric(2, 2);
+const LEVEL: NodeId = NodeId::Numeric(2, 3);
 
 /// Publishes until a message with data (or a status change) arrives.
 fn next_data(c: &mut Client, acks: &[(u32, u32)]) -> Publish {
@@ -175,8 +177,49 @@ fn queue_overflow_and_deadband() {
     neg.filter = Some((1, 1, -1.0));
     let r = c.monitor(sub, &[bad, pct, neg]).unwrap();
     assert_eq!(r[0].0, BAD_FILTER_NOT_ALLOWED);
-    assert_eq!(r[1].0, BAD_MONITORED_ITEM_FILTER_UNSUPPORTED);
+    // Percent deadband without EURange.
+    assert_eq!(r[1].0, BAD_FILTER_NOT_ALLOWED);
     assert_eq!(r[2].0, BAD_DEADBAND_FILTER_INVALID);
+}
+
+#[test]
+fn percent_deadband_uses_eu_range() {
+    let (addr, _dir) = start("percent");
+    let mut c = client(&addr);
+    // The EURange property of the AnalogItem.
+    let range = c.read(&[(NodeId::String(2, "__prop/i=3/EURange".into()), 13)]).unwrap();
+    assert_eq!(range[0].value, Some(fastua::address_space::range_value(-50.0, 150.0)));
+
+    let (sub, ..) = c.create_subscription(10.0, 300, 10).unwrap();
+    let mut pct = MonitorSpec::value(LEVEL, 1);
+    pct.filter = Some((1, 2, 10.0)); // 10 % of 200 = 20
+    pct.sampling_ms = 1.0;
+    let mut over = MonitorSpec::value(LEVEL, 2);
+    over.filter = Some((1, 2, 150.0));
+    let r = c.monitor(sub, &[pct, over]).unwrap();
+    assert_eq!(r[0].0, status::GOOD);
+    assert_eq!(r[1].0, BAD_DEADBAND_FILTER_INVALID);
+    let mut seen = Vec::new();
+    let mut acks = Vec::new();
+    for v in [5.0, 15.0, 30.0, 45.0, 51.0] {
+        c.write(&[(LEVEL, Variant::Double(v))]).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        loop {
+            let p = c.publish(&acks).unwrap();
+            acks.clear();
+            if p.message.is_keep_alive() {
+                break;
+            }
+            acks.push((p.subscription, p.message.seq));
+            seen.extend(p.message.data.iter().filter_map(|(_, d)| d.value.clone()));
+            if !p.more {
+                break;
+            }
+        }
+    }
+    // 5 replaces the initial value (queue of 1), then only |delta| > 20.
+    let want: Vec<Variant> = [5.0, 30.0, 51.0].into_iter().map(Variant::Double).collect();
+    assert_eq!(seen, want);
 }
 
 #[test]

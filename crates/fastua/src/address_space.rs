@@ -73,6 +73,30 @@ impl Node {
         }
     }
 
+    /// Target of the forward HasProperty reference named `name`.
+    pub fn property<'a>(&self, space: &'a AddressSpace, name: &str) -> Option<&'a Node> {
+        self.refs
+            .iter()
+            .filter(|r| r.forward && r.type_id == ids::HAS_PROPERTY)
+            .map(|r| space.node(r.target))
+            .find(|n| n.browse_name.ns == 0 && &*n.browse_name.name == name)
+    }
+
+    /// EURange (low, high) of an AnalogItem.
+    pub fn eu_range(&self, space: &AddressSpace) -> Option<(f64, f64)> {
+        let NodeKind::Variable { value: ValueSource::Static(Variant::ExtensionObject(x)), .. } =
+            &self.property(space, "EURange")?.kind
+        else {
+            return None;
+        };
+        if x.type_id != NodeId::ns0(ids::RANGE_ENCODING) || x.encoding != 1 || x.body.len() != 16 {
+            return None;
+        }
+        let low = f64::from_le_bytes(x.body[..8].try_into().unwrap());
+        let high = f64::from_le_bytes(x.body[8..].try_into().unwrap());
+        Some((low, high))
+    }
+
     /// Target of the HasTypeDefinition reference, if any.
     pub fn type_definition(&self) -> Option<u32> {
         self.refs.iter().find(|r| r.forward && r.type_id == ids::HAS_TYPE_DEFINITION).map(|r| r.target)
@@ -352,6 +376,7 @@ const DATA_TYPES: &[(u32, &str, u32, bool)] = &[
     (ids::SERVER_STATE, "ServerState", ids::ENUMERATION, false),
     (ids::BUILD_INFO, "BuildInfo", ids::STRUCTURE, false),
     (ids::SERVER_STATUS_DATA_TYPE, "ServerStatusDataType", ids::STRUCTURE, false),
+    (ids::RANGE, "Range", ids::STRUCTURE, false),
 ];
 
 const REF_TYPES: &[(u32, &str, Option<&str>, bool, bool)] = &[
@@ -390,6 +415,8 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     b.ns0(ids::BASE_DATA_VARIABLE_TYPE, "BaseDataVariableType", vt(ids::BASE_DATA_TYPE, -2, false));
     b.ns0(ids::PROPERTY_TYPE, "PropertyType", vt(ids::BASE_DATA_TYPE, -2, false));
     b.ns0(ids::SERVER_STATUS_TYPE, "ServerStatusType", vt(ids::SERVER_STATUS_DATA_TYPE, -1, false));
+    b.ns0(ids::DATA_ITEM_TYPE, "DataItemType", vt(ids::BASE_DATA_TYPE, -2, false));
+    b.ns0(ids::ANALOG_ITEM_TYPE, "AnalogItemType", vt(ids::NUMBER, -2, false));
 
     let root = b.idx(ids::ROOT_FOLDER);
     let ft = b.idx(ids::FOLDER_TYPE);
@@ -414,6 +441,8 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     b.subtype(ids::BASE_VARIABLE_TYPE, ids::BASE_DATA_VARIABLE_TYPE);
     b.subtype(ids::BASE_VARIABLE_TYPE, ids::PROPERTY_TYPE);
     b.subtype(ids::BASE_DATA_VARIABLE_TYPE, ids::SERVER_STATUS_TYPE);
+    b.subtype(ids::BASE_DATA_VARIABLE_TYPE, ids::DATA_ITEM_TYPE);
+    b.subtype(ids::DATA_ITEM_TYPE, ids::ANALOG_ITEM_TYPE);
 
     // Data types
     for &(id, name, parent, abs) in DATA_TYPES {
@@ -500,6 +529,18 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
     );
 }
 
+/// A `Range` structure value.
+pub fn range_value(low: f64, high: f64) -> Variant {
+    let mut body = [0u8; 16];
+    body[..8].copy_from_slice(&low.to_le_bytes());
+    body[8..].copy_from_slice(&high.to_le_bytes());
+    Variant::ExtensionObject(Box::new(ExtensionObject {
+        type_id: NodeId::ns0(ids::RANGE_ENCODING),
+        encoding: 1,
+        body: body.into(),
+    }))
+}
+
 /// Builds a new snapshot. Cells of variables that still exist with the same
 /// data type are taken over from `previous`, so values survive reloads.
 pub fn build(
@@ -516,8 +557,17 @@ pub fn build(
     }
     let namespaces = registry.uris().to_vec();
 
-    let capacity =
-        128 + configs.iter().map(|c| 1 + c.groups.iter().map(|g| 1 + g.items.len()).sum::<usize>()).sum::<usize>();
+    let capacity = 128
+        + configs
+            .iter()
+            .map(|c| {
+                1 + c
+                    .groups
+                    .iter()
+                    .map(|g| 1 + g.items.iter().map(|i| 1 + i.eu_range.is_some() as usize).sum::<usize>())
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
     let mut b = Builder {
         nodes: Vec::with_capacity(capacity),
         index: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
@@ -527,6 +577,8 @@ pub fn build(
     let objects = b.idx(ids::OBJECTS_FOLDER);
     let folder_type = b.idx(ids::FOLDER_TYPE);
     let bdv_type = b.idx(ids::BASE_DATA_VARIABLE_TYPE);
+    let analog_type = b.idx(ids::ANALOG_ITEM_TYPE);
+    let property_type = b.idx(ids::PROPERTY_TYPE);
     let created = now_ticks();
 
     for (c, &ns) in configs.iter().zip(&assigned) {
@@ -573,7 +625,28 @@ pub fn build(
                     })
                     .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
                 b.link(group, ids::HAS_COMPONENT, var);
-                b.link(var, ids::HAS_TYPE_DEFINITION, bdv_type);
+                let Some((low, high)) = it.eu_range else {
+                    b.link(var, ids::HAS_TYPE_DEFINITION, bdv_type);
+                    continue;
+                };
+                b.link(var, ids::HAS_TYPE_DEFINITION, analog_type);
+                let prop = b
+                    .add(Node {
+                        id: NodeId::String(ns, format!("__prop/{}/EURange", it.node_id).into()),
+                        browse_name: QualifiedName { ns: 0, name: "EURange".into() },
+                        display_name: LocalizedText::new("EURange"),
+                        description: None,
+                        refs: Vec::with_capacity(2),
+                        kind: NodeKind::Variable {
+                            data_type: NodeId::ns0(ids::RANGE),
+                            value_rank: -1,
+                            access: ACCESS_READ,
+                            value: ValueSource::Static(range_value(low, high)),
+                        },
+                    })
+                    .map_err(|e| format!("{}: item '{}': {e}", c.source.display(), it.name))?;
+                b.link(var, ids::HAS_PROPERTY, prop);
+                b.link(prop, ids::HAS_TYPE_DEFINITION, property_type);
             }
         }
     }
@@ -659,6 +732,7 @@ mod tests {
                         node_id: NodeId::Numeric(0, *i),
                         data_type: *t,
                         writable: true,
+                        eu_range: None,
                     })
                     .collect(),
             }],
