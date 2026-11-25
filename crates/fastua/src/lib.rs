@@ -1,6 +1,7 @@
 //! fastua: an ultra-light, ultra-fast OPC UA server.
 
 pub mod address_space;
+pub mod aggregates;
 pub mod channel;
 pub mod client;
 pub mod codec;

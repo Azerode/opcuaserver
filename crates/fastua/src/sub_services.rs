@@ -243,11 +243,25 @@ pub(super) fn republish(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mu
 
 // ---------------------------------------------------------------- MonitoredItem set
 
-/// A parsed EventFilter and its per clause results.
-type Events = Option<(EventFilter, FilterResult)>;
+/// Filters other than DataChangeFilter.
+enum Special {
+    None,
+    /// A parsed EventFilter and its per clause results.
+    Events(EventFilter, FilterResult),
+    Aggregate(crate::subscription::AggSpec),
+}
+
+/// AggregateFilterResult.
+fn write_aggregate_result(w: &mut Writer, (start, interval, config): crate::subscription::AggRevised) {
+    let at = w.begin_extension_object(ids::AGGREGATE_FILTER_RESULT_ENCODING);
+    w.i64(start);
+    w.f64(interval);
+    config.encode(w);
+    w.end_extension_object(at);
+}
 
 /// MonitoringParameters; `Err` is a per-item status for an unusable filter.
-fn read_parameters(r: &mut Reader) -> DResult<Result<(ItemParams, Events), u32>> {
+fn read_parameters(r: &mut Reader) -> DResult<Result<(ItemParams, Special), u32>> {
     let client_handle = r.u32()?;
     let sampling_ms = r.f64()?;
     let (type_id, enc, body) = r.extension_object_raw()?;
@@ -292,12 +306,25 @@ fn read_parameters(r: &mut Reader) -> DResult<Result<(ItemParams, Events), u32>>
                 return Ok(Err(BAD_EVENT_FILTER_INVALID));
             };
             p.filter_present = true;
-            return Ok(Ok((p, Some(ef))));
+            return Ok(Ok((p, Special::Events(ef.0, ef.1))));
         }
-        Some(ids::AGGREGATE_FILTER_ENCODING) => return Ok(Err(BAD_MONITORED_ITEM_FILTER_UNSUPPORTED)),
+        Some(ids::AGGREGATE_FILTER_ENCODING) if enc == 1 => {
+            let mut b = Reader::new(body);
+            let spec = (|| {
+                Ok::<_, crate::codec::DecodeError>(crate::subscription::AggSpec {
+                    start: b.i64()?,
+                    aggregate: b.node_id()?.as_ns0().unwrap_or(0),
+                    interval_ms: b.f64()?,
+                    config: crate::aggregates::Config::decode(&mut b)?,
+                })
+            })();
+            let Ok(spec) = spec else { return Ok(Err(BAD_MONITORED_ITEM_FILTER_INVALID)) };
+            p.filter_present = true;
+            return Ok(Ok((p, Special::Aggregate(spec))));
+        }
         _ => return Ok(Err(BAD_MONITORED_ITEM_FILTER_INVALID)),
     }
-    Ok(Ok((p, None)))
+    Ok(Ok((p, Special::None)))
 }
 
 pub(super) fn create_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
@@ -323,8 +350,15 @@ pub(super) fn create_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
         let mode = r.u32().map_err(decode_err)?;
         let params = read_parameters(r).map_err(decode_err)?;
         let mut filter_result = None;
-        let result = params.and_then(|(p, events)| {
-            if let Some((filter, fr)) = events {
+        let mut agg_result = None;
+        let result = params.and_then(|(p, special)| {
+            if let Special::Aggregate(spec) = special {
+                let (r, revised) =
+                    sub.create_aggregate_item(l, space, node, attribute, mode, ts, &p, &spec, can_write, now)?;
+                agg_result = Some(revised);
+                return Ok(r);
+            }
+            if let Special::Events(filter, fr) = special {
                 if attribute != attr::EVENT_NOTIFIER {
                     return Err(BAD_FILTER_NOT_ALLOWED);
                 }
@@ -365,9 +399,10 @@ pub(super) fn create_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
                 w.u32(0);
             }
         }
-        match filter_result {
-            Some(fr) => fr.write(w),
-            None => w.null_extension_object(),
+        match (filter_result, agg_result) {
+            (Some(fr), _) => fr.write(w),
+            (None, Some(a)) => write_aggregate_result(w, a),
+            (None, None) => w.null_extension_object(),
         }
     }
     w.empty_array(); // diagnosticInfos
@@ -393,10 +428,17 @@ pub(super) fn modify_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
         let id = r.u32().map_err(decode_err)?;
         let params = read_parameters(r).map_err(decode_err)?;
         let mut filter_result = None;
-        let result = params.and_then(|(p, events)| {
+        let mut agg_result = None;
+        let result = params.and_then(|(p, special)| {
+            if sub.is_aggregate_item(id) {
+                let Special::Aggregate(spec) = special else { return Err(BAD_FILTER_NOT_ALLOWED) };
+                let (r, revised) = sub.modify_aggregate_item(l, space, id, ts, &p, &spec, now)?;
+                agg_result = Some(revised);
+                return Ok(r);
+            }
             if sub.is_event_item(id) {
-                let filter = match events {
-                    Some((f, fr)) => {
+                let filter = match special {
+                    Special::Events(f, fr) => {
                         let good = fr.is_good() && f.select_len() > 0;
                         filter_result = Some(fr);
                         if !good {
@@ -404,11 +446,12 @@ pub(super) fn modify_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
                         }
                         Some(f)
                     }
-                    None => None,
+                    Special::None => None,
+                    Special::Aggregate(_) => return Err(BAD_FILTER_NOT_ALLOWED),
                 };
                 return sub.modify_event_item(l, id, &p, filter).map(|q| (0.0, q));
             }
-            if events.is_some() {
+            if !matches!(special, Special::None) {
                 return Err(BAD_FILTER_NOT_ALLOWED);
             }
             sub.modify_item(l, space, id, ts, &p, now)
@@ -425,9 +468,10 @@ pub(super) fn modify_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
                 w.u32(0);
             }
         }
-        match filter_result {
-            Some(fr) => fr.write(w),
-            None => w.null_extension_object(),
+        match (filter_result, agg_result) {
+            (Some(fr), _) => fr.write(w),
+            (None, Some(a)) => write_aggregate_result(w, a),
+            (None, None) => w.null_extension_object(),
         }
     }
     w.empty_array();

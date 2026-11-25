@@ -489,6 +489,7 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
         (ids::SERVER_REDUNDANCY_TYPE, "ServerRedundancyType"),
         (ids::OPERATION_LIMITS_TYPE, "OperationLimitsType"),
         (ids::HISTORY_SERVER_CAPABILITIES_TYPE, "HistoryServerCapabilitiesType"),
+        (crate::aggregates::AGGREGATE_FUNCTION_TYPE, "AggregateFunctionType"),
     ] {
         b.ns0(id, name, NodeKind::ObjectType { is_abstract: false });
     }
@@ -517,6 +518,7 @@ fn build_ns0(b: &mut Builder, namespaces: &[Arc<str>], info: &ServerInfo) {
         ids::SERVER_REDUNDANCY_TYPE,
         ids::OPERATION_LIMITS_TYPE,
         ids::HISTORY_SERVER_CAPABILITIES_TYPE,
+        crate::aggregates::AGGREGATE_FUNCTION_TYPE,
     ] {
         b.subtype(ids::BASE_OBJECT_TYPE, t);
     }
@@ -752,6 +754,16 @@ fn build_server_details(b: &mut Builder, info: &ServerInfo) {
     for rule in [ids::MODELLING_RULE_MANDATORY, ids::MODELLING_RULE_OPTIONAL] {
         let (f, r) = (b.idx(2996), b.idx(rule));
         b.link(f, ids::ORGANIZES, r);
+    }
+    // The aggregates, listed in both AggregateFunctions folders.
+    let fn_type = b.idx(crate::aggregates::AGGREGATE_FUNCTION_TYPE);
+    let folders = [b.idx(2997), b.idx(ids::HISTORY_AGGREGATE_FUNCTIONS)];
+    for &(id, name) in crate::aggregates::FUNCTIONS {
+        let n = b.ns0(id, name, NodeKind::Object { event_notifier: 0 });
+        b.link(n, ids::HAS_TYPE_DEFINITION, fn_type);
+        for f in folders {
+            b.link(f, ids::ORGANIZES, n);
+        }
     }
 
     let diag = 2274;

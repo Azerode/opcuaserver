@@ -467,12 +467,8 @@ pub(crate) const CP_PROCESSED: u8 = 4;
 /// What a HistoryRead asks for.
 enum Details {
     Raw(RawQuery),
-    AtTime {
-        times: Vec<i64>,
-        stepped: bool,
-    },
-    #[allow(dead_code)]
-    Processed(crate::history::ProcessedQuery),
+    AtTime { times: Vec<i64>, stepped: bool },
+    Processed(ProcessedQuery),
 }
 
 /// ReadProcessedDetails (aggregates).
@@ -482,6 +478,7 @@ pub struct ProcessedQuery {
     pub end: i64,
     pub interval_ms: f64,
     pub aggregates: Vec<NodeId>,
+    pub config: crate::aggregates::Config,
 }
 
 fn parse_details(type_id: &NodeId, body: &[u8]) -> Result<Details, u32> {
@@ -506,18 +503,28 @@ fn parse_details(type_id: &NodeId, body: &[u8]) -> Result<Details, u32> {
                 let end = r.i64()?;
                 let interval_ms = r.f64()?;
                 let aggregates = r.array(2, |r| r.node_id())?;
-                Details::Processed(ProcessedQuery { start, end, interval_ms, aggregates })
+                let config = crate::aggregates::Config::decode(r)?;
+                Details::Processed(ProcessedQuery { start, end, interval_ms, aggregates, config })
             }
             _ => return Err(crate::codec::DecodeError),
         })
     };
     match type_id.as_ns0() {
-        Some(ids::READ_RAW_MODIFIED_DETAILS_ENCODING | ids::READ_AT_TIME_DETAILS_ENCODING) => {
-            parse(&mut r).map_err(|_| status::BAD_HISTORY_OPERATION_INVALID)
+        Some(
+            ids::READ_RAW_MODIFIED_DETAILS_ENCODING
+            | ids::READ_AT_TIME_DETAILS_ENCODING
+            | ids::READ_PROCESSED_DETAILS_ENCODING,
+        ) => {
+            let mut d = parse(&mut r).map_err(|_| status::BAD_HISTORY_OPERATION_INVALID)?;
+            if let Details::Processed(q) = &mut d {
+                q.config = q.config.revise()?;
+                if q.start == 0 || q.end == 0 || q.start == q.end || q.interval_ms.is_nan() || q.interval_ms < 0.0 {
+                    return Err(status::BAD_INVALID_TIMESTAMP_ARGUMENT);
+                }
+            }
+            Ok(d)
         }
-        Some(ids::READ_PROCESSED_DETAILS_ENCODING | ids::READ_EVENT_DETAILS_ENCODING) => {
-            Err(status::BAD_HISTORY_OPERATION_UNSUPPORTED)
-        }
+        Some(ids::READ_EVENT_DETAILS_ENCODING) => Err(status::BAD_HISTORY_OPERATION_UNSUPPORTED),
         _ => Err(status::BAD_HISTORY_OPERATION_INVALID),
     }
 }
@@ -588,13 +595,18 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
     }
     check_count(ctx, n)?;
     let details = parse_details(&type_id, body)?;
+    if let Details::Processed(q) = &details {
+        if q.aggregates.len() != n {
+            return Err(status::BAD_AGGREGATE_LIST_MISMATCH);
+        }
+    }
     let _ = &s;
     let space = ctx.server.store.cached(ctx.space);
     begin(w, ids::HISTORY_READ_RESPONSE, h);
     w.i32(n as i32);
     let (mut body_buf, mut mods_buf) = (Vec::new(), Vec::new());
     let (body, mods) = (&mut body_buf, &mut mods_buf);
-    for _ in 0..n {
+    for node_index in 0..n {
         let id = r.node_id().map_err(decode_err)?;
         let range = r.str().map_err(decode_err)?;
         let (_, enc_name) = r.qualified_name_ref().map_err(decode_err)?;
@@ -670,7 +682,33 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
                     }
                     Ok((status::GOOD, more, Some(ids::HISTORY_DATA_ENCODING)))
                 }
-                Details::Processed(_) => Err(status::BAD_HISTORY_OPERATION_UNSUPPORTED),
+                Details::Processed(q) => {
+                    use crate::aggregates as agg;
+                    let a = agg::supported(&q.aggregates[node_index]).ok_or(status::BAD_AGGREGATE_NOT_SUPPORTED)?;
+                    if !agg::accepts(a, hist.kind()) {
+                        return Err(status::BAD_AGGREGATE_INVALID_INPUTS);
+                    }
+                    let total = agg::interval_count(q.start, q.end, q.interval_ms);
+                    let from = resume.map_or(0, |r| r.skip as usize).min(total);
+                    let to = (from + MAX_RETURN_VALUES).min(total);
+                    let (before, values, after) = hist.window(q.start.min(q.end), q.start.max(q.end));
+                    body.clear();
+                    let mut wb = Writer::new(body);
+                    wb.i32((to - from) as i32);
+                    for (s, e, partial, t) in agg::intervals(q.start, q.end, q.interval_ms).skip(from).take(to - from) {
+                        let a_ = values.partition_point(|x| x.source_ts < s);
+                        let b_ = values.partition_point(|x| x.source_ts < e);
+                        let window = agg::Window {
+                            before: if a_ > 0 { values.get(a_ - 1) } else { before.as_ref() },
+                            values: &values[a_..b_],
+                            after: values.get(b_).or(after.as_ref()),
+                        };
+                        let out = agg::compute(a, hist.kind(), false, &q.config, s, e, partial, t, &window);
+                        write_sample(&mut wb, &out, ts, range);
+                    }
+                    let more = (to < total).then(|| cp_encode(&id, kind, Resume { ts: 0, skip: to as u32 }));
+                    Ok((status::GOOD, more, Some(ids::HISTORY_DATA_ENCODING)))
+                }
             }
         })();
         match result {

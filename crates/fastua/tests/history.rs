@@ -253,3 +253,110 @@ fn update_delete_paging_and_at_time() {
         .unwrap();
     assert_eq!(times(&r[0].values), (1..5).map(|i| T0 + i * S).collect::<Vec<_>>());
 }
+
+fn processed(start: i64, end: i64, interval_ms: f64, aggs: &[u32]) -> Vec<u8> {
+    encode(|w| {
+        w.i64(start);
+        w.i64(end);
+        w.f64(interval_ms);
+        w.i32(aggs.len() as i32);
+        for &a in aggs {
+            w.node_id(&NodeId::ns0(a));
+        }
+        // AggregateConfiguration: server defaults.
+        w.bool(true);
+        w.bool(true);
+        w.u8(100);
+        w.u8(100);
+        w.bool(false);
+    })
+}
+
+#[test]
+fn processed_history_and_aggregate_functions() {
+    let (addr, _dir) = start("processed");
+    let mut c = client(&addr);
+    let pts: Vec<(i64, f64)> = (0..10).map(|i| (T0 + i * S, i as f64)).collect();
+    c.history_update(&[update(&TEMP, UPDATE_INSERT, &pts)]).unwrap().unwrap();
+    let mode = NodeId::String(2, "Mode".into());
+    c.write(&[(mode.clone(), Variant::string("auto"))]).unwrap();
+
+    let read = |c: &mut Client, aggs: &[u32], nodes: &[NodeId]| {
+        let nodes: Vec<_> = nodes.iter().map(|n| (n.clone(), None)).collect();
+        c.history_read(
+            ids::READ_PROCESSED_DETAILS_ENCODING,
+            &processed(T0, T0 + 10 * S, 5000.0, aggs),
+            0,
+            false,
+            &nodes,
+        )
+        .unwrap()
+    };
+    // Average (2342), Count (2352), Maximum (2347) per 5 s interval.
+    let r = read(&mut c, &[2342, 2352, 2347], &[TEMP, TEMP, TEMP]).unwrap();
+    let values = |i: usize| r[i].values.iter().map(|d| d.value.clone().unwrap()).collect::<Vec<_>>();
+    assert_eq!(values(0), vec![Variant::Double(2.0), Variant::Double(7.0)]);
+    assert_eq!(values(1), vec![Variant::Int32(5), Variant::Int32(5)]);
+    assert_eq!(values(2), vec![Variant::Double(4.0), Variant::Double(9.0)]);
+    assert_eq!(times(&r[0].values), vec![T0, T0 + 5 * S]);
+    assert_eq!(r[0].values[0].status, Some(fastua::history::CALCULATED));
+
+    // Errors.
+    assert_eq!(read(&mut c, &[2342], &[TEMP, TEMP]), Err(status::BAD_AGGREGATE_LIST_MISMATCH));
+    let r = read(&mut c, &[9999, 2342, 2352], &[TEMP, mode.clone(), mode.clone()]).unwrap();
+    assert_eq!(r[0].status, status::BAD_AGGREGATE_NOT_SUPPORTED);
+    assert_eq!(r[1].status, status::BAD_AGGREGATE_INVALID_INPUTS);
+    assert_eq!(r[2].status, status::GOOD);
+
+    // The functions are listed under ServerCapabilities.AggregateFunctions.
+    let (_, _, targets) = c.browse(&NodeId::ns0(2997), 0).unwrap();
+    assert!(targets.contains(&NodeId::ns0(2342)) && targets.len() >= 30, "{targets:?}");
+    let (_, _, targets) = c.browse(&NodeId::ns0(ids::HISTORY_AGGREGATE_FUNCTIONS), 0).unwrap();
+    assert!(targets.contains(&NodeId::ns0(2343)));
+}
+
+#[test]
+fn aggregate_filter_on_monitored_items() {
+    use fastua::client::MonitorSpec;
+    let (addr, _dir) = start("aggfilter");
+    let mut c = client(&addr);
+    let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
+    let agg = |node: NodeId, handle: u32, f: u32| MonitorSpec {
+        aggregate: Some((0, f, 200.0)),
+        queue_size: 10,
+        ..MonitorSpec::value(node, handle)
+    };
+    let r = c.monitor(sub, &[agg(TEMP, 1, 2342), agg(PLAIN, 2, 2342), agg(TEMP, 3, 9999), agg(TEMP, 4, 2352)]).unwrap();
+    let codes: Vec<u32> = r.iter().map(|x| x.0).collect();
+    assert_eq!(
+        codes,
+        vec![status::GOOD, 0x8044_0000, status::BAD_AGGREGATE_NOT_SUPPORTED, status::GOOD],
+        "{codes:08X?}"
+    );
+    assert!(r[0].2 <= 20.0 + 1e-9, "sampling {}", r[0].2);
+    // Write during a few intervals; collect the averages and counts.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    let (mut avgs, mut counts) = (Vec::new(), Vec::new());
+    let mut acks = Vec::new();
+    let mut x = 0.0;
+    while std::time::Instant::now() < deadline {
+        x += 1.0;
+        c.write(&[(TEMP, Variant::Double(x))]).unwrap();
+        let p = c.publish(&acks).unwrap();
+        acks = vec![(sub, p.message.seq)];
+        for (h, dv) in &p.message.data {
+            match h {
+                1 => avgs.push(dv.clone()),
+                4 => counts.push(dv.clone()),
+                _ => {}
+            }
+        }
+    }
+    assert!(avgs.len() >= 3, "{avgs:?}");
+    // Intervals follow each other 200 ms apart, values are Calculated.
+    let ts: Vec<i64> = avgs.iter().map(|d| d.source_timestamp.unwrap()).collect();
+    assert!(ts.windows(2).all(|w| w[1] - w[0] == 2_000_000), "{ts:?}");
+    let good: Vec<_> = avgs.iter().filter(|d| d.status == Some(fastua::history::CALCULATED)).collect();
+    assert!(good.len() >= 2, "{avgs:?}");
+    assert!(counts.iter().any(|d| matches!(d.value, Some(Variant::Int32(n)) if n > 0)), "{counts:?}");
+}

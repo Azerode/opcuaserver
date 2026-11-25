@@ -31,9 +31,12 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
   - HistoryRead: raw values (with bounds, forward and reverse), modified values, values at given times (interpolated), with continuation points.
   - HistoryUpdate: insert, replace, update, delete a range, delete at times; every change goes to the modified history with its user.
   - HistoryServerCapabilities describes what is supported.
+- **Aggregates:** 37 aggregate functions of Part 13 (averages, time averages, totals, minimum / maximum and their variants, range, count, start / end and bounds, durations in state, transitions, quality durations and percentages, worst quality, standard deviation and variance).
+  - HistoryRead with ReadProcessedDetails, any processing interval, forward or reverse, with an AggregateConfiguration.
+  - AggregateFilter on MonitoredItems of historized variables: one value per processing interval.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: the full namespace 0 nodeset, conditions and alarms, event history, history persistence across restarts, aggregates, ECC policies, the HTTPS transport (`opc.https`).
+Not yet: the full namespace 0 nodeset, conditions and alarms, event history, history persistence across restarts, ECC policies, the HTTPS transport (`opc.https`).
 
 ## Build and run
 

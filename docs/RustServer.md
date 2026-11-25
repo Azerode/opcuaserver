@@ -209,13 +209,57 @@ HistoryRead (and, when writable, HistoryWrite) AccessLevel bits.
   (MaxHistoryContinuationPoints is 0, no limit). A read returns at most
   10 000 values per node (MaxReturnDataValues).
 - **Not yet:** event history (ReadEventDetails returns
-  `BadHistoryOperationUnsupported`), ReadProcessedDetails (aggregates),
-  annotations.
+  `BadHistoryOperationUnsupported`) and annotations.
 - **Cost:** a write of a variable without history checks one flag stored in
   the padding of the cell's first cache line (no measurable change). A
   historized write adds a short uncontended mutex and a push into the ring,
   about 25 ns. HistoryRead encodes each DataValue straight from the ring under
   the lock (about 13 ns per value).
+
+## Aggregates
+
+The functions are Objects of AggregateFunctionType under
+`ServerCapabilities/AggregateFunctions` and
+`HistoryServerCapabilities/AggregateFunctions`.
+
+- **Functions:** Interpolative, Average, TimeAverage, TimeAverage2, Total,
+  Total2, Minimum, Maximum, MinimumActualTime, MaximumActualTime, Range,
+  Minimum2, Maximum2, MinimumActualTime2, MaximumActualTime2, Range2,
+  AnnotationCount, Count, DurationInStateZero, DurationInStateNonZero,
+  NumberOfTransitions, Start, End, Delta, StartBound, EndBound, DeltaBounds,
+  DurationGood, DurationBad, PercentGood, PercentBad, WorstQuality,
+  WorstQuality2, StandardDeviationSample, StandardDeviationPopulation,
+  VarianceSample and VariancePopulation.
+- **Intervals:** `[start, start + interval)`, the last one shorter (Partial
+  bit) when the range is not a multiple of the interval. A processing
+  interval of 0 gives one interval for the whole range. When EndTime is
+  before StartTime, intervals go back in time from StartTime.
+- **Bounds and interpolation:** each interval sees its raw values and the raw
+  values just before and after it. Values at the interval ends are
+  interpolated (sloped for numbers, stepped for Boolean and text), and
+  extrapolated as Uncertain after the last value
+  (`UseSlopedExtrapolation` picks sloped extrapolation).
+- **Quality:** `TreatUncertainAsBad`, `PercentDataGood` and `PercentDataBad`
+  (by count for the counting aggregates, by duration for the time-weighted
+  ones) decide between Good, Uncertain (`UncertainDataSubNormal`) and Bad.
+  An interval without data gives `BadNoData`. Results carry the Calculated
+  or Interpolated historian bit, MultiValue when a minimum or maximum occurs
+  several times. The server default configuration is TreatUncertainAsBad,
+  100 % / 100 %, stepped extrapolation; a configuration with
+  `PercentDataGood + PercentDataBad < 100` is rejected
+  (`BadAggregateConfigurationRejected`).
+- **HistoryRead with ReadProcessedDetails:** one aggregate per node
+  (`BadAggregateListMismatch` otherwise), `BadAggregateNotSupported` and
+  `BadAggregateInvalidInputs` (a numeric aggregate on a String) per node,
+  at most 10 000 intervals per call with continuation points.
+- **AggregateFilter on MonitoredItems:** the item must be on a historized
+  variable (`BadMonitoredItemFilterUnsupported` otherwise), because the
+  values come from its history, so every write counts, not only the
+  sampled ones. Intervals are aligned on the requested StartTime (now when
+  not given) and a result is queued once its interval has ended; the item
+  is sampled ten times per interval, so a result leaves at most a tenth of
+  an interval late. The AggregateFilterResult returns the start time,
+  interval and configuration in effect.
 
 ## Security
 
@@ -266,7 +310,7 @@ On a None or Sign channel the password must be encrypted with the server key, as
 
 ### Interoperability tests
 
-`crates/fastua/tests/interop/asyncua_interop.py` runs the release binary against the Python asyncua client. It checks every policy and mode, a 4096-bit client key, the certificate trust flow, user name and X.509 users, access rights, hot reload, subscriptions with absolute and percent deadbands, events with a where clause, GetMonitoredItems, ServerCapabilities, index ranges and HistoryRead (raw values, bounds, continuation points). CI runs it on both architectures.
+`crates/fastua/tests/interop/asyncua_interop.py` runs the release binary against the Python asyncua client. It checks every policy and mode, a 4096-bit client key, the certificate trust flow, user name and X.509 users, access rights, hot reload, subscriptions with absolute and percent deadbands, events with a where clause, GetMonitoredItems, ServerCapabilities, index ranges and HistoryRead (raw values, bounds, continuation points, processed Average and Maximum). CI runs it on both architectures.
 
 ```bash
 pip install asyncua cryptography
