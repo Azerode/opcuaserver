@@ -96,7 +96,7 @@ The numbers below were measured by CI on GitHub runners. Run `cargo run --releas
 | Subscription changed value (sample + queue + encode) | 21 ns/item | 24 ns/item |
 | Write → notification p50 / p99, 1 ms intervals | 0.53 / 1.03 ms | 0.52 / 1.05 ms |
 | Write → notification p50 / p99, 0.1 ms intervals, `--busy-poll` | 64 / 114 µs | 64 / 113 µs |
-| Server event → EventFieldList (where clause, 6 fields) | pending CI | pending CI |
+| Server event → EventFieldList (where clause, 6 fields) | ~340 ns | ~490 ns |
 
 How it gets there:
 
