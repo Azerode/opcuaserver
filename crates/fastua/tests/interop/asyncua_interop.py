@@ -248,6 +248,26 @@ async def main(work, cfg):
             break
     check("HistoryRead continuation points and bounds", seen[-5:] == [5.0, 15.0, 30.0, 45.0, 51.0], str(seen))
 
+    # Processed history: one interval over the whole range.
+    pd = ua.ReadProcessedDetails()
+    pd.StartTime = since
+    pd.EndTime = now + datetime.timedelta(seconds=1)
+    pd.ProcessingInterval = 0
+    pd.AggregateType = [ua.NodeId(ua.ObjectIds.AggregateFunction_Average), ua.NodeId(ua.ObjectIds.AggregateFunction_Maximum)]
+    pd.AggregateConfiguration = ua.AggregateConfiguration()
+    pd.AggregateConfiguration.UseServerCapabilitiesDefaults = True
+    hp_ = ua.HistoryReadParameters()
+    hp_.HistoryReadDetails = pd
+    hp_.TimestampsToReturn = ua.TimestampsToReturn.Source
+    hp_.ReleaseContinuationPoints = False  # asyncua's default is True
+    for agg in (0, 1):
+        rv = ua.HistoryReadValueId()
+        rv.NodeId = level.nodeid
+        hp_.NodesToRead.append(rv)
+    res = await c.uaclient.history_read(hp_)
+    got = [r.HistoryData.DataValues[0].Value.Value for r in res]
+    check("HistoryRead processed (Average, Maximum)", abs(got[0] - 29.2) < 1e-9 and got[1] == 51.0, str(got))
+
     # Methods: GetMonitoredItems.
     out = await c.nodes.server.call_method("0:GetMonitoredItems", ua.Variant(sub5.subscription_id, ua.VariantType.UInt32))
     check("GetMonitoredItems", len(out) == 2 and len(out[0]) == 1 and len(out[1]) == 1, str(out))

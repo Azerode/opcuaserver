@@ -512,6 +512,15 @@ impl Client {
                 w.f64(it.sampling_ms);
                 match it.filter {
                     _ if it.event_select.is_some() => it.write_event_filter(w),
+                    _ if it.aggregate.is_some() => {
+                        let (start, agg, interval) = it.aggregate.unwrap();
+                        let at = w.begin_extension_object(ids::AGGREGATE_FILTER_ENCODING);
+                        w.i64(start);
+                        w.node_id(&NodeId::ns0(agg));
+                        w.f64(interval);
+                        crate::aggregates::Config::default().encode(w);
+                        w.end_extension_object(at);
+                    }
                     None => w.null_extension_object(),
                     Some((trigger, db_type, db)) => {
                         let at = w.begin_extension_object(ids::DATA_CHANGE_FILTER_ENCODING);
@@ -808,6 +817,9 @@ pub struct MonitorSpec {
     pub event_select: Option<Vec<String>>,
     /// EventFilter where clause: (operator, operands) elements.
     pub event_where: Vec<(u32, Vec<FilterOperand>)>,
+    /// AggregateFilter: (start time, aggregate function id, processing
+    /// interval in ms), server default configuration.
+    pub aggregate: Option<(i64, u32, f64)>,
 }
 
 /// Operand of a where clause element.
@@ -840,6 +852,7 @@ impl MonitorSpec {
             filter: None,
             event_select: None,
             event_where: Vec::new(),
+            aggregate: None,
         }
     }
 

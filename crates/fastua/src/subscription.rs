@@ -86,6 +86,51 @@ enum Source {
     Fixed(Variant),
     /// The node disappeared in a configuration reload.
     Gone,
+    /// AggregateFilter: one value per processing interval, computed from
+    /// the variable's history.
+    Aggregate(Box<AggState>),
+}
+
+/// AggregateFilter as requested (Part 4 §7.22.4).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AggSpec {
+    /// DateTime; 0 = now.
+    pub start: i64,
+    pub aggregate: u32,
+    pub interval_ms: f64,
+    pub config: crate::aggregates::Config,
+}
+
+/// AggregateFilterResult: (revised start, revised interval, configuration).
+pub type AggRevised = (i64, f64, crate::aggregates::Config);
+
+pub struct AggState {
+    /// `None` while the variable is gone (after a reload).
+    cell: Option<Arc<ValueCell>>,
+    aggregate: u32,
+    /// Ticks (100 ns).
+    interval: i64,
+    /// End of the next interval to report.
+    next_end: i64,
+    config: crate::aggregates::Config,
+}
+
+impl AggState {
+    /// The aggregate of `[next_end - interval, next_end)`.
+    fn compute(&self) -> crate::value::Sample {
+        let (s, e) = (self.next_end - self.interval, self.next_end);
+        let Some(h) = self.cell.as_ref().and_then(|c| c.history()) else {
+            return crate::value::Sample {
+                value: Variant::Empty,
+                status: status::BAD_NODE_ID_UNKNOWN,
+                source_ts: s,
+                server_ts: e,
+            };
+        };
+        let (before, values, after) = h.window(s, e);
+        let w = crate::aggregates::Window { before: before.as_ref(), values: &values, after: after.as_ref() };
+        crate::aggregates::compute(self.aggregate, h.kind(), false, &self.config, s, e, false, s, &w)
+    }
 }
 
 const TAG_BITS: u8 = 0;
@@ -340,6 +385,27 @@ impl Item {
                 let v = v.clone();
                 let src = if self.cold.attribute == crate::services::attr::VALUE { now_ticks() } else { NO_SOURCE_TS };
                 self.offer(v, status::GOOD, src, now_ticks())
+            }
+            Source::Aggregate(_) => {
+                // Every interval completed since the last pass (at most a
+                // queue's worth when the thread was held up).
+                let now = now_ticks();
+                let mut queued = false;
+                let mut n = 0;
+                while let Source::Aggregate(a) = &mut self.source {
+                    if a.next_end > now {
+                        break;
+                    }
+                    if n > self.queue_size {
+                        let behind = (now - a.next_end) / a.interval;
+                        a.next_end += behind * a.interval;
+                    }
+                    let out = a.compute();
+                    a.next_end += a.interval;
+                    n += 1;
+                    queued |= self.offer(out.value, out.status, out.source_ts, now);
+                }
+                queued
             }
             Source::Gone => {
                 if self.sampled && self.last_status == status::BAD_NODE_ID_UNKNOWN {
@@ -886,6 +952,116 @@ impl Subscription {
         Ok(f)
     }
 
+    /// CreateMonitoredItems with an AggregateFilter. The values come from
+    /// the variable's history, so the variable must be historized.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_aggregate_item(
+        &mut self,
+        l: &Limits,
+        space: &AddressSpace,
+        node: NodeId,
+        attribute: u32,
+        mode: u32,
+        ts: (bool, bool),
+        p: &ItemParams,
+        spec: &AggSpec,
+        can_write: bool,
+        now: u64,
+    ) -> Result<((u32, f64, u32), AggRevised), u32> {
+        let (state, p2, revised) = self.aggregate_state(l, space, &node, attribute, p, spec)?;
+        let r = self.create_item(l, space, node, attribute, MODE_DISABLED, ts, &p2, can_write, now)?;
+        self.set_aggregate(r.0, state);
+        if mode != MODE_DISABLED {
+            self.set_mode(r.0, mode, space)?;
+        }
+        Ok((r, revised))
+    }
+
+    /// ModifyMonitoredItems of an aggregate item.
+    #[allow(clippy::too_many_arguments)]
+    pub fn modify_aggregate_item(
+        &mut self,
+        l: &Limits,
+        space: &AddressSpace,
+        id: u32,
+        ts: (bool, bool),
+        p: &ItemParams,
+        spec: &AggSpec,
+        now: u64,
+    ) -> Result<((f64, u32), AggRevised), u32> {
+        let it = self.item(id).ok_or(BAD_MONITORED_ITEM_ID_INVALID)?;
+        let (node, attribute) = (it.cold.node.clone(), it.cold.attribute);
+        let (state, p2, revised) = self.aggregate_state(l, space, &node, attribute, p, spec)?;
+        let r = self.modify_item(l, space, id, ts, &p2, now)?;
+        self.set_aggregate(id, state);
+        Ok((r, revised))
+    }
+
+    pub fn is_aggregate_item(&self, id: u32) -> bool {
+        self.item(id).is_some_and(|it| matches!(it.source, Source::Aggregate(_)))
+    }
+
+    fn aggregate_state(
+        &self,
+        l: &Limits,
+        space: &AddressSpace,
+        node: &NodeId,
+        attribute: u32,
+        p: &ItemParams,
+        spec: &AggSpec,
+    ) -> Result<(AggState, ItemParams, AggRevised), u32> {
+        use crate::aggregates as agg;
+        if attribute != crate::services::attr::VALUE {
+            return Err(BAD_FILTER_NOT_ALLOWED);
+        }
+        let (source, kind, _) = resolve(space, node, attribute, true)?;
+        let Source::Cell(cell) = source else { return Err(BAD_MONITORED_ITEM_FILTER_UNSUPPORTED) };
+        if cell.history().is_none() {
+            return Err(BAD_MONITORED_ITEM_FILTER_UNSUPPORTED);
+        }
+        let aggregate = agg::supported(&NodeId::ns0(spec.aggregate)).ok_or(status::BAD_AGGREGATE_NOT_SUPPORTED)?;
+        if !agg::accepts(aggregate, kind) {
+            return Err(status::BAD_AGGREGATE_INVALID_INPUTS);
+        }
+        let config = spec.config.revise()?;
+        let interval_ms = if spec.interval_ms.is_finite() && spec.interval_ms > 0.0 {
+            spec.interval_ms.max(l.min_sampling_interval_ms)
+        } else {
+            self.params.interval_ms
+        };
+        let interval = (interval_ms * 10_000.0) as i64;
+        let now = now_ticks();
+        let start = if spec.start > 0 { spec.start } else { now };
+        let next_end = if start >= now { start + interval } else { start + ((now - start) / interval + 1) * interval };
+        // Sample ten times per interval: a result leaves at most a tenth of
+        // an interval after its end.
+        let p2 = ItemParams {
+            client_handle: p.client_handle,
+            sampling_ms: (interval_ms / 10.0).max(l.min_sampling_interval_ms),
+            filter: Filter { trigger: TRIGGER_STATUS_VALUE_TIMESTAMP, deadband: 0.0 },
+            percent_deadband: false,
+            filter_present: true,
+            queue_size: p.queue_size,
+            discard_oldest: p.discard_oldest,
+        };
+        let state = AggState { cell: Some(cell), aggregate, interval, next_end, config };
+        Ok((state, p2, (start, interval_ms, config)))
+    }
+
+    /// Makes item `id` an aggregate item.
+    fn set_aggregate(&mut self, id: u32, state: AggState) {
+        let Some(slot) = self.slot(id) else { return };
+        let it = self.items[slot as usize].as_mut().unwrap();
+        it.source = Source::Aggregate(Box::new(state));
+        it.size = 0;
+        it.sampled = false;
+        let g = &mut self.groups[it.group];
+        for h in g.items.iter_mut().filter(|h| h.slot == slot) {
+            *h = Hot::new(slot, &it.source);
+        }
+        g.stale = true;
+    }
+
     /// CreateMonitoredItems for one item. Returns (id, revised sampling,
     /// revised queue size) or the item's status code.
     #[allow(clippy::too_many_arguments)]
@@ -1141,6 +1317,13 @@ impl Subscription {
                 if let Some(range) = space.get(&it.cold.node).and_then(|n| n.eu_range(space)) {
                     it.filter.deadband = percent_to_absolute(it.cold.percent, range);
                 }
+            }
+            if let Source::Aggregate(a) = &mut it.source {
+                a.cell = match resolve(space, &it.cold.node, it.cold.attribute, it.cold.can_write) {
+                    Ok((Source::Cell(c), ..)) if c.history().is_some() => Some(c),
+                    _ => None,
+                };
+                continue;
             }
             match resolve(space, &it.cold.node, it.cold.attribute, it.cold.can_write) {
                 Ok((src, kind, size)) => {
