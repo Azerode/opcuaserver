@@ -373,3 +373,125 @@ fn notifications_follow_hot_reload() {
     let p = next_data(&mut c, &[]);
     assert_eq!(p.message.data[0].1.status, Some(status::BAD_NODE_ID_UNKNOWN));
 }
+
+/// Call with one object/method pair: (status, input argument results, outputs).
+fn call(c: &mut Client, object: NodeId, method: u32, args: &[Variant]) -> (u32, Vec<u32>, Vec<Variant>) {
+    use fastua::codec::Reader;
+    let (ty, body) = c
+        .call(ids::CALL_REQUEST, |w| {
+            w.i32(1);
+            w.node_id(&object);
+            w.node_id(&NodeId::ns0(method));
+            w.i32(args.len() as i32);
+            for a in args {
+                w.variant(a);
+            }
+        })
+        .unwrap();
+    assert_eq!(ty, ids::CALL_RESPONSE, "{:08X}", fastua::client::service_result(body));
+    let mut r = Reader::new(body);
+    fastua::client::skip_response_header(&mut r).unwrap();
+    let mut out = r
+        .array(1, |r| {
+            let code = r.u32()?;
+            let arg_codes = r.array(4, |r| r.u32())?;
+            r.array(1, |r| r.diagnostic_info())?;
+            let outputs = r.array(1, |r| r.variant())?;
+            Ok((code, arg_codes, outputs))
+        })
+        .unwrap();
+    out.pop().unwrap()
+}
+
+/// Read of the Value attribute with an index range.
+fn read_range(c: &mut Client, node: NodeId, range: &str) -> DataValue {
+    use fastua::codec::Reader;
+    let (ty, body) = c
+        .call(ids::READ_REQUEST, |w| {
+            w.f64(0.0);
+            w.u32(2);
+            w.i32(1);
+            w.node_id(&node);
+            w.u32(13);
+            w.str(Some(range));
+            w.u16(0);
+            w.str(None);
+        })
+        .unwrap();
+    assert_eq!(ty, ids::READ_RESPONSE);
+    let mut r = Reader::new(body);
+    fastua::client::skip_response_header(&mut r).unwrap();
+    r.array(1, |r| r.data_value()).unwrap().pop().unwrap()
+}
+
+#[test]
+fn methods_cancel_index_ranges_and_capabilities() {
+    let (addr, _dir) = start("methods");
+    let mut c = client(&addr);
+    let server = NodeId::ns0(2253);
+    let (sub, ..) = c.create_subscription(20.0, 300, 10).unwrap();
+    let r = c
+        .monitor(sub, &[MonitorSpec::value(SPEED, 11), MonitorSpec::events(server.clone(), 12, &["Message"])])
+        .unwrap();
+    assert!(r.iter().all(|x| x.0 == status::GOOD));
+
+    // GetMonitoredItems
+    let (code, _, out) = call(&mut c, server.clone(), ids::SERVER_GET_MONITORED_ITEMS, &[Variant::UInt32(sub)]);
+    assert_eq!(code, status::GOOD);
+    let array = |v: &Variant| match v {
+        Variant::Array(a) => a.items.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(array(&out[0]), vec![Variant::UInt32(r[0].1), Variant::UInt32(r[1].1)]);
+    assert_eq!(array(&out[1]), vec![Variant::UInt32(11), Variant::UInt32(12)]);
+    let (code, args, _) = call(&mut c, server.clone(), ids::SERVER_GET_MONITORED_ITEMS, &[Variant::Int32(1)]);
+    assert_eq!((code, args), (0x80AB_0000, vec![status::BAD_TYPE_MISMATCH]));
+    let (code, ..) = call(&mut c, server.clone(), ids::SERVER_GET_MONITORED_ITEMS, &[Variant::UInt32(sub + 99)]);
+    assert_eq!(code, BAD_SUBSCRIPTION_ID_INVALID);
+    let (code, ..) = call(&mut c, server.clone(), ids::SERVER_GET_MONITORED_ITEMS, &[]);
+    assert_eq!(code, 0x8076_0000);
+    let (code, ..) = call(&mut c, NodeId::ns0(85), ids::SERVER_GET_MONITORED_ITEMS, &[Variant::UInt32(sub)]);
+    assert_eq!(code, 0x8075_0000);
+
+    // ResendData: the current value is reported again.
+    let first = next_data(&mut c, &[]);
+    assert!(first.message.data.iter().any(|(h, _)| *h == 11));
+    let (code, ..) = call(&mut c, server.clone(), ids::SERVER_RESEND_DATA, &[Variant::UInt32(sub)]);
+    assert_eq!(code, status::GOOD);
+    let again = next_data(&mut c, &[(sub, first.message.seq)]);
+    assert!(again.message.data.iter().any(|(h, _)| *h == 11));
+
+    // Cancel a queued Publish request.
+    let mut d = client(&addr);
+    let (_s, ..) = d.create_subscription(2000.0, 300, 10).unwrap();
+    let handle = d.next_handle();
+    d.send_publish(&[]).unwrap();
+    let (ty, body) = d
+        .call(ids::CANCEL_REQUEST, |w| {
+            w.u32(handle);
+        })
+        .unwrap();
+    assert_eq!(ty, ids::CANCEL_RESPONSE);
+    assert_eq!(u32::from_le_bytes(body[body.len() - 4..].try_into().unwrap()), 1);
+    let p = d.receive_publish().unwrap();
+    assert_eq!(p.fault, status::BAD_REQUEST_CANCELLED_BY_CLIENT);
+
+    // Index ranges.
+    let ns = read_range(&mut c, NodeId::ns0(2255), "1");
+    let all = c.read(&[(NodeId::ns0(2255), 13)]).unwrap().pop().unwrap();
+    let second = match all.value {
+        Some(Variant::Array(a)) => a.items[1].clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(ns.value, Some(Variant::Array(Box::new(VariantArray { type_id: 12, items: vec![second], dims: None }))));
+    c.write(&[(NodeId::String(2, "Label".into()), Variant::string("Hello"))]).unwrap();
+    assert_eq!(read_range(&mut c, NodeId::String(2, "Label".into()), "1:3").value, Some(Variant::string("ell")));
+    assert_eq!(read_range(&mut c, SPEED, "0").status, Some(status::BAD_INDEX_RANGE_NO_DATA));
+    assert_eq!(read_range(&mut c, SPEED, "2:1").status, Some(status::BAD_INDEX_RANGE_INVALID));
+
+    // ServerCapabilities and BuildInfo.
+    let v = c.read(&[(NodeId::ns0(11705), 13), (NodeId::ns0(2269), 13), (NodeId::ns0(2261), 13)]).unwrap();
+    assert_eq!(v[0].value, Some(Variant::UInt32(10_000)));
+    assert!(matches!(&v[1].value, Some(Variant::Array(_))));
+    assert_eq!(v[2].value, Some(Variant::string("fastua")));
+}

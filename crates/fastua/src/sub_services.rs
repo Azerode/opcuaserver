@@ -492,3 +492,114 @@ pub(super) fn delete_monitored_items(ctx: &mut Ctx, h: &RequestHeader, r: &mut R
     write_codes(w, codes.into_iter());
     Ok(())
 }
+
+// ---------------------------------------------------------------- Cancel, Call
+
+/// Cancel (Part 4 §5.6.5): queued Publish requests with the handle are
+/// answered with Bad_RequestCancelledByClient.
+pub(super) fn cancel(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
+    let s = session(ctx, h, true)?;
+    let handle = r.u32().map_err(decode_err)?;
+    let count = lock(&s).cancel(handle);
+    if count > 0 {
+        ctx.conn.drive(&s);
+    }
+    begin(w, ids::CANCEL_RESPONSE, h);
+    w.u32(count);
+    Ok(())
+}
+
+pub const BAD_METHOD_INVALID: u32 = 0x8075_0000;
+pub const BAD_ARGUMENTS_MISSING: u32 = 0x8076_0000;
+pub const BAD_TOO_MANY_ARGUMENTS: u32 = 0x80E5_0000;
+pub const BAD_INVALID_ARGUMENT: u32 = 0x80AB_0000;
+
+/// Result of one method call: outputs, or (status, input argument results).
+type CallResult = Result<Vec<Variant>, (u32, Vec<u32>)>;
+
+/// Call (Part 4 §5.11.2) with the Server methods (Part 5 §9).
+pub(super) fn call(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut Writer) -> SResult {
+    let s = session(ctx, h, true)?;
+    let n = r.length(5).map_err(decode_err)?.unwrap_or(0);
+    check_count(ctx, n)?;
+    let space = ctx.server.store.cached(ctx.space);
+    let mut resend = false;
+    begin(w, ids::CALL_RESPONSE, h);
+    w.i32(n as i32);
+    for _ in 0..n {
+        let object = r.node_id().map_err(decode_err)?;
+        let method = r.node_id().map_err(decode_err)?;
+        let args = r.array(1, |r| r.variant()).map_err(decode_err)?;
+        match call_method(&s, space, &object, &method, &args, &mut resend) {
+            Ok(outputs) => {
+                w.u32(status::GOOD);
+                w.empty_array(); // inputArgumentResults
+                w.empty_array(); // inputArgumentDiagnosticInfos
+                w.i32(outputs.len() as i32);
+                for v in &outputs {
+                    w.variant(v);
+                }
+            }
+            Err((code, arg_results)) => {
+                w.u32(code);
+                write_codes(w, arg_results.into_iter());
+                w.empty_array(); // outputArguments
+            }
+        }
+    }
+    w.empty_array(); // diagnosticInfos
+    if resend {
+        ctx.conn.drive(&s);
+    }
+    Ok(())
+}
+
+fn call_method(
+    s: &Session,
+    space: &AddressSpace,
+    object: &NodeId,
+    method: &NodeId,
+    args: &[Variant],
+    resend: &mut bool,
+) -> CallResult {
+    let fail = |code| Err((code, Vec::new()));
+    let Some(o) = space.find(object) else { return fail(status::BAD_NODE_ID_UNKNOWN) };
+    let Some(m) = space.find(method) else { return fail(BAD_METHOD_INVALID) };
+    if !matches!(space.node(m).kind, NodeKind::Method { .. })
+        || !space.node(o).refs.iter().any(|r| r.forward && r.type_id == ids::HAS_COMPONENT && r.target == m)
+    {
+        return fail(BAD_METHOD_INVALID);
+    }
+    match method.as_ns0() {
+        Some(ids::SERVER_GET_MONITORED_ITEMS) | Some(ids::SERVER_RESEND_DATA) => {
+            let id = subscription_argument(args)?;
+            let mut st = lock(s);
+            let Some(sub) = st.find(id) else { return fail(BAD_SUBSCRIPTION_ID_INVALID) };
+            if method.as_ns0() == Some(ids::SERVER_RESEND_DATA) {
+                sub.resend_initial_values();
+                *resend = true;
+                return Ok(Vec::new());
+            }
+            let (server, client) = sub.handles();
+            let array = |v: Vec<u32>| {
+                Variant::Array(Box::new(VariantArray {
+                    type_id: builtin::UINT32,
+                    items: v.into_iter().map(Variant::UInt32).collect(),
+                    dims: None,
+                }))
+            };
+            Ok(vec![array(server), array(client)])
+        }
+        _ => fail(BAD_METHOD_INVALID),
+    }
+}
+
+/// The single UInt32 SubscriptionId argument.
+fn subscription_argument(args: &[Variant]) -> Result<u32, (u32, Vec<u32>)> {
+    match args {
+        [] => Err((BAD_ARGUMENTS_MISSING, Vec::new())),
+        [Variant::UInt32(id)] => Ok(*id),
+        [_] => Err((BAD_INVALID_ARGUMENT, vec![status::BAD_TYPE_MISMATCH])),
+        _ => Err((BAD_TOO_MANY_ARGUMENTS, Vec::new())),
+    }
+}

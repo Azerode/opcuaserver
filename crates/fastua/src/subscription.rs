@@ -743,6 +743,13 @@ impl Subscription {
         self.event_index(id).is_some()
     }
 
+    /// (server handles, client handles) of every item (GetMonitoredItems).
+    pub fn handles(&self) -> (Vec<u32>, Vec<u32>) {
+        let data = self.items.iter().flatten().map(|it| (it.id, it.client_handle));
+        let events = self.events.iter().map(|e| (e.id, e.client_handle));
+        data.chain(events).unzip()
+    }
+
     /// Pulls new events into the event items' queues.
     #[cold]
     #[inline(never)]
@@ -1321,6 +1328,9 @@ pub struct PublishRequest {
     pub acks: Vec<u32>,
 }
 
+/// Deadline of a cancelled Publish request (monotonic deadlines are > 0).
+const CANCELLED: u64 = 0;
+
 /// A StatusChangeNotification waiting for a Publish request.
 struct StatusMsg {
     sub_id: u32,
@@ -1399,6 +1409,21 @@ impl SessionSubs {
         }
     }
 
+    /// Cancel: queued Publish requests with `handle` are answered with
+    /// Bad_RequestCancelledByClient on the next `write_next`.
+    pub fn cancel(&mut self, handle: u32) -> u32 {
+        let mut n = 0;
+        for i in 0..self.requests.len() {
+            if self.requests[i].handle == handle && self.requests[i].deadline != CANCELLED {
+                let mut r = self.requests.remove(i).unwrap();
+                r.deadline = CANCELLED;
+                self.requests.push_front(r);
+                n += 1;
+            }
+        }
+        n
+    }
+
     /// Queues a StatusChangeNotification for subscription `sub_id`.
     pub fn status_change(&mut self, sub_id: u32, seq: u32, code: u32) {
         self.status_msgs.push_back(StatusMsg { sub_id, seq, status: code });
@@ -1457,7 +1482,9 @@ impl SessionSubs {
         let front = self.requests.front()?;
         if front.deadline <= now {
             let r = self.requests.pop_front().unwrap();
-            crate::services::write_fault(w, r.handle, status::BAD_TIMEOUT);
+            let code =
+                if r.deadline == CANCELLED { status::BAD_REQUEST_CANCELLED_BY_CLIENT } else { status::BAD_TIMEOUT };
+            crate::services::write_fault(w, r.handle, code);
             return Some(self.done(r));
         }
         if let Some(m) = self.status_msgs.pop_front() {

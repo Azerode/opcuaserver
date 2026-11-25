@@ -453,6 +453,9 @@ pub mod ids {
     pub const BUILD_INFO: u32 = 338;
     pub const UTC_TIME: u32 = 294;
     pub const RANGE: u32 = 884;
+    pub const ARGUMENT: u32 = 296;
+    pub const SIGNED_SOFTWARE_CERTIFICATE: u32 = 344;
+    pub const REDUNDANCY_SUPPORT: u32 = 851;
 
     // Reference types
     pub const REFERENCES: u32 = 31;
@@ -486,6 +489,12 @@ pub mod ids {
     pub const SERVER_STATUS_TYPE: u32 = 2138;
     pub const DATA_ITEM_TYPE: u32 = 2365;
     pub const ANALOG_ITEM_TYPE: u32 = 2368;
+    pub const BUILD_INFO_TYPE: u32 = 3051;
+    pub const SERVER_CAPABILITIES_TYPE: u32 = 2013;
+    pub const SERVER_DIAGNOSTICS_TYPE: u32 = 2020;
+    pub const VENDOR_SERVER_INFO_TYPE: u32 = 2033;
+    pub const SERVER_REDUNDANCY_TYPE: u32 = 2034;
+    pub const OPERATION_LIMITS_TYPE: u32 = 11564;
 
     // Folders
     pub const ROOT_FOLDER: u32 = 84;
@@ -507,11 +516,16 @@ pub mod ids {
     pub const SERVER_SERVER_STATUS_STATE: u32 = 2259;
     pub const SERVER_SERVER_STATUS_BUILD_INFO: u32 = 2260;
     pub const SERVER_SERVICE_LEVEL: u32 = 2267;
+    pub const SERVER_SERVER_CAPABILITIES: u32 = 2268;
+    pub const OPERATION_LIMITS: u32 = 11704;
+    pub const SERVER_GET_MONITORED_ITEMS: u32 = 11492;
+    pub const SERVER_RESEND_DATA: u32 = 12873;
 
     // Binary encodings of structures
     pub const SERVER_STATUS_DATA_TYPE_ENCODING: u32 = 864;
     pub const BUILD_INFO_ENCODING: u32 = 340;
     pub const RANGE_ENCODING: u32 = 886;
+    pub const ARGUMENT_ENCODING: u32 = 298;
     pub const ANONYMOUS_IDENTITY_TOKEN_ENCODING: u32 = 321;
     pub const USERNAME_IDENTITY_TOKEN_ENCODING: u32 = 324;
     pub const X509_IDENTITY_TOKEN_ENCODING: u32 = 327;
@@ -531,6 +545,8 @@ pub mod ids {
     pub const ACTIVATE_SESSION_RESPONSE: u32 = 470;
     pub const CLOSE_SESSION_REQUEST: u32 = 473;
     pub const CLOSE_SESSION_RESPONSE: u32 = 476;
+    pub const CANCEL_REQUEST: u32 = 479;
+    pub const CANCEL_RESPONSE: u32 = 482;
     pub const BROWSE_REQUEST: u32 = 527;
     pub const BROWSE_RESPONSE: u32 = 530;
     pub const BROWSE_NEXT_REQUEST: u32 = 533;
@@ -545,6 +561,8 @@ pub mod ids {
     pub const READ_RESPONSE: u32 = 634;
     pub const WRITE_REQUEST: u32 = 673;
     pub const WRITE_RESPONSE: u32 = 676;
+    pub const CALL_REQUEST: u32 = 712;
+    pub const CALL_RESPONSE: u32 = 715;
     pub const CREATE_MONITORED_ITEMS_REQUEST: u32 = 751;
     pub const CREATE_MONITORED_ITEMS_RESPONSE: u32 = 754;
     pub const MODIFY_MONITORED_ITEMS_REQUEST: u32 = 763;
@@ -600,11 +618,13 @@ pub mod status {
     pub const BAD_SESSION_CLOSED: u32 = 0x8026_0000;
     pub const BAD_SESSION_NOT_ACTIVATED: u32 = 0x8027_0000;
     pub const BAD_REQUEST_HEADER_INVALID: u32 = 0x802A_0000;
+    pub const BAD_REQUEST_CANCELLED_BY_CLIENT: u32 = 0x802C_0000;
     pub const BAD_TIMESTAMPS_TO_RETURN_INVALID: u32 = 0x802B_0000;
     pub const BAD_NODE_ID_INVALID: u32 = 0x8033_0000;
     pub const BAD_NODE_ID_UNKNOWN: u32 = 0x8034_0000;
     pub const BAD_ATTRIBUTE_ID_INVALID: u32 = 0x8035_0000;
     pub const BAD_INDEX_RANGE_INVALID: u32 = 0x8036_0000;
+    pub const BAD_INDEX_RANGE_NO_DATA: u32 = 0x8037_0000;
     pub const BAD_DATA_ENCODING_INVALID: u32 = 0x8038_0000;
     pub const BAD_DATA_ENCODING_UNSUPPORTED: u32 = 0x8039_0000;
     pub const BAD_NOT_READABLE: u32 = 0x803A_0000;

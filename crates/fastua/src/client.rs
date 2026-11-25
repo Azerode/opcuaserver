@@ -460,6 +460,11 @@ impl Client {
         r
     }
 
+    /// Request handle of the next request sent.
+    pub fn next_handle(&self) -> u32 {
+        self.handle
+    }
+
     /// Next response: (type id, body starting with the response header).
     pub fn receive(&mut self) -> io::Result<(u32, &[u8])> {
         self.read_response()
