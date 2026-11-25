@@ -198,12 +198,11 @@ pub fn compute(
             None => no_data(),
         },
         2342 => {
-            let good = c.good_values();
-            if good.is_empty() {
+            let (sum, n) = c.good_values().fold((0.0, 0usize), |(s, n), v| (s + v.1, n + 1));
+            if n == 0 {
                 return no_data();
             }
-            let avg = good.iter().map(|s| s.1).sum::<f64>() / good.len() as f64;
-            out(dbl(avg), c.count_status() | CALCULATED)
+            out(dbl(sum / n as f64), c.count_status() | CALCULATED)
         }
         2343 | 2344 | 11285 | 11304 => {
             let v2 = matches!(agg, 11285 | 11304);
@@ -217,8 +216,38 @@ pub fn compute(
         }
         2346 | 2347 | 2348 | 2349 | 2350 | 11286 | 11287 | 11305 | 11306 | 11288 => {
             let with_bounds = matches!(agg, 11286 | 11287 | 11305 | 11306 | 11288);
-            let mut pts: Vec<(i64, f64)> = c.good_values().into_iter().map(|(t, f, _)| (t, f)).collect();
-            if with_bounds {
+            let st = c.count_status();
+            if !with_bounds {
+                // One pass, no allocation: extremes, first time and count of each.
+                let mut it = c.good_values();
+                let Some((t0, f0, _)) = it.next() else { return no_data() };
+                let (mut min, mut tmin, mut nmin, mut max, mut tmax, mut nmax) = (f0, t0, 1, f0, t0, 1);
+                for (t, f, _) in it {
+                    if f < min {
+                        (min, tmin, nmin) = (f, t, 1);
+                    } else if f == min {
+                        nmin += 1;
+                    }
+                    if f > max {
+                        (max, tmax, nmax) = (f, t, 1);
+                    } else if f == max {
+                        nmax += 1;
+                    }
+                }
+                if agg == 2350 {
+                    return out(same_type(max - min), st | CALCULATED);
+                }
+                let (want, at, hits) = if matches!(agg, 2346 | 2348) { (min, tmin, nmin) } else { (max, tmax, nmax) };
+                let multi = if hits > 1 { MULTI_VALUE } else { 0 };
+                let mut s = out(same_type(want), st | CALCULATED | multi);
+                if matches!(agg, 2348 | 2349) {
+                    s.source_ts = at;
+                    s.server_ts = at;
+                }
+                return s;
+            }
+            let mut pts: Vec<(i64, f64)> = c.good_values().map(|(t, f, _)| (t, f)).collect();
+            {
                 for t in [start, end] {
                     if let Some((v, st, exact)) = c.at(t) {
                         if !exact && c.counts_as_good(st) {
@@ -235,7 +264,6 @@ pub fn compute(
             }
             let min = pts.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
             let max = pts.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
-            let st = c.count_status();
             match agg {
                 2350 | 11288 => out(same_type(max - min), st | CALCULATED),
                 _ => {
@@ -253,7 +281,7 @@ pub fn compute(
             }
         }
         2351 => out(Variant::Int32(0), status::GOOD | CALCULATED),
-        2352 => out(Variant::Int32(c.good_values().len() as i32), c.count_status_or_good() | CALCULATED),
+        2352 => out(Variant::Int32(c.good_values().count() as i32), c.count_status_or_good() | CALCULATED),
         11307 | 11308 => {
             let zero = agg == 11307;
             let d = c.state_duration(|f| (f == 0.0) == zero);
@@ -272,8 +300,8 @@ pub fn compute(
             out(Variant::Int32(n), c.count_status_or_good() | CALCULATED)
         }
         2357 | 2358 => {
-            let good: Vec<&Sample> = c.w.values.iter().filter(|s| c.counts_as_good(s.status)).collect();
-            let s = if agg == 2357 { good.first() } else { good.last() };
+            let mut good = c.w.values.iter().filter(|s| c.counts_as_good(s.status));
+            let s = if agg == 2357 { good.next() } else { good.next_back() };
             match s {
                 Some(s) => Sample {
                     value: s.value.clone(),
@@ -285,8 +313,10 @@ pub fn compute(
             }
         }
         2359 => {
-            let good = c.good_values();
-            match (good.first(), good.last()) {
+            let mut good = c.good_values();
+            let first = good.next();
+            let last = good.last().or(first);
+            match (first, last) {
                 (Some(a), Some(b)) => out(same_type(b.1 - a.1), c.count_status() | CALCULATED),
                 _ => no_data(),
             }
@@ -326,7 +356,7 @@ pub fn compute(
         2364 | 11292 => {
             let mut worst = status::GOOD;
             let mut seen = 0;
-            let bounds: Vec<&Sample> = if agg == 11292 { c.w.before.iter().copied().collect() } else { Vec::new() };
+            let bounds = if agg == 11292 { c.w.before } else { None };
             for s in bounds.into_iter().chain(c.w.values.iter()) {
                 worst = worse(worst, s.status);
                 seen += 1;
@@ -339,12 +369,12 @@ pub fn compute(
         11426..=11429 => {
             let good = c.good_values();
             let sample = matches!(agg, 11426 | 11428);
-            let n = good.len();
+            let (sum, n) = good.clone().fold((0.0, 0usize), |(s, n), v| (s + v.1, n + 1));
             if n == 0 || (sample && n < 2) {
                 return no_data();
             }
-            let mean = good.iter().map(|s| s.1).sum::<f64>() / n as f64;
-            let ss: f64 = good.iter().map(|s| (s.1 - mean).powi(2)).sum();
+            let mean = sum / n as f64;
+            let ss: f64 = good.map(|s| (s.1 - mean).powi(2)).sum();
             let var = ss / if sample { (n - 1) as f64 } else { n as f64 };
             let v = if matches!(agg, 11426 | 11427) { var.sqrt() } else { var };
             out(dbl(v), c.count_status() | CALCULATED)
@@ -396,20 +426,15 @@ impl Calc<'_> {
     }
 
     /// Good numeric values in the interval: (time, value, status).
-    fn good_values(&self) -> Vec<(i64, f64, u32)> {
-        self.w
-            .values
-            .iter()
-            .filter(|s| self.counts_as_good(s.status))
-            .filter_map(|s| {
-                let f = value::variant_as_f64(&s.value).or(if let Variant::Boolean(b) = s.value {
-                    Some(b as u8 as f64)
-                } else {
-                    None
-                })?;
-                Some((s.source_ts, f, s.status))
-            })
-            .collect()
+    fn good_values(&self) -> impl Iterator<Item = (i64, f64, u32)> + Clone + '_ {
+        self.w.values.iter().filter(|s| self.counts_as_good(s.status)).filter_map(|s| {
+            let f = value::variant_as_f64(&s.value).or(if let Variant::Boolean(b) = s.value {
+                Some(b as u8 as f64)
+            } else {
+                None
+            })?;
+            Some((s.source_ts, f, s.status))
+        })
     }
 
     /// Good / Uncertain / Bad from the share of good values (by count).
@@ -451,25 +476,42 @@ impl Calc<'_> {
     /// after the last value, stepped (or sloped) extrapolation as
     /// Uncertain.
     fn at(&self, t: i64) -> Option<(Variant, u32, bool)> {
-        let all = self.w.before.into_iter().chain(self.w.values.iter()).chain(self.w.after);
-        let mut prev: Option<&Sample> = None;
-        let mut prev2: Option<&Sample> = None;
-        let mut next: Option<&Sample> = None;
-        for s in all {
-            if s.source_ts == t && self.counts_as_good(s.status) {
-                return Some((s.value.clone(), s.status, true));
+        // before, values, after: sorted by time; binary search, then walk
+        // to the nearest good values.
+        let w = self.w;
+        let b = w.before.is_some() as usize;
+        let n = b + w.values.len() + w.after.is_some() as usize;
+        let get = |i: usize| -> &Sample {
+            if i < b {
+                w.before.unwrap()
+            } else if i - b < w.values.len() {
+                &w.values[i - b]
+            } else {
+                w.after.unwrap()
             }
-            if s.source_ts <= t {
-                if prev.is_some_and(|p| self.counts_as_good(p.status)) {
-                    prev2 = prev;
-                }
-                if self.counts_as_good(s.status) {
-                    prev = Some(s);
-                }
-            } else if next.is_none() && self.counts_as_good(s.status) {
-                next = Some(s);
+        };
+        let (mut lo, mut hi) = (0, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if get(mid).source_ts < t {
+                lo = mid + 1;
+            } else {
+                hi = mid;
             }
         }
+        let mut j = lo;
+        while j < n && get(j).source_ts == t {
+            let s = get(j);
+            if self.counts_as_good(s.status) {
+                return Some((s.value.clone(), s.status, true));
+            }
+            j += 1;
+        }
+        let good = |i: &usize| self.counts_as_good(get(*i).status);
+        let next = (j..n).find(good).map(get);
+        let mut before_t = (0..j).rev().filter(good).map(get);
+        let prev = before_t.next();
+        let prev2 = before_t.next();
         let p = prev?;
         let pf = value::variant_as_f64(&p.value);
         match next {
@@ -500,39 +542,42 @@ impl Calc<'_> {
     /// (the "2" variants) leaves bad periods out of both; otherwise bad
     /// periods are bridged by interpolation.
     fn area(&self, only_good: bool) -> Option<(f64, f64, u32)> {
-        let start = self.at(self.start);
-        let end = self.at(self.end);
-        let mut pts: Vec<(i64, f64, bool)> = Vec::with_capacity(self.w.values.len() + 2);
-        if let Some((v, st, _)) = &start {
-            pts.push((self.start, value::variant_as_f64(v)?, self.counts_as_good(*st)));
-        }
-        for s in self.w.values {
+        let first = match self.at(self.start) {
+            Some((v, st, _)) => Some((self.start, value::variant_as_f64(&v)?, self.counts_as_good(st))),
+            None => None,
+        };
+        let last = match self.at(self.end) {
+            Some((v, st, _)) => Some((self.end, value::variant_as_f64(&v)?, self.counts_as_good(st))),
+            None => None,
+        };
+        let inner = self.w.values.iter().filter_map(|s| {
             let good = self.counts_as_good(s.status);
             if !good && !only_good {
-                continue;
+                return None;
             }
-            if let Some(f) = value::variant_as_f64(&s.value) {
-                pts.push((s.source_ts, f, good));
-            } else if !good {
-                pts.push((s.source_ts, 0.0, false));
+            match value::variant_as_f64(&s.value) {
+                Some(f) => Some((s.source_ts, f, good)),
+                None if !good => Some((s.source_ts, 0.0, false)),
+                None => None,
             }
+        });
+        // Trapezoids between consecutive points, without collecting them.
+        let (mut area, mut dur, mut count) = (0.0, 0.0, 0usize);
+        let mut prev: Option<(i64, f64, bool)> = None;
+        for b in first.into_iter().chain(inner).chain(last) {
+            count += 1;
+            if let Some(a) = prev {
+                let dt = (b.0 - a.0) as f64 / 10_000_000.0;
+                if dt > 0.0 && !(only_good && !a.2) {
+                    let h = if self.stepped || (only_good && !b.2) { a.1 } else { (a.1 + b.1) / 2.0 };
+                    area += h * dt;
+                    dur += dt;
+                }
+            }
+            prev = Some(b);
         }
-        if let Some((v, st, _)) = &end {
-            pts.push((self.end, value::variant_as_f64(v)?, self.counts_as_good(*st)));
-        }
-        if pts.len() < 2 {
+        if count < 2 {
             return None;
-        }
-        let (mut area, mut dur) = (0.0, 0.0);
-        for p in pts.windows(2) {
-            let (a, b) = (p[0], p[1]);
-            let dt = (b.0 - a.0) as f64 / 10_000_000.0;
-            if dt <= 0.0 || (only_good && !a.2) {
-                continue;
-            }
-            let h = if self.stepped || (only_good && !b.2) { a.1 } else { (a.1 + b.1) / 2.0 };
-            area += h * dt;
-            dur += dt;
         }
         let total = self.span_s();
         let (good_ms, _) = self.quality_durations();

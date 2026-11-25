@@ -3,10 +3,14 @@
 //! (insert, replace, update, delete raw / modified / at time).
 //!
 //! Recording is a branch on a flag in [`crate::value::ValueCell::write`]
-//! (never taken for variables without history) and, for historized ones, a
-//! short uncontended mutex and a push into a ring that does not allocate
-//! once it has grown to its capacity. Reads copy what they need under the
-//! lock and encode outside of it.
+//! (never taken for variables without history). A historized write of a
+//! numeric, Boolean or DateTime value goes into a small lock-free staging
+//! buffer (single producer: writers of a cell are already serialised by its
+//! seqlock), with plain stores only. The writer that fills half of it moves
+//! the staged values into the ring under the mutex, and so does every reader
+//! before it looks at the ring: the mutex is paid once per 32 writes. Other
+//! kinds (String, ByteString, Guid) take the mutex on every write. The ring
+//! does not allocate once it has grown to its capacity.
 
 use crate::codec::{DResult, Reader, Writer};
 use crate::services::{begin, check_count, decode_err, session, SResult};
@@ -14,7 +18,7 @@ use crate::services::{Ctx, RequestHeader};
 use crate::types::*;
 use crate::value::{self, Sample};
 use std::collections::VecDeque;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// AccessLevel bits (Part 3 §8.57).
@@ -61,8 +65,37 @@ struct Store {
 
 pub struct History {
     kind: u8,
+    stage: Stage,
     store: Mutex<Store>,
 }
+
+/// Staged values (a power of two).
+const STAGE: usize = 64;
+
+/// One staged write of an inline kind.
+#[derive(Clone, Copy, Default)]
+struct Staged {
+    bits: u64,
+    status: u32,
+    source_ts: i64,
+    server_ts: i64,
+}
+
+/// Single-producer / single-consumer ring: the producer is the writer of
+/// the cell (serialised by its seqlock), the consumer whoever holds the
+/// store mutex.
+struct Stage {
+    /// Next slot to write (producer).
+    tail: AtomicU32,
+    /// Next slot to read (consumer, under the mutex).
+    head: AtomicU32,
+    slots: [std::cell::UnsafeCell<Staged>; STAGE],
+}
+
+// SAFETY: a slot is written by the single producer before `tail` is
+// released past it, and read by the single consumer before `head` is
+// released past it; the producer reuses a slot only after acquiring that.
+unsafe impl Sync for Stage {}
 
 /// Position of the first value at `ts` or later.
 fn lower(raw: &VecDeque<Sample>, ts: i64) -> usize {
@@ -130,12 +163,87 @@ impl History {
         let cap = capacity.max(1);
         History {
             kind,
+            stage: Stage {
+                tail: AtomicU32::new(0),
+                head: AtomicU32::new(0),
+                slots: std::array::from_fn(|_| Default::default()),
+            },
             store: Mutex::new(Store { raw: VecDeque::with_capacity(cap.min(1024)), cap, modified: VecDeque::new() }),
         }
     }
 
+    /// The store, with every staged value moved in.
     fn lock(&self) -> std::sync::MutexGuard<'_, Store> {
-        self.store.lock().unwrap_or_else(|e| e.into_inner())
+        let mut st = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        self.drain(&mut st);
+        st
+    }
+
+    /// Moves the staged values into the store (the consumer side).
+    fn drain(&self, st: &mut Store) {
+        let h = self.stage.head.load(Ordering::Relaxed);
+        let t = self.stage.tail.load(Ordering::Acquire);
+        if h == t {
+            return;
+        }
+        // SAFETY: slots in [head, tail) are published and not reused until
+        // `head` moves past them.
+        let slot = |i: u32| unsafe { *self.stage.slots[i as usize % STAGE].get() };
+        let kind = self.kind;
+        let sample = move |s: Staged| Sample {
+            value: value::from_bits(kind, s.bits),
+            status: s.status,
+            source_ts: s.source_ts,
+            server_ts: s.server_ts,
+        };
+        let n = t.wrapping_sub(h) as usize;
+        // Usual case: timestamps in order after the newest value. Make room
+        // once and append the batch.
+        let mut prev = st.raw.back().map_or(i64::MIN, |b| b.source_ts);
+        let in_order = (0..n as u32).all(|k| {
+            let ts = slot(h.wrapping_add(k)).source_ts;
+            let ok = ts >= prev;
+            prev = ts;
+            ok
+        });
+        if in_order {
+            let excess = (st.raw.len() + n).saturating_sub(st.cap);
+            let keep_from = excess.min(st.raw.len());
+            st.raw.drain(..keep_from);
+            let skip = excess - keep_from; // more staged values than capacity
+            st.raw.extend((skip as u32..n as u32).map(|k| sample(slot(h.wrapping_add(k)))));
+        } else {
+            for k in 0..n as u32 {
+                st.insert(sample(slot(h.wrapping_add(k))));
+            }
+        }
+        self.stage.head.store(t, Ordering::Release);
+    }
+
+    /// Stages a write of an inline kind. Only the writer of the cell may
+    /// call it (writers are serialised by the cell's seqlock). Returns true
+    /// once half of the buffer is in use: the caller then calls
+    /// [`History::flush`] after releasing the cell.
+    #[inline(always)]
+    pub(crate) fn stage(&self, bits: u64, status: u32, source_ts: i64, server_ts: i64) -> bool {
+        let t = self.stage.tail.load(Ordering::Relaxed);
+        let mut used = t.wrapping_sub(self.stage.head.load(Ordering::Acquire)) as usize;
+        if used >= STAGE {
+            self.flush();
+            used = 0;
+        }
+        // SAFETY: the slot at `tail` is free (head is less than STAGE
+        // behind) and only this producer writes it.
+        unsafe { *self.stage.slots[t as usize % STAGE].get() = Staged { bits, status, source_ts, server_ts } };
+        self.stage.tail.store(t.wrapping_add(1), Ordering::Release);
+        used + 1 >= STAGE / 2
+    }
+
+    /// Moves the staged values into the store.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn flush(&self) {
+        drop(self.lock());
     }
 
     pub fn kind(&self) -> u8 {
@@ -360,13 +468,26 @@ impl History {
     /// Raw values in `[start, end)` (both inclusive when equal), oldest
     /// first, plus the values just before and after (bounds for aggregates).
     pub fn window(&self, start: i64, end: i64) -> (Option<Sample>, Vec<Sample>, Option<Sample>) {
-        let st = self.lock();
+        self.window_with(start, end, |w| (w.before.cloned(), w.values.to_vec(), w.after.cloned()))
+    }
+
+    /// `f` sees the raw values of `[start, end)` and their neighbours in
+    /// place, under the lock: aggregates are computed without copying the
+    /// values. The ring is made contiguous only when the range wraps.
+    pub fn window_with<R>(&self, start: i64, end: i64, f: impl FnOnce(&crate::aggregates::Window) -> R) -> R {
+        let mut st = self.lock();
         let (a, b) = (start.min(end), start.max(end));
         let lo = lower(&st.raw, a);
         let hi = if a == b { upper(&st.raw, b) } else { lower(&st.raw, b) };
-        let before = lo.checked_sub(1).map(|i| st.raw[i].clone());
-        let after = st.raw.get(hi).cloned();
-        (before, st.raw.range(lo..hi).cloned().collect(), after)
+        let front = st.raw.as_slices().0.len();
+        if lo < front && hi > front {
+            st.raw.make_contiguous();
+        }
+        let raw = &st.raw;
+        let (front, back) = raw.as_slices();
+        let values = if hi <= front.len() { &front[lo..hi] } else { &back[lo - front.len()..hi - front.len()] };
+        let w = crate::aggregates::Window { before: lo.checked_sub(1).map(|i| &raw[i]), values, after: raw.get(hi) };
+        f(&w)
     }
 
     /// UpdateDataDetails for one value. The caller checked the type.
@@ -691,21 +812,25 @@ pub(crate) fn history_read(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: 
                     let total = agg::interval_count(q.start, q.end, q.interval_ms);
                     let from = resume.map_or(0, |r| r.skip as usize).min(total);
                     let to = (from + MAX_RETURN_VALUES).min(total);
-                    let (before, values, after) = hist.window(q.start.min(q.end), q.start.max(q.end));
                     body.clear();
                     let mut wb = Writer::new(body);
                     wb.i32((to - from) as i32);
-                    for (s, e, partial, t) in agg::intervals(q.start, q.end, q.interval_ms).skip(from).take(to - from) {
-                        let a_ = values.partition_point(|x| x.source_ts < s);
-                        let b_ = values.partition_point(|x| x.source_ts < e);
-                        let window = agg::Window {
-                            before: if a_ > 0 { values.get(a_ - 1) } else { before.as_ref() },
-                            values: &values[a_..b_],
-                            after: values.get(b_).or(after.as_ref()),
-                        };
-                        let out = agg::compute(a, hist.kind(), false, &q.config, s, e, partial, t, &window);
-                        write_sample(&mut wb, &out, ts, range);
-                    }
+                    hist.window_with(q.start.min(q.end), q.start.max(q.end), |all| {
+                        let values = all.values;
+                        for (s, e, partial, t) in
+                            agg::intervals(q.start, q.end, q.interval_ms).skip(from).take(to - from)
+                        {
+                            let a_ = values.partition_point(|x| x.source_ts < s);
+                            let b_ = values.partition_point(|x| x.source_ts < e);
+                            let window = agg::Window {
+                                before: if a_ > 0 { values.get(a_ - 1) } else { all.before },
+                                values: &values[a_..b_],
+                                after: values.get(b_).or(all.after),
+                            };
+                            let out = agg::compute(a, hist.kind(), false, &q.config, s, e, partial, t, &window);
+                            write_sample(&mut wb, &out, ts, range);
+                        }
+                    });
                     let more = (to < total).then(|| cp_encode(&id, kind, Resume { ts: 0, skip: to as u32 }));
                     Ok((status::GOOD, more, Some(ids::HISTORY_DATA_ENCODING)))
                 }

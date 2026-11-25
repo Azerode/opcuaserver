@@ -117,7 +117,7 @@ fn to_bits(v: &Variant) -> u64 {
 }
 
 #[inline(always)]
-fn from_bits(kind: u8, b: u64) -> Variant {
+pub(crate) fn from_bits(kind: u8, b: u64) -> Variant {
     use builtin::*;
     match kind {
         BOOLEAN => Variant::Boolean(b != 0),
@@ -337,8 +337,8 @@ impl ValueCell {
         }
     }
 
-    /// History and alarm hooks of a write (never inlined: off the path of
-    /// variables without hooks).
+    /// History and alarm hooks of a write of a String, ByteString or Guid
+    /// (never inlined: off the path of variables without hooks).
     #[cold]
     #[inline(never)]
     fn run_hooks(&self, hooks: u8, value: &Variant, status: u32, source_ts: i64, server_ts: i64) {
@@ -490,15 +490,45 @@ impl ValueCell {
             }
         }
         fence(Ordering::Release);
-        self.bits.store(to_bits(value), Ordering::Relaxed);
+        let bits = to_bits(value);
+        self.bits.store(bits, Ordering::Relaxed);
         self.status.store(status, Ordering::Relaxed);
         self.source_ts.store(source_ts, Ordering::Relaxed);
         self.server_ts.store(server_ts, Ordering::Relaxed);
+        let hooks = self.hooks.load(Ordering::Relaxed);
+        // History is staged while this writer still holds the cell: that
+        // makes it the single producer of the staging buffer.
+        let flush = hooks & HOOK_HISTORY != 0 && self.stage_history(bits, status, source_ts, server_ts);
         self.seq.store(s.wrapping_add(2), Ordering::Release);
         self.publish(s.wrapping_add(2));
-        let hooks = self.hooks.load(Ordering::Relaxed);
-        if hooks != 0 {
-            self.run_hooks(hooks, value, status, source_ts, server_ts);
+        if flush || hooks & HOOK_ALARM != 0 {
+            self.run_inline_hooks(hooks, flush, value, status, source_ts);
+        }
+    }
+
+    #[inline(always)]
+    fn stage_history(&self, bits: u64, status: u32, source_ts: i64, server_ts: i64) -> bool {
+        match self.extras_get().and_then(|x| x.history.get()) {
+            Some(h) => h.stage(bits, status, source_ts, server_ts),
+            None => false,
+        }
+    }
+
+    /// Hooks of an inline write once the cell is released: the history
+    /// flush (every 32 writes) and the alarm.
+    #[cold]
+    #[inline(never)]
+    fn run_inline_hooks(&self, hooks: u8, flush: bool, value: &Variant, status: u32, source_ts: i64) {
+        let Some(x) = self.extras_get() else { return };
+        if flush {
+            if let Some(h) = x.history.get() {
+                h.flush();
+            }
+        }
+        if hooks & HOOK_ALARM != 0 {
+            if let Some(c) = &*x.alarm.load() {
+                c.evaluate(value, status, source_ts);
+            }
         }
     }
 
@@ -617,4 +647,49 @@ mod tests {
 fn cell_size() {
     // Hooks live behind one pointer: a bigger cell costs every write.
     assert!(std::mem::size_of::<ValueCell>() <= 88, "{}", std::mem::size_of::<ValueCell>());
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    /// Concurrent writers and readers of a historized cell: every write is
+    /// recorded once, in timestamp order, whatever the interleaving.
+    #[test]
+    fn concurrent_history_writes() {
+        let cell = std::sync::Arc::new(ValueCell::new(builtin::INT64, 0));
+        cell.set_history(Some(1_000_000));
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let cell = cell.clone();
+                std::thread::spawn(move || {
+                    for i in 0..20_000i64 {
+                        let v = t * 1_000_000 + i;
+                        cell.write(&Variant::Int64(v), status::GOOD, v, v);
+                    }
+                })
+            })
+            .collect();
+        let reader = {
+            let cell = cell.clone();
+            std::thread::spawn(move || {
+                let mut last = 0;
+                for _ in 0..200 {
+                    let n = cell.history().unwrap().len();
+                    assert!(n >= last);
+                    last = n;
+                }
+            })
+        };
+        for w in writers {
+            w.join().unwrap();
+        }
+        reader.join().unwrap();
+        let h = cell.history().unwrap();
+        assert_eq!(h.len(), 80_000);
+        let (_, values, _) = h.window(0, i64::MAX);
+        assert_eq!(values.len(), 80_000);
+        assert!(values.windows(2).all(|w| w[0].source_ts <= w[1].source_ts));
+        assert!(values.iter().all(|s| s.value == Variant::Int64(s.source_ts)));
+    }
 }

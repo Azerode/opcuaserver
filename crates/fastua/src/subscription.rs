@@ -127,9 +127,9 @@ impl AggState {
                 server_ts: e,
             };
         };
-        let (before, values, after) = h.window(s, e);
-        let w = crate::aggregates::Window { before: before.as_ref(), values: &values, after: after.as_ref() };
-        crate::aggregates::compute(self.aggregate, h.kind(), false, &self.config, s, e, false, s, &w)
+        h.window_with(s, e, |w| {
+            crate::aggregates::compute(self.aggregate, h.kind(), false, &self.config, s, e, false, s, w)
+        })
     }
 }
 
