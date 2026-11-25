@@ -173,7 +173,8 @@ async def main(work, cfg):
     d = json.load(open(path))
     d["Subscriptions"][0]["Items"].append({"Name": "NEW", "NodeId": "s=New", "Type": "Double"})
     d["Subscriptions"][0]["Items"].append(
-        {"Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": {"Low": 0, "High": 200}})
+        {"Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": {"Low": 0, "High": 200},
+         "Historizing": True})
 
     # Events: the reload raises a model change event, sessions raise audit events.
     class Events:
@@ -221,6 +222,31 @@ async def main(work, cfg):
     await asyncio.sleep(0.2)
     seen = [v for n, v in hp.values]
     check("percent deadband", seen[-3:] == [5.0, 30.0, 51.0] and 15.0 not in seen, str(seen))
+
+    # Historical access: the writes above were recorded.
+    hz = await level.read_attribute(ua.AttributeIds.Historizing)
+    check("Historizing attribute", hz.Value.Value is True, str(hz))
+    now = datetime.datetime.now(datetime.timezone.utc)
+    since = now - datetime.timedelta(minutes=5)
+    hist = await level.read_raw_history(since, now + datetime.timedelta(seconds=1), return_bounds=False)
+    seen = [d.Value.Value for d in hist]
+    check("HistoryRead raw", seen[-5:] == [5.0, 15.0, 30.0, 45.0, 51.0], str(seen))
+    # Two values per call, following the continuation points; bounds on.
+    details = ua.ReadRawModifiedDetails()
+    details.IsReadModified = False
+    details.StartTime = since
+    details.EndTime = now + datetime.timedelta(seconds=1)
+    details.NumValuesPerNode = 2
+    details.ReturnBounds = True
+    seen, cp, calls = [], None, 0
+    while True:
+        res = await level.history_read(details, cp)
+        calls += 1
+        seen += [d.Value.Value for d in res.HistoryData.DataValues if d.StatusCode.is_good()]
+        cp = res.ContinuationPoint
+        if not cp or calls > 20:
+            break
+    check("HistoryRead continuation points and bounds", seen[-5:] == [5.0, 15.0, 30.0, 45.0, 51.0], str(seen))
 
     # Methods: GetMonitoredItems.
     out = await c.nodes.server.call_method("0:GetMonitoredItems", ua.Variant(sub5.subscription_id, ua.VariantType.UInt32))

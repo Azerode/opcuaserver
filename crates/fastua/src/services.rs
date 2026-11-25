@@ -178,6 +178,8 @@ pub fn dispatch(ctx: &mut Ctx, r: &mut Reader, w: &mut Writer) -> u32 {
         Some(ids::DELETE_MONITORED_ITEMS_REQUEST) => sub::delete_monitored_items(ctx, &header, r, w),
         Some(ids::CALL_REQUEST) => sub::call(ctx, &header, r, w),
         Some(ids::CANCEL_REQUEST) => sub::cancel(ctx, &header, r, w),
+        Some(ids::HISTORY_READ_REQUEST) => crate::history::history_read(ctx, &header, r, w),
+        Some(ids::HISTORY_UPDATE_REQUEST) => crate::history::history_update(ctx, &header, r, w),
         _ => Err(status::BAD_SERVICE_UNSUPPORTED),
     };
     if let Err(code) = result {
@@ -818,11 +820,14 @@ pub fn attribute_value(node: &Node, attribute: u32, can_write: bool) -> Option<V
         }
         (ACCESS_LEVEL, NodeKind::Variable { access, .. }) => Variant::Byte(*access),
         (USER_ACCESS_LEVEL, NodeKind::Variable { access, .. }) => {
-            Variant::Byte(if can_write { *access } else { *access & !ACCESS_WRITE })
+            let mask = ACCESS_WRITE | crate::history::ACCESS_HISTORY_WRITE;
+            Variant::Byte(if can_write { *access } else { *access & !mask })
         }
         (ACCESS_LEVEL_EX, NodeKind::Variable { access, .. }) => Variant::UInt32(*access as u32),
         (MINIMUM_SAMPLING_INTERVAL, NodeKind::Variable { .. }) => Variant::Double(0.0),
-        (HISTORIZING, NodeKind::Variable { .. }) => Variant::Boolean(false),
+        (HISTORIZING, NodeKind::Variable { access, .. }) => {
+            Variant::Boolean(access & crate::history::ACCESS_HISTORY_READ != 0)
+        }
         (EXECUTABLE, NodeKind::Method { executable }) | (USER_EXECUTABLE, NodeKind::Method { executable }) => {
             Variant::Boolean(*executable)
         }

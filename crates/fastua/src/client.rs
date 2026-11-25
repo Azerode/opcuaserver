@@ -605,6 +605,94 @@ impl Client {
         r.array(4, |r| r.u32()).map_err(|_| invalid("bad results"))
     }
 
+    /// HistoryRead with raw `details` (an encoded *Details structure of type
+    /// `details_encoding`) on several nodes, each with its continuation
+    /// point. Returns per node (status, continuation point, result type,
+    /// values, modification infos).
+    pub fn history_read(
+        &mut self,
+        details_encoding: u32,
+        details: &[u8],
+        ttr: u32,
+        release: bool,
+        nodes: &[(NodeId, Option<Vec<u8>>)],
+    ) -> io::Result<Result<Vec<HistoryResult>, u32>> {
+        let (ty, body) = self.call(ids::HISTORY_READ_REQUEST, |w| {
+            let at = w.begin_extension_object(details_encoding);
+            w.raw(details);
+            w.end_extension_object(at);
+            w.u32(ttr);
+            w.bool(release);
+            w.i32(nodes.len() as i32);
+            for (id, cp) in nodes {
+                w.node_id(id);
+                w.str(None);
+                w.u16(0);
+                w.str(None);
+                w.bytes(cp.as_deref());
+            }
+        })?;
+        if ty != ids::HISTORY_READ_RESPONSE {
+            return Ok(Err(service_result(body)));
+        }
+        let mut r = Reader::new(body);
+        let bad = |_| invalid("bad HistoryRead response");
+        skip_response_header(&mut r).map_err(bad)?;
+        let results = r
+            .array(12, |r| {
+                let code = r.u32()?;
+                let cp = r.bytes()?.map(|b| b.to_vec());
+                let (type_id, _, data) = r.extension_object_raw()?;
+                let mut d = Reader::new(data);
+                let ty = type_id.as_ns0().unwrap_or(0);
+                let (values, mods) = match ty {
+                    0 => (Vec::new(), Vec::new()),
+                    _ => {
+                        let values = d.array(1, |r| r.data_value())?;
+                        let mods = if ty == ids::HISTORY_MODIFIED_DATA_ENCODING {
+                            d.array(16, |r| {
+                                Ok((r.i64()?, r.u32()?, r.string_owned()?.map(String::from).unwrap_or_default()))
+                            })?
+                        } else {
+                            Vec::new()
+                        };
+                        (values, mods)
+                    }
+                };
+                Ok(HistoryResult { status: code, continuation_point: cp, type_id: ty, values, modifications: mods })
+            })
+            .map_err(bad)?;
+        Ok(Ok(results))
+    }
+
+    /// HistoryUpdate with encoded details: (encoding id, body). Returns per
+    /// details (status, operation results).
+    pub fn history_update(&mut self, details: &[(u32, Vec<u8>)]) -> io::Result<Result<Vec<UpdateResult>, u32>> {
+        let (ty, body) = self.call(ids::HISTORY_UPDATE_REQUEST, |w| {
+            w.i32(details.len() as i32);
+            for (enc, d) in details {
+                let at = w.begin_extension_object(*enc);
+                w.raw(d);
+                w.end_extension_object(at);
+            }
+        })?;
+        if ty != ids::HISTORY_UPDATE_RESPONSE {
+            return Ok(Err(service_result(body)));
+        }
+        let mut r = Reader::new(body);
+        let bad = |_| invalid("bad HistoryUpdate response");
+        skip_response_header(&mut r).map_err(bad)?;
+        let results = r
+            .array(12, |r| {
+                let code = r.u32()?;
+                let ops = r.array(4, |r| r.u32())?;
+                r.array(1, |r| r.diagnostic_info())?;
+                Ok((code, ops))
+            })
+            .map_err(bad)?;
+        Ok(Ok(results))
+    }
+
     /// Forward hierarchical browse; returns (status, continuation point, target ids).
     pub fn browse(&mut self, id: &NodeId, max: u32) -> io::Result<(u32, Option<Vec<u8>>, Vec<NodeId>)> {
         let (ty, body) = self.call(ids::BROWSE_REQUEST, |w| {
@@ -669,6 +757,21 @@ fn parse_browse_results(body: &[u8]) -> io::Result<(u32, Option<Vec<u8>>, Vec<No
         })
         .map_err(|_| bad())?;
     Ok((st, cp, refs))
+}
+
+/// One HistoryUpdate result: (status, operation results).
+pub type UpdateResult = (u32, Vec<u32>);
+
+/// One node's HistoryRead result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryResult {
+    pub status: u32,
+    pub continuation_point: Option<Vec<u8>>,
+    /// Encoding id of the HistoryData / HistoryModifiedData (0 = none).
+    pub type_id: u32,
+    pub values: Vec<DataValue>,
+    /// (modification time, HistoryUpdateType, user name).
+    pub modifications: Vec<(i64, u32, String)>,
 }
 
 pub fn skip_response_header(r: &mut Reader) -> crate::codec::DResult<u32> {

@@ -51,6 +51,11 @@ struct RawItem {
     writable: bool,
     #[serde(rename = "EURange", default)]
     eu_range: Option<RawRange>,
+    #[serde(rename = "Historizing", default)]
+    historizing: bool,
+    /// Values kept in the history (default 10 000).
+    #[serde(rename = "HistoryCapacity", default)]
+    history_capacity: Option<u32>,
 }
 
 /// `{"Low": 0, "High": 100}` or `[0, 100]`.
@@ -94,6 +99,8 @@ pub struct ItemConfig {
     /// EURange (low, high): the variable becomes an AnalogItemType and
     /// supports percent deadbands.
     pub eu_range: Option<(f64, f64)>,
+    /// Values kept in the history; `None` = not historized.
+    pub history: Option<usize>,
 }
 
 /// Maps a type name (`System.Int16`, `Int16`, `int16`, `Single`…) to a built-in type id.
@@ -148,7 +155,14 @@ pub fn parse_file(path: &Path, text: &str) -> Result<NamespaceConfig, String> {
                     Some((low, high))
                 }
             };
-            items.push(ItemConfig { name: it.name, node_id, data_type, writable: it.writable, eu_range });
+            let history = match (it.historizing, it.history_capacity) {
+                (false, _) => None,
+                (true, Some(0)) => {
+                    return Err(format!("{}: item '{}': HistoryCapacity must be > 0", path.display(), it.name))
+                }
+                (true, cap) => Some(cap.map_or(crate::history::DEFAULT_CAPACITY, |c| c as usize)),
+            };
+            items.push(ItemConfig { name: it.name, node_id, data_type, writable: it.writable, eu_range, history });
         }
         groups.push(GroupConfig { name: g.name, items });
     }
@@ -211,7 +225,8 @@ mod tests {
                 { "Name": "PC", "NodeId": "ns=5;i=1000", "Type": "System.Int16" },
                 { "Name": "S", "NodeId": "s=Speed", "Type": "Double", "Writable": false,
                   "EURange": { "Low": -10, "High": 90 } },
-                { "Name": "T", "NodeId": "i=7", "Type": "Float", "EURange": [0, 5] } ] } ] }"#;
+                { "Name": "T", "NodeId": "i=7", "Type": "Float", "EURange": [0, 5], "Historizing": true },
+                { "Name": "H", "NodeId": "i=8", "Type": "Int32", "Historizing": true, "HistoryCapacity": 50 } ] } ] }"#;
         let ns = parse_file(Path::new("m.json"), text).unwrap();
         assert_eq!(ns.uri, "Machine1");
         assert_eq!(ns.groups[0].items[0].node_id, NodeId::Numeric(0, 1000));
@@ -220,6 +235,9 @@ mod tests {
         assert_eq!(ns.groups[0].items[0].eu_range, None);
         assert_eq!(ns.groups[0].items[1].eu_range, Some((-10.0, 90.0)));
         assert_eq!(ns.groups[0].items[2].eu_range, Some((0.0, 5.0)));
+        assert_eq!(ns.groups[0].items[0].history, None);
+        assert_eq!(ns.groups[0].items[2].history, Some(crate::history::DEFAULT_CAPACITY));
+        assert_eq!(ns.groups[0].items[3].history, Some(50));
     }
 
     #[test]

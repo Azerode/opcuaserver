@@ -30,7 +30,8 @@ Every `*.json` file (searched recursively) is one namespace:
     { "Name": "FLAGS",
       "Items": [
         { "Name": "PC", "NodeId": "ns=5;i=1000", "Type": "System.Int16", "Writable": true },
-        { "Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": { "Low": 0, "High": 200 } } ] }
+        { "Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": { "Low": 0, "High": 200 },
+          "Historizing": true, "HistoryCapacity": 50000 } ] }
   ]
 }
 ```
@@ -45,6 +46,9 @@ Every `*.json` file (searched recursively) is one namespace:
 - `EURange` (numeric types only, `{"Low": .., "High": ..}` or `[low, high]`)
   makes the item an AnalogItemType variable with an EURange property (a
   `Range` structure, browse name `0:EURange`). Percent deadbands use it.
+- `Historizing` (default `false`) records every write of the item (see
+  [Historical access](#historical-access)); `HistoryCapacity` (default
+  10 000) is how many values are kept.
 - Address space: `Objects/<Name>/<group>/<item>`.
 
 ### Hot reload
@@ -175,6 +179,44 @@ EventNotifier attribute with an EventFilter receives every server event.
   subscribes costs one atomic load. A slow reader that falls more than 4096
   events behind gets an overflow event.
 
+## Historical access
+
+Variables with `Historizing: true` have the Historizing attribute set and the
+HistoryRead (and, when writable, HistoryWrite) AccessLevel bits.
+
+- **Storage:** every write is recorded in a ring of `HistoryCapacity` values
+  per variable, ordered by source timestamp (an out-of-order write is inserted
+  in place). History lives in memory: it survives configuration reloads that
+  keep the variable, not a restart. A reload that turns `Historizing` off keeps
+  the data, and turning it back on resumes the same history.
+- **HistoryRead, ReadRawModifiedDetails:** forward (start before end) or
+  reverse (start after end, or only an end time) reads, start inclusive and
+  end exclusive (both inclusive when equal), with `NumValuesPerNode` and
+  continuation points. `ReturnBounds` adds the values just outside the range,
+  or a `BadBoundNotFound` placeholder. `IsReadModified` returns
+  HistoryModifiedData: the values replaced, deleted or inserted by
+  HistoryUpdate, with time, type and user.
+- **HistoryRead, ReadAtTimeDetails:** the value at each time, sloped
+  interpolation for numbers (status with the Interpolated bit), the last value
+  with `UncertainDataSubNormal` after the end, `BadNoData` before the start.
+- **HistoryUpdate:** UpdateDataDetails (insert, replace, update; per value
+  `GoodEntryInserted`, `GoodEntryReplaced`, `BadEntryExists`,
+  `BadNoEntryExists`), DeleteRawModifiedDetails (raw or modified values in a
+  range) and DeleteAtTimeDetails. It needs a user with write rights and a
+  writable variable.
+- **Continuation points** carry the node, the kind of read and where to
+  resume, so they use no server memory and never run out
+  (MaxHistoryContinuationPoints is 0, no limit). A read returns at most
+  10 000 values per node (MaxReturnDataValues).
+- **Not yet:** event history (ReadEventDetails returns
+  `BadHistoryOperationUnsupported`), ReadProcessedDetails (aggregates),
+  annotations.
+- **Cost:** a write of a variable without history checks one flag stored in
+  the padding of the cell's first cache line (no measurable change). A
+  historized write adds a short uncontended mutex and a push into the ring,
+  about 25 ns. HistoryRead encodes each DataValue straight from the ring under
+  the lock (about 13 ns per value).
+
 ## Security
 
 ### Endpoints
@@ -224,7 +266,7 @@ On a None or Sign channel the password must be encrypted with the server key, as
 
 ### Interoperability tests
 
-`crates/fastua/tests/interop/asyncua_interop.py` runs the release binary against the Python asyncua client. It checks every policy and mode, a 4096-bit client key, the certificate trust flow, user name and X.509 users, access rights, hot reload, subscriptions with absolute and percent deadbands, events with a where clause, GetMonitoredItems, ServerCapabilities and index ranges. CI runs it on both architectures.
+`crates/fastua/tests/interop/asyncua_interop.py` runs the release binary against the Python asyncua client. It checks every policy and mode, a 4096-bit client key, the certificate trust flow, user name and X.509 users, access rights, hot reload, subscriptions with absolute and percent deadbands, events with a where clause, GetMonitoredItems, ServerCapabilities, index ranges and HistoryRead (raw values, bounds, continuation points). CI runs it on both architectures.
 
 ```bash
 pip install asyncua cryptography
@@ -239,6 +281,7 @@ Aes256_Sha256_RsaPss in Sign and SignAndEncrypt modes (issue/renew, token
 lifetime, sequence checks), PKI with CRLs, sessions with anonymous, user name
 and X.509 identities, per-user read/write rights, GetEndpoints, FindServers,
 Read (with index ranges on arrays, Strings and ByteStrings), Write, Browse,
+HistoryRead and HistoryUpdate (see [Historical access](#historical-access)),
 BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes/UnregisterNodes,
 Cancel, Call, ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities
 with OperationLimits, every Subscription and MonitoredItem service (see
@@ -246,5 +289,6 @@ with OperationLimits, every Subscription and MonitoredItem service (see
 [Events](#events)).
 
 Not yet: the full namespace 0 nodeset, conditions and alarms, index ranges on
-MonitoredItems and in writes (`BadWriteNotSupported`), history, aggregates,
+MonitoredItems and in writes (`BadWriteNotSupported`), event history,
+history persistence across restarts, aggregates,
 ECC policies.

@@ -196,6 +196,7 @@ fn main() {
     // ---- 4. subscriptions
     subscription_engine(&store);
     event_engine(&store);
+    history_engine();
     let fast_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let fast_addr = fast_listener.local_addr().unwrap().to_string();
     {
@@ -284,6 +285,58 @@ fn subscription_engine(store: &Store) {
 
 /// Server event -> EventFieldList: emit, where clause, select clauses and
 /// encoding, per event (batches of 1000 between two publishes).
+/// Cost of a write with and without history, and of a raw history read.
+fn history_engine() {
+    use fastua::history::RawQuery;
+    use fastua::value::ValueCell;
+    let n = 2_000_000;
+    // Source timestamps keep increasing across runs (in-order history).
+    let clock = std::cell::Cell::new(0i64);
+    let run = |c: &ValueCell| {
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let t = Instant::now();
+            for i in 0..n {
+                let ts = clock.get() + 1;
+                clock.set(ts);
+                c.write(black_box(&Variant::Double(i as f64)), status::GOOD, ts, 2);
+            }
+            best = best.min(t.elapsed().as_nanos() as f64 / n as f64);
+        }
+        best
+    };
+    let plain = ValueCell::new(builtin::DOUBLE, 0);
+    let hist = ValueCell::new(builtin::DOUBLE, 0);
+    hist.set_history(Some(10_000));
+    println!("history        write, no history  {:>6.1} ns", run(&plain));
+    println!("history        write, historized  {:>6.1} ns", run(&hist));
+    let h = hist.history().unwrap();
+    let last = clock.get();
+    let mut out = Vec::with_capacity(1 << 20);
+    for count in [1usize, 100, 1000] {
+        let q = RawQuery { modified: false, start: last - count as i64 + 1, end: last + 1, max: 0, bounds: false };
+        let iters = 200_000 / count;
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let t = Instant::now();
+            for _ in 0..iters {
+                // As the service does: encode each DataValue under the lock.
+                out.clear();
+                let mut w = Writer::new(&mut out);
+                black_box(h.read_raw_with(black_box(&q), None, |s, _| {
+                    w.u8(0x0D);
+                    w.variant(&s.value);
+                    w.i64(s.source_ts);
+                    w.i64(s.server_ts);
+                }))
+                .unwrap();
+            }
+            best = best.min(t.elapsed().as_nanos() as f64 / iters as f64);
+        }
+        println!("history        read raw x{count:<5}    {best:>8.0} ns  {:>6.1} ns/value", best / count as f64);
+    }
+}
+
 fn event_engine(store: &Store) {
     use fastua::events::{types::*, Event, LITERAL_OPERAND, SIMPLE_ATTRIBUTE_OPERAND};
     use fastua::server::Limits;
