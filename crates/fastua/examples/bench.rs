@@ -11,6 +11,7 @@ use fastua::address_space::ServerInfo;
 use fastua::channel::Security;
 use fastua::client::Client;
 use fastua::codec::{Reader, Writer};
+use fastua::crypto::{ChannelKeys, Mode, Policy};
 use fastua::pki::Pki;
 use fastua::reload::Store;
 use fastua::server::{Server, ServerConfig};
@@ -141,13 +142,99 @@ fn main() {
     let spin_listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let spin_addr = spin_listener.local_addr().unwrap().to_string();
     {
-        let server = Server::new(store, spin_config, pki, Users::default());
+        let server = Server::new(store, spin_config, pki.clone(), Users::default());
         std::thread::spawn(move || server.serve(spin_listener));
     }
     loopback("server blocking, client blocking ", &addr, false);
     loopback("server busy-poll, client blocking", &spin_addr, false);
     loopback("server busy-poll, client busy-poll", &spin_addr, true);
+
+    // ---- 3. secure channels (mutual certificate authentication)
+    let (client_cert, client_key) = fastua::pki::generate_self_signed("urn:fastua:test-client", "localhost").unwrap();
+    let trusted = dir.join("pki/trusted/certs");
+    std::fs::create_dir_all(&trusted).unwrap();
+    std::fs::write(trusted.join("bench-client.der"), &client_cert).unwrap();
+    let server_cert = pki.cert_der.clone();
+    let mut combos = vec![(Policy::None, Mode::None)];
+    for p in Policy::SECURE {
+        combos.push((p, Mode::Sign));
+        combos.push((p, Mode::SignAndEncrypt));
+    }
+    for (policy, mode) in combos {
+        let name = format!("{policy:?}/{mode:?}");
+        println!(
+            "secure crypto  {name:<36} {:>6.0} ns/Read (server: verify+decrypt request, sign+encrypt response)",
+            sym_cost(policy, mode)
+        );
+        for (label, a, spin) in [("blocking ", &addr, false), ("busy-poll", &spin_addr, true)] {
+            let mut c = if policy == Policy::None {
+                Client::connect(a, &format!("opc.tcp://{a}")).unwrap()
+            } else {
+                Client::connect_secure(
+                    a,
+                    &format!("opc.tcp://{a}"),
+                    policy,
+                    mode,
+                    &client_cert,
+                    &client_key,
+                    &server_cert,
+                )
+                .unwrap()
+            };
+            c.spin = spin;
+            c.create_session("bench").unwrap();
+            let (p50, p99) = round_trips(&mut c, 30_000);
+            println!("secure loopback {name:<35} {label}  p50 {p50:>6.1} us  p99 {p99:>6.1} us");
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Server-side symmetric crypto of one Read x1 exchange (sizes of a real
+/// request and response chunk), best of 5.
+fn sym_cost(policy: Policy, mode: Mode) -> f64 {
+    if mode == Mode::None {
+        return 0.0;
+    }
+    let keys = ChannelKeys::derive(policy, &[7; 32], &[9; 32]).unwrap();
+    let (req_len, resp_len) = (128usize, 96usize); // encrypted part: multiples of 16
+    let mut req = vec![0x5Au8; 8 + req_len + 32];
+    let mut resp = vec![0xA5u8; 8 + resp_len];
+    let n = 200_000;
+    let mut best = f64::MAX;
+    for _ in 0..5 {
+        let t = Instant::now();
+        for _ in 0..n {
+            if mode == Mode::SignAndEncrypt {
+                keys.remote.decrypt(&mut req[8..8 + req_len]).unwrap();
+            }
+            black_box(keys.remote.verify_parts(&[&req[..8], &req[8..8 + req_len]], &req[8 + req_len..]));
+            resp.truncate(8 + resp_len);
+            let sig = keys.local.sign(&resp);
+            resp.extend_from_slice(&sig);
+            if mode == Mode::SignAndEncrypt {
+                keys.local.encrypt(&mut resp[8..8 + resp_len + 32]).unwrap();
+            }
+            black_box(&resp);
+        }
+        best = best.min(t.elapsed().as_nanos() as f64 / n as f64);
+    }
+    best
+}
+
+fn round_trips(c: &mut Client, n: usize) -> (f64, f64) {
+    let node = [(NodeId::Numeric(2, 42), 13)];
+    for _ in 0..2_000 {
+        c.read(&node).unwrap();
+    }
+    let mut samples = Vec::with_capacity(n);
+    for _ in 0..n {
+        let t = Instant::now();
+        black_box(c.read(&node).unwrap());
+        samples.push(t.elapsed().as_nanos() as u64);
+    }
+    samples.sort_unstable();
+    (percentile(&samples, 0.5) as f64 / 1000.0, percentile(&samples, 0.99) as f64 / 1000.0)
 }
 
 fn loopback(label: &str, addr: &str, client_spin: bool) {
