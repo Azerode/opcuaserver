@@ -2,6 +2,7 @@
 
 pub mod address_space;
 pub mod aggregates;
+pub mod alarms;
 pub mod channel;
 pub mod client;
 pub mod codec;

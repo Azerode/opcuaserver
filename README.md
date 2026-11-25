@@ -33,9 +33,13 @@ The original C server (open62541 + json-c) is still in `src/`. See [Legacy C ser
 - **Aggregates:** 37 aggregate functions of Part 13 (averages, time averages, totals, minimum / maximum and their variants, range, count, start / end and bounds, durations in state, transitions, quality durations and percentages, worst quality, standard deviation and variance).
   - HistoryRead with ReadProcessedDetails, any processing interval, forward or reverse, with an AggregateConfiguration.
   - AggregateFilter on MonitoredItems of historized variables: one value per processing interval.
+- **Alarms and conditions (Part 9):** an item with an `Alarm` gets a condition: an ExclusiveLimitAlarm (HighHigh / High / Low / LowLow limits with a deadband) or an OffNormalAlarm (a normal value).
+  - Every write of the variable evaluates its condition; state changes raise condition events with the Active, Acked, Confirmed, Enabled and LimitState fields.
+  - Methods Acknowledge, Confirm, AddComment, Enable, Disable, ConditionRefresh and ConditionRefresh2, through Call.
+  - Condition states survive configuration reloads.
 - **Hot reload:** the configuration directory is watched (inotify, polling elsewhere). The new address space is swapped in atomically, readers never lock, and values survive reloads. An invalid file is rejected and the previous configuration stays live.
 
-Not yet: the full namespace 0 nodeset, conditions and alarms, index ranges on MonitoredItems and in writes, event history, history persistence across restarts, ECC policies, the HTTPS transport (`opc.https`).
+Not yet: the full namespace 0 nodeset, condition branches and shelving, dialog conditions, index ranges on MonitoredItems and in writes, event history, history persistence across restarts, ECC policies, the HTTPS transport (`opc.https`).
 
 ## Build and run
 
@@ -80,12 +84,15 @@ Every `*.json` file in the directory, searched recursively, is one namespace:
       "Items": [
         { "Name": "PC", "NodeId": "ns=5;i=1000", "Type": "System.Int16", "Writable": true },
         { "Name": "Level", "NodeId": "s=Level", "Type": "Double", "EURange": { "Low": 0, "High": 200 },
-          "Historizing": true, "HistoryCapacity": 50000 } ] }
+          "Historizing": true, "HistoryCapacity": 50000,
+          "Alarm": { "HighHigh": 190, "High": 170, "Low": 20, "Deadband": 2, "Severity": 700 } },
+        { "Name": "Door", "NodeId": "s=Door", "Type": "Boolean",
+          "Alarm": { "Normal": false, "Message": "Door open" } } ] }
   ]
 }
 ```
 
-Variables appear under `Objects/<Name>/<group>/<item>`. Supported types are Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float, Double, String, DateTime, Guid and ByteString. A numeric item with an `EURange` (`{"Low": .., "High": ..}` or `[low, high]`) becomes an AnalogItemType variable with an EURange property, which percent deadbands use. `Historizing: true` records every write of the item for HistoryRead; `HistoryCapacity` (default 10 000) bounds the values kept. Adding, removing or editing a file takes effect about 50 ms later, without a restart.
+Variables appear under `Objects/<Name>/<group>/<item>`. Supported types are Boolean, SByte, Byte, Int16, UInt16, Int32, UInt32, Int64, UInt64, Float, Double, String, DateTime, Guid and ByteString. A numeric item with an `EURange` (`{"Low": .., "High": ..}` or `[low, high]`) becomes an AnalogItemType variable with an EURange property, which percent deadbands use. `Historizing: true` records every write of the item for HistoryRead; `HistoryCapacity` (default 10 000) bounds the values kept. `Alarm` adds a limit alarm (any of `LowLow`, `Low`, `High`, `HighHigh`, ordered, with an optional `Deadband`) or an off-normal alarm (`Normal`), with a `Severity` (default 500) and a `Message`. Adding, removing or editing a file takes effect about 50 ms later, without a restart.
 
 ## Performance
 

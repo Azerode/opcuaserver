@@ -11,16 +11,17 @@
 
 use crate::history::History;
 use crate::types::{builtin, status, DataValue, Variant};
-use std::sync::atomic::{fence, AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{fence, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 pub struct ValueCell {
     kind: u8,
     /// Encoded size of an inline kind, 0 for String / ByteString / Guid.
     size: u8,
-    /// Writes are recorded in `history` (Historizing variables). Next to
-    /// `kind`: in padding, on the cache line every write touches anyway.
-    historize: AtomicBool,
+    /// What a write does besides storing the value ([`HOOK_HISTORY`],
+    /// [`HOOK_ALARM`]). Next to `kind`: in padding, on the cache line every
+    /// write touches anyway, and one test for all hooks.
+    hooks: AtomicU8,
     seq: AtomicU32,
     bits: AtomicU64,
     status: AtomicU32,
@@ -33,10 +34,35 @@ pub struct ValueCell {
     stamp: &'static AtomicU32,
     /// Position in the block (top 6 bits of every stamp this cell stores).
     lane: u32,
+    /// History and alarm, allocated for the variables that have one (one
+    /// pointer keeps the cell small).
+    /// Set once (never replaced), freed with the cell: one load to reach it.
+    extras: std::sync::atomic::AtomicPtr<Extras>,
+}
+
+impl Drop for ValueCell {
+    fn drop(&mut self) {
+        let p = *self.extras.get_mut();
+        if !p.is_null() {
+            // SAFETY: created by Box::into_raw in `extras()`, owned by the cell.
+            drop(unsafe { Box::from_raw(p) });
+        }
+    }
+}
+
+#[derive(Default)]
+struct Extras {
     /// Kept when historizing is switched off, so data survives a reload
     /// that switches it back on.
-    history: OnceLock<Box<History>>,
+    history: OnceLock<History>,
+    /// Condition evaluated on every write (variables with an Alarm).
+    alarm: arc_swap::ArcSwapOption<crate::alarms::Condition>,
 }
+
+/// Writes are recorded in the history.
+pub const HOOK_HISTORY: u8 = 1;
+/// Writes are evaluated by an alarm condition.
+pub const HOOK_ALARM: u8 = 2;
 
 /// Cells per change stamp.
 pub const BLOCK: usize = 64;
@@ -240,8 +266,8 @@ impl ValueCell {
             source_ts: AtomicI64::new(created),
             server_ts: AtomicI64::new(created),
             blob: Mutex::new(default_value(kind)),
-            historize: AtomicBool::new(false),
-            history: OnceLock::new(),
+            hooks: AtomicU8::new(0),
+            extras: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -250,27 +276,82 @@ impl ValueCell {
     pub fn set_history(&self, capacity: Option<usize>) {
         match capacity {
             Some(cap) => {
-                self.history.get_or_init(|| Box::new(History::new(self.kind, cap))).set_capacity(cap);
-                self.historize.store(true, Ordering::Release);
+                self.extras().history.get_or_init(|| History::new(self.kind, cap)).set_capacity(cap);
+                self.hooks.fetch_or(HOOK_HISTORY, Ordering::Release);
             }
-            None => self.historize.store(false, Ordering::Release),
+            None => {
+                self.hooks.fetch_and(!HOOK_HISTORY, Ordering::Release);
+            }
+        }
+    }
+
+    /// Sets (or removes) the condition evaluated on every write.
+    #[cold]
+    pub fn set_alarm(&self, c: Option<std::sync::Arc<crate::alarms::Condition>>) {
+        let on = c.is_some();
+        if on || self.extras_get().is_some() {
+            self.extras().alarm.store(c);
+        }
+        if on {
+            self.hooks.fetch_or(HOOK_ALARM, Ordering::Release);
+        } else {
+            self.hooks.fetch_and(!HOOK_ALARM, Ordering::Release);
+        }
+    }
+
+    /// The condition of a variable with an Alarm.
+    pub fn alarm(&self) -> Option<std::sync::Arc<crate::alarms::Condition>> {
+        self.extras_get()?.alarm.load_full()
+    }
+
+    #[inline]
+    fn extras_get(&self) -> Option<&Extras> {
+        // SAFETY: non-null pointers come from Box::into_raw and live as long
+        // as the cell.
+        unsafe { self.extras.load(Ordering::Acquire).as_ref() }
+    }
+
+    #[cold]
+    fn extras(&self) -> &Extras {
+        if let Some(x) = self.extras_get() {
+            return x;
+        }
+        let new = Box::into_raw(Box::<Extras>::default());
+        match self.extras.compare_exchange(std::ptr::null_mut(), new, Ordering::AcqRel, Ordering::Acquire) {
+            // SAFETY: just published, owned by the cell.
+            Ok(_) => unsafe { &*new },
+            Err(cur) => {
+                // SAFETY: `new` was never shared; `cur` is owned by the cell.
+                drop(unsafe { Box::from_raw(new) });
+                unsafe { &*cur }
+            }
         }
     }
 
     /// History of a historizing cell.
     pub fn history(&self) -> Option<&History> {
-        if self.historize.load(Ordering::Acquire) {
-            self.history.get().map(|h| &**h)
+        if self.hooks.load(Ordering::Acquire) & HOOK_HISTORY != 0 {
+            self.extras_get()?.history.get()
         } else {
             None
         }
     }
 
+    /// History and alarm hooks of a write (never inlined: off the path of
+    /// variables without hooks).
     #[cold]
     #[inline(never)]
-    fn record(&self, value: &Variant, status: u32, source_ts: i64, server_ts: i64) {
-        if let Some(h) = self.history.get() {
-            h.record(Sample { value: value.clone(), status, source_ts, server_ts });
+    fn run_hooks(&self, hooks: u8, value: &Variant, status: u32, source_ts: i64, server_ts: i64) {
+        let Some(x) = self.extras_get() else { return };
+        if hooks & HOOK_HISTORY != 0 {
+            if let Some(h) = x.history.get() {
+                h.record(Sample { value: value.clone(), status, source_ts, server_ts });
+            }
+        }
+        if hooks & HOOK_ALARM != 0 {
+            if let Some(c) = &*x.alarm.load() {
+                c.evaluate(value, status, source_ts);
+            }
         }
     }
 
@@ -389,8 +470,9 @@ impl ValueCell {
             let seq = self.seq.fetch_add(2, Ordering::Release).wrapping_add(2);
             drop(blob);
             self.publish(seq);
-            if self.historize.load(Ordering::Relaxed) {
-                self.record(value, status, source_ts, server_ts);
+            let hooks = self.hooks.load(Ordering::Relaxed);
+            if hooks != 0 {
+                self.run_hooks(hooks, value, status, source_ts, server_ts);
             }
             return;
         }
@@ -414,8 +496,9 @@ impl ValueCell {
         self.server_ts.store(server_ts, Ordering::Relaxed);
         self.seq.store(s.wrapping_add(2), Ordering::Release);
         self.publish(s.wrapping_add(2));
-        if self.historize.load(Ordering::Relaxed) {
-            self.record(value, status, source_ts, server_ts);
+        let hooks = self.hooks.load(Ordering::Relaxed);
+        if hooks != 0 {
+            self.run_hooks(hooks, value, status, source_ts, server_ts);
         }
     }
 
@@ -527,4 +610,11 @@ mod tests {
         }
         reader.join().unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn cell_size() {
+    // Hooks live behind one pointer: a bigger cell costs every write.
+    assert!(std::mem::size_of::<ValueCell>() <= 88, "{}", std::mem::size_of::<ValueCell>());
 }

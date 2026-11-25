@@ -475,6 +475,7 @@ pub mod ids {
     pub const HAS_COMPONENT: u32 = 47;
     pub const HAS_NOTIFIER: u32 = 48;
     pub const HAS_ORDERED_COMPONENT: u32 = 49;
+    pub const HAS_CONDITION: u32 = 9006;
 
     // Object / variable types
     pub const BASE_OBJECT_TYPE: u32 = 58;

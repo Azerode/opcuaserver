@@ -831,10 +831,27 @@ pub enum FilterOperand {
     Field(String),
 }
 
+/// A field by browse path ("Severity", "ActiveState/Id") of BaseEventType,
+/// or of another type given as "<ns0 id>:<path>" ("2782:ClientUserId");
+/// "ConditionId" is the NodeId attribute of ConditionType (Part 9 §5.5.2).
 fn write_simple_operand(w: &mut Writer, name: &str) {
-    w.node_id(&NodeId::ns0(crate::events::types::BASE_EVENT_TYPE));
-    w.i32(1);
-    w.qualified_name(&QualifiedName { ns: 0, name: name.into() });
+    use crate::events::types::{BASE_EVENT_TYPE, CONDITION_TYPE};
+    if name == "ConditionId" {
+        w.node_id(&NodeId::ns0(CONDITION_TYPE));
+        w.i32(0);
+        w.u32(1);
+        w.str(None);
+        return;
+    }
+    let (ty, name) = match name.split_once(':').and_then(|(t, n)| Some((t.parse().ok()?, n))) {
+        Some((t, n)) => (t, n),
+        None => (BASE_EVENT_TYPE, name),
+    };
+    w.node_id(&NodeId::ns0(ty));
+    w.i32(name.split('/').count() as i32);
+    for part in name.split('/') {
+        w.qualified_name(&QualifiedName { ns: 0, name: part.into() });
+    }
     w.u32(13);
     w.str(None);
 }

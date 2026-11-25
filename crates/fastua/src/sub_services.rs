@@ -607,6 +607,28 @@ fn call_method(
     resend: &mut bool,
 ) -> CallResult {
     let fail = |code| Err((code, Vec::new()));
+    // Condition methods: called on a condition instance with the method of
+    // its type (Part 9 §5.5), or on ConditionType for ConditionRefresh.
+    let user = s.identity.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let can_write = s.can_write.load(Ordering::Relaxed);
+    let mut check = |sub: u32, item: Option<u32>| {
+        let mut st = lock(s);
+        let Some(sub) = st.find(sub) else { return Err(BAD_SUBSCRIPTION_ID_INVALID) };
+        if item.is_some_and(|i| !sub.is_event_item(i)) {
+            return Err(BAD_MONITORED_ITEM_ID_INVALID);
+        }
+        Ok(())
+    };
+    let caller = crate::alarms::Caller { user: &user, can_write, refresh: &mut check };
+    if let Some(r) = crate::alarms::call(&space.alarms, &space.events, object, method, args, caller) {
+        if r.is_ok() {
+            *resend = true;
+        }
+        return match r {
+            Err((status::BAD_NODE_ID_UNKNOWN, _)) if space.find(object).is_some() => fail(BAD_METHOD_INVALID),
+            r => r,
+        };
+    }
     let Some(o) = space.find(object) else { return fail(status::BAD_NODE_ID_UNKNOWN) };
     let Some(m) = space.find(method) else { return fail(BAD_METHOD_INVALID) };
     if !matches!(space.node(m).kind, NodeKind::Method { .. })

@@ -261,6 +261,46 @@ The functions are Objects of AggregateFunctionType under
   an interval late. The AggregateFilterResult returns the start time,
   interval and configuration in effect.
 
+## Alarms and conditions
+
+An item with an `Alarm` gets a condition object `<Name>Alarm`
+(`ns=<ns>;s=__alarm/<NodeId>`), referenced from the variable by HasCondition.
+
+- **Types:** ExclusiveLimitAlarmType when the alarm has limits (`LowLow`,
+  `Low`, `High`, `HighHigh`, any subset, ordered), OffNormalAlarmType when it
+  has a `Normal` value (Boolean or number). ConditionClass is
+  ProcessConditionClassType.
+- **Evaluation:** every write of the variable evaluates the condition (a
+  hook that variables without an alarm never run: one flag test in the
+  cell's padding). The most severe limit crossed wins; a limit state is left
+  only once the value is `Deadband` back on the normal side. Bad values keep
+  the state and only update Quality. A new or more severe state needs a new
+  Acknowledge and Confirm.
+- **Events:** each state change raises an event of the alarm type on the
+  Server object with every field of the type: EventId, ConditionId (the
+  NodeId attribute of ConditionType), ConditionName, Retain, EnabledState,
+  ActiveState (with EffectiveDisplayName), AckedState, ConfirmedState,
+  LimitState/CurrentState, the limits, Quality, LastSeverity, Comment,
+  ClientUserId, each with its Id and TransitionTime. Select clauses use
+  browse paths such as `ActiveState/Id`.
+- **Methods:** Acknowledge and Confirm (EventId and comment), AddComment,
+  Enable and Disable (write rights), called on the condition with the
+  method of its type. They return `BadEventIdUnknown` for an EventId that
+  is not the condition's last one, `BadConditionBranchAlreadyAcked` /
+  `Confirmed`, `BadConditionDisabled`, `BadConditionAlreadyEnabled` /
+  `Disabled`.
+- **ConditionRefresh / ConditionRefresh2** (on ConditionType): sends
+  RefreshStart, every retained condition, RefreshEnd to the subscription
+  (or one event item) only. RefreshStart and RefreshEnd go through whatever
+  the where clause is, so a client filtering on its alarm types still sees
+  them.
+- **Reloads:** condition states survive reloads; new limits or severity
+  apply at the next evaluation; a removed alarm disappears.
+
+Not yet: branches, shelving, suppression, dialog conditions and the
+condition's state variables as browsable nodes (their values travel in the
+events).
+
 ## Security
 
 ### Endpoints
@@ -330,9 +370,10 @@ BrowseNext, TranslateBrowsePathsToNodeIds, RegisterNodes/UnregisterNodes,
 Cancel, Call, ServerStatus with BuildInfo, NamespaceArray, ServerCapabilities
 with OperationLimits, every Subscription and MonitoredItem service (see
 [Subscriptions](#subscriptions)) and events with session audit (see
-[Events](#events)).
+[Events](#events)), alarms and conditions (see
+[Alarms and conditions](#alarms-and-conditions)).
 
-Not yet: the full namespace 0 nodeset, conditions and alarms, index ranges on
+Not yet: the full namespace 0 nodeset, condition branches and shelving, index ranges on
 MonitoredItems and in writes (`BadWriteNotSupported`), event history,
 history persistence across restarts, aggregates,
 ECC policies.
