@@ -409,9 +409,6 @@ impl DataValue {
     pub fn value(v: Variant) -> Self {
         DataValue { value: Some(v), ..Default::default() }
     }
-    pub fn status(code: u32) -> Self {
-        DataValue { status: Some(code), ..Default::default() }
-    }
 }
 
 /// UTC "now" as OPC UA DateTime (100 ns ticks since 1601-01-01).

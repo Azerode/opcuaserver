@@ -150,16 +150,6 @@ impl Suite {
         }
     }
 
-    pub fn symmetric_uri(self) -> &'static str {
-        match (self.cipher, self.sym_key_len()) {
-            (Cipher::ChaChaPoly, _) => "http://opcfoundation.org/UA/security/chacha20-poly1305",
-            (Cipher::AesCbc, 16) => "http://www.w3.org/2001/04/xmlenc#aes128-cbc",
-            (Cipher::AesCbc, _) => "http://www.w3.org/2001/04/xmlenc#aes256-cbc",
-            (Cipher::AesGcm, 16) => "http://opcfoundation.org/UA/security/aes128-gcm",
-            _ => "http://opcfoundation.org/UA/security/aes256-gcm",
-        }
-    }
-
     fn agreement(self) -> &'static agreement::Algorithm {
         match self.curve {
             Curve::NistP256 => &agreement::ECDH_P256,

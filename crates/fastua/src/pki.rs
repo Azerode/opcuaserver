@@ -17,7 +17,6 @@
 //! are re-read automatically when their directories change.
 
 use crate::crypto::{thumbprint, CryptoError, PrivateKey};
-use crate::types::status;
 use aws_lc_rs::signature::{self, UnparsedPublicKey, VerificationAlgorithm};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -567,9 +566,6 @@ pub fn generate_self_signed_ecc(
     let cert = params.self_signed(&key).map_err(|_| CryptoError)?;
     Ok((cert.der().to_vec(), pkcs8))
 }
-
-/// Re-export for status code mapping in the channel layer.
-pub const SECURITY_CHECKS_FAILED: u32 = status::BAD_SECURITY_CHECKS_FAILED;
 
 #[cfg(test)]
 mod tests {

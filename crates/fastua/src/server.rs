@@ -659,10 +659,6 @@ impl Server {
         Some(Ok(orphans.swap_remove(i).sub))
     }
 
-    pub fn session_count(&self) -> usize {
-        self.sessions.lock().unwrap_or_else(|e| e.into_inner()).len()
-    }
-
     /// Accepts connections forever, one thread per connection. OPC UA servers
     /// have few, long-lived clients: a dedicated thread with a blocking socket
     /// gives the lowest possible latency (no executor, no wake-up hops).

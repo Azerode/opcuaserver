@@ -2,8 +2,6 @@
 
 fastua is an OPC UA server written from scratch in Rust. It is built for minimum latency and a small footprint. Its address space comes from a directory of JSON files and is hot-reloaded on every change. It runs natively on **x86_64** and **aarch64** Linux.
 
-The original C server (open62541 + json-c) is still in `src/`. See [Legacy C server](#legacy-c-server).
-
 ## Features
 
 - **Transport:** UA TCP binary (HEL/ACK/ERR, chunking both ways, pipelined requests).
@@ -204,10 +202,6 @@ $I/serve.sh $B dotnet dotnet-interop/fastua-interop-dotnet.dll
 `serve.sh` starts a fresh server (namespace [tests/interop/config](crates/fastua/tests/interop/config/Plant/Plant.json), every default endpoint, HTTPS, users `operator` / `viewer`, event history) and runs the client against it.
 
 `.github/workflows/rust.yml` builds, tests, benchmarks and runs the four interoperability suites natively on x86_64 and aarch64.
-
-## Legacy C server
-
-The first implementation (open62541 + json-c) is still in `src/`, built with `make` (needs `cmake` and `libmbedtls-dev`, which `apt-get install build-essential cmake libmbedtls-dev` provides on Debian/Ubuntu). Run it with `./bin/opcuaserver config.json5`.
 
 ## License
 MIT License
