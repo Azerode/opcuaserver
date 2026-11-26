@@ -78,3 +78,7 @@ dkms.conf
 
 # Rust
 /target/
+
+# Interop clients
+node_modules/
+crates/fastua/tests/interop/dotnet/obj/

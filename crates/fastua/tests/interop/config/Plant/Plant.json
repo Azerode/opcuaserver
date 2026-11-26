@@ -1,0 +1,27 @@
+{
+    "Name": "Plant",
+    "Namespace": "urn:fastua:interop:plant",
+    "Subscriptions": [
+        {
+            "Name": "Line",
+            "Items": [
+                { "Name": "Speed", "NodeId": "i=1", "Type": "Int32", "Writable": true },
+                { "Name": "Running", "NodeId": "i=2", "Type": "Boolean", "Writable": true },
+                { "Name": "Counter", "NodeId": "i=3", "Type": "UInt64", "Writable": true },
+                { "Name": "Recipe", "NodeId": "s=Recipe", "Type": "String", "Writable": true },
+                { "Name": "Ratio", "NodeId": "s=Ratio", "Type": "Float", "Writable": true },
+                { "Name": "Stamp", "NodeId": "s=Stamp", "Type": "DateTime", "Writable": true },
+                { "Name": "Id", "NodeId": "s=Id", "Type": "Guid", "Writable": true },
+                { "Name": "Blob", "NodeId": "s=Blob", "Type": "ByteString", "Writable": true }
+            ]
+        },
+        {
+            "Name": "Tank",
+            "Items": [
+                { "Name": "Level", "NodeId": "s=Level", "Type": "Double", "Writable": true,
+                  "EURange": { "Low": 0, "High": 200 }, "Historizing": true,
+                  "Alarm": { "High": 100, "HighHigh": 150, "Severity": 600 } }
+            ]
+        }
+    ]
+}

@@ -704,11 +704,9 @@ fn parse_event_details(body: &[u8]) -> Result<EventQuery, u32> {
     let max = r.u32().map_err(bad)? as usize;
     let start = r.i64().map_err(bad)?;
     let end = r.i64().map_err(bad)?;
-    let (ty, enc, fbody) = r.extension_object_raw().map_err(bad)?;
-    if ty.as_ns0() != Some(ids::EVENT_FILTER_ENCODING) || enc != 1 {
-        return Err(crate::events::codes::BAD_EVENT_FILTER_INVALID);
-    }
-    let (filter, result) = crate::events::parse_filter(fbody).map_err(bad)?;
+    // Filter is a field of type EventFilter, encoded in place (Part 11
+    // §6.5.2, Part 6 §5.2.6), not in an ExtensionObject.
+    let (filter, result) = crate::events::parse_filter(r.rest()).map_err(bad)?;
     if !result.is_good() || filter.select_len() == 0 {
         return Err(crate::events::codes::BAD_EVENT_FILTER_INVALID);
     }

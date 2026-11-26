@@ -1,0 +1,10 @@
+{
+  "name": "fastua-interop-node-opcua",
+  "private": true,
+  "description": "Interoperability check of fastua against the node-opcua client",
+  "type": "module",
+  "dependencies": {
+    "node-opcua-certificate-manager": "2.186.17",
+    "node-opcua-client": "2.186.17"
+  }
+}

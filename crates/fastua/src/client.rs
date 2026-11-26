@@ -1493,12 +1493,18 @@ impl MonitorSpec {
         w.u32(max);
         w.i64(start);
         w.i64(end);
-        self.write_event_filter(&mut w);
+        // An EventFilter field, encoded in place.
+        self.write_event_filter_body(&mut w);
         buf
     }
 
     fn write_event_filter(&self, w: &mut Writer) {
         let at = w.begin_extension_object(ids::EVENT_FILTER_ENCODING);
+        self.write_event_filter_body(w);
+        w.end_extension_object(at);
+    }
+
+    fn write_event_filter_body(&self, w: &mut Writer) {
         let select = self.event_select.as_deref().unwrap_or(&[]);
         w.i32(select.len() as i32);
         for f in select {
@@ -1529,7 +1535,6 @@ impl MonitorSpec {
                 w.end_extension_object(x);
             }
         }
-        w.end_extension_object(at);
     }
 }
 

@@ -1816,6 +1816,11 @@ impl SessionSubs {
         }
     }
 
+    /// Position of a queued Publish request in the queue (0: answered next).
+    pub fn request_position(&self, request_id: u32, channel_id: u32) -> Option<usize> {
+        self.requests.iter().position(|r| r.request_id == request_id && r.channel_id == channel_id)
+    }
+
     /// Earliest time `tick` / `write_next` have something to do (0 = now).
     pub fn next_deadline(&self) -> u64 {
         if !self.requests.is_empty()

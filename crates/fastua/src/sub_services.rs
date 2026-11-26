@@ -221,7 +221,10 @@ pub(super) fn publish(ctx: &mut Ctx, h: &RequestHeader, r: &mut Reader, w: &mut 
     }
     // A late subscription is answered right away, otherwise the request
     // waits for the next publishing cycle.
-    match st.write_next(l, now, ctx.channel_id, ctx.conn.max_response, w, false) {
+    // Over HTTPS, several connections share a session's queue: a response
+    // goes out on its own request's connection only.
+    let ours = !ctx.security.https || st.request_position(ctx.conn.request_id, ctx.channel_id) == Some(0);
+    match if ours { st.write_next(l, now, ctx.channel_id, ctx.conn.max_response, w, false) } else { None } {
         Some(ready) if ready.request_id != ctx.conn.request_id => ctx.conn.reply_to = Some(ready.request_id),
         Some(_) => {}
         None => ctx.conn.deferred = true,

@@ -5,11 +5,15 @@
 //! and user tokens are protected like on the unsecured opc.tcp endpoint.
 //!
 //! One thread per TLS connection, HTTP/1.1 keep-alive, requests answered in
-//! order. A TLS connection is a virtual secure channel: a session is bound
-//! to the connection that activated it (ActivateSession on another one
-//! moves it). A Publish holds its HTTP response until a notification or a
-//! keep-alive is due, so clients keep a Publish outstanding as usual; the
-//! subscriptions of the connection are evaluated while it waits.
+//! order. HTTP clients spread the requests of one session over several
+//! connections (the OPC Foundation stack does): the connections of one
+//! client identity (its TLS client certificate, or none) form one virtual
+//! secure channel, so a session works on any of them, while a session
+//! activated with a certificate is out of reach of the others. A Publish
+//! holds its HTTP response until a notification or a keep-alive is due, so
+//! clients keep Publish requests outstanding as usual; each one waits on
+//! its own connection, evaluating the session's subscriptions, and the
+//! session's queue answers them in order.
 //!
 //! TLS client certificates (Part 6 §7.4.3): the server asks for one
 //! ([`ClientAuth`]). A certificate the client presents is validated against
@@ -23,9 +27,11 @@ use crate::json::{self, Transcoder};
 use crate::server::Server;
 use crate::services;
 use crate::subscription::mono_ns;
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Transport profile of the HTTPS endpoint.
@@ -119,8 +125,49 @@ pub fn tls_config(cert_der: &[u8], key_pkcs8: &[u8], clients: ClientAuth) -> Res
     Ok(Arc::new(config))
 }
 
+/// State shared by the HTTPS connections.
+struct Shared {
+    /// Virtual secure channel of the connections without client certificate.
+    anonymous: u32,
+    /// Virtual secure channel per client certificate (DER).
+    by_cert: Mutex<HashMap<Vec<u8>, u32>>,
+    /// Request ids, unique across connections (Publish queues are shared).
+    request_ids: AtomicU32,
+}
+
+impl Shared {
+    fn channel_for(&self, server: &Server, cert: &[u8]) -> u32 {
+        let mut map = self.by_cert.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&id) = map.get(cert) {
+            return id;
+        }
+        // Bounded: a client cycling through certificates gets new channels
+        // without growing the map forever.
+        if map.len() >= 4096 {
+            map.clear();
+        }
+        let id = server.next_channel_id();
+        map.insert(cert.to_vec(), id);
+        id
+    }
+
+    fn next_request_id(&self) -> u32 {
+        loop {
+            let id = self.request_ids.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            if id != 0 {
+                return id;
+            }
+        }
+    }
+}
+
 /// Accepts HTTPS connections forever, one thread per connection.
 pub fn serve(server: Arc<Server>, listener: TcpListener, tls: Arc<rustls::ServerConfig>) {
+    let shared = Arc::new(Shared {
+        anonymous: server.next_channel_id(),
+        by_cert: Mutex::new(HashMap::new()),
+        request_ids: AtomicU32::new(0),
+    });
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(s) => s,
@@ -129,10 +176,10 @@ pub fn serve(server: Arc<Server>, listener: TcpListener, tls: Arc<rustls::Server
                 continue;
             }
         };
-        let (server, tls) = (server.clone(), tls.clone());
+        let (server, tls, shared) = (server.clone(), tls.clone(), shared.clone());
         let r = std::thread::Builder::new().name("fastua-https".into()).spawn(move || {
             let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_default();
-            if let Err(e) = connection(&server, stream, tls) {
+            if let Err(e) = connection(&server, &shared, stream, tls) {
                 if e.kind() != io::ErrorKind::UnexpectedEof {
                     crate::log!("https connection {peer} closed: {e}");
                 }
@@ -213,14 +260,19 @@ fn respond_as(w: &mut impl Write, code: &str, content_type: &str, body: &[u8], c
     w.flush()
 }
 
-fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerConfig>) -> io::Result<()> {
+fn connection(
+    server: &Arc<Server>,
+    shared: &Shared,
+    stream: TcpStream,
+    tls: Arc<rustls::ServerConfig>,
+) -> io::Result<()> {
     let limits = server.limits().clone();
     let _ = stream.set_nodelay(true);
     stream.set_read_timeout(Some(limits.hello_timeout))?;
     let conn = rustls::ServerConnection::new(tls).map_err(io::Error::other)?;
     let tls = rustls::StreamOwned::new(conn, stream);
     let mut tls = BufReader::with_capacity(64 * 1024, tls);
-    let channel_id = server.next_channel_id();
+    let mut channel_id = shared.anonymous;
     let mut security = Security::HTTPS;
     let mut first = true;
     let mut session = None;
@@ -230,7 +282,6 @@ fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerCo
     let mut body = Vec::new();
     let mut json_in = Vec::new();
     let mut tx: Vec<u8> = Vec::with_capacity(limits.buffer_size as usize);
-    let mut request_id = 0u32;
     loop {
         let Some(head) = read_head(&mut tls, &mut line)? else { return Ok(()) };
         if std::mem::take(&mut first) {
@@ -238,7 +289,10 @@ fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerCo
             if let Some(certs) = tls.get_ref().conn.peer_certificates() {
                 let chain: Vec<u8> = certs.iter().flat_map(|c| c.as_ref().iter().copied()).collect();
                 match server.pki().validate_application(&chain) {
-                    Ok(info) => security.client_cert = Some(Arc::new(info)),
+                    Ok(info) => {
+                        security.client_cert = Some(Arc::new(info));
+                        channel_id = shared.channel_for(server, &chain);
+                    }
                     Err(code) => {
                         crate::log!("https client certificate rejected (0x{code:08X})");
                         respond(tls.get_mut(), "403 Forbidden", b"", true)?;
@@ -268,7 +322,7 @@ fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerCo
         }
         body.resize(len, 0);
         tls.read_exact(&mut body)?;
-        request_id = request_id.wrapping_add(1);
+        let request_id = shared.next_request_id();
 
         tx.clear();
         tx.resize(MSG_HEADER_LEN, 0);
@@ -309,7 +363,7 @@ fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerCo
         conn.reply_to = None;
         if std::mem::take(&mut conn.deferred) {
             // Publish: answer it once the session has something to send.
-            wait_publish(server, channel_id, &mut conn, &mut space, &mut tx);
+            wait_publish(server, channel_id, request_id, session.clone(), &mut conn, &mut space, &mut tx);
         }
         let _ = handle;
         if tx.len() - MSG_HEADER_LEN > conn.max_response {
@@ -333,48 +387,57 @@ fn connection(server: &Arc<Server>, stream: TcpStream, tls: Arc<rustls::ServerCo
     }
 }
 
-/// Runs the subscriptions of this connection until a Publish response is
-/// written to `tx`.
+/// Runs the session's subscriptions until the Publish request `request_id`
+/// is answered into `tx` (the session's queue answers requests in order;
+/// the ones ahead of it belong to other connections).
 fn wait_publish(
     server: &Arc<Server>,
     channel_id: u32,
+    request_id: u32,
+    session: Option<Arc<crate::server::Session>>,
     conn: &mut services::ConnState,
     space: &mut Option<Arc<crate::address_space::AddressSpace>>,
     tx: &mut Vec<u8>,
 ) {
     let limits = server.limits();
+    let gone = |tx: &mut Vec<u8>| {
+        tx.clear();
+        tx.resize(MSG_HEADER_LEN, 0);
+        services::write_fault(&mut Writer::new(tx), 0, crate::types::status::BAD_SESSION_CLOSED);
+    };
+    let Some(s) = session else { return gone(tx) };
     loop {
         let now = mono_ns();
         server.store.cached(space);
-        let mut deadline = u64::MAX;
-        for s in &conn.sessions {
-            if s.closed.load(std::sync::atomic::Ordering::Acquire)
-                || s.channel_id.load(std::sync::atomic::Ordering::Acquire) != channel_id
-            {
-                continue;
-            }
+        if s.closed.load(Ordering::Acquire) || s.channel_id.load(Ordering::Acquire) != channel_id {
+            return gone(tx);
+        }
+        let (front, deadline) = {
             let mut st = s.subs.lock().unwrap_or_else(|e| e.into_inner());
             st.tick(now, space.as_ref().unwrap());
-            tx.clear();
-            tx.resize(MSG_HEADER_LEN, 0);
-            if st.write_next(limits, now, channel_id, conn.max_response, &mut Writer::new(tx), true).is_some() {
-                // Kept for Republish (a copy: `tx` is sent after this).
-                let mut copy = tx.clone();
-                st.keep_sent(&mut copy, true);
-                return;
+            let front = match st.request_position(request_id, channel_id) {
+                // Dropped (the session moved to another channel).
+                None => return gone(tx),
+                Some(p) => p == 0,
+            };
+            if front {
+                tx.clear();
+                tx.resize(MSG_HEADER_LEN, 0);
+                if st.write_next(limits, now, channel_id, conn.max_response, &mut Writer::new(tx), true).is_some() {
+                    // Kept for Republish (a copy: `tx` is sent after this).
+                    let mut copy = tx.clone();
+                    st.keep_sent(&mut copy, true);
+                    return;
+                }
             }
-            deadline = deadline.min(st.next_deadline());
-        }
-        if deadline == u64::MAX {
-            // Nothing will ever answer it (the session went away).
-            tx.clear();
-            tx.resize(MSG_HEADER_LEN, 0);
-            services::write_fault(&mut Writer::new(tx), 0, crate::types::status::BAD_SESSION_CLOSED);
-            return;
-        }
+            (front, st.next_deadline())
+        };
         let now = mono_ns();
-        if deadline > now {
-            std::thread::sleep(Duration::from_nanos(deadline - now));
+        // Behind another connection's request: check again shortly after
+        // the deadline, when that request has been answered.
+        let wake = if front { deadline } else { deadline.max(now + 200_000) };
+        if wake > now {
+            std::thread::sleep(Duration::from_nanos((wake - now).min(1_000_000_000)));
         }
     }
 }
