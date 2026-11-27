@@ -1,0 +1,32 @@
+# One-command launch:   docker compose up -d --build
+# Clients connect to    opc.tcp://localhost:4840 (or FASTUA_HOST:FASTUA_PORT).
+services:
+  fastua:
+    build: .
+    image: fastua:latest
+    hostname: fastua
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${FASTUA_PORT:-4840}:4840"
+    volumes:
+      # Namespace files, hot-reloaded: edit them on the host, no restart needed.
+      - ./config/machines:/config:ro
+      # Server certificate, trusted/rejected client certificates, history.
+      - fastua-data:/data
+    # The endpoint URL must be the address clients use to reach the container,
+    # not the container's own hostname.
+    command:
+      - --config
+      - /config
+      - --pki
+      - /data/pki
+      - --listen
+      - 0.0.0.0:4840
+      - --endpoint
+      - opc.tcp://${FASTUA_HOST:-localhost}:${FASTUA_PORT:-4840}
+      - --application-uri
+      - urn:${FASTUA_HOST:-localhost}:fastua
+
+volumes:
+  fastua-data:

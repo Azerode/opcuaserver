@@ -1,0 +1,13 @@
+# Only the sources needed to build the server go into the build context.
+target/
+.git/
+.github/
+docs/
+**/node_modules/
+crates/fastua/tests/interop/dotnet/obj/
+*.log
+*.pem
+*.der
+*.crt
+*.key
+pki/

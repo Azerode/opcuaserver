@@ -123,3 +123,23 @@ jobs:
           name: fastua-linux-${{ matrix.arch }}
           path: target/release/fastua
           if-no-files-found: error
+
+  docker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image and start the server with Compose
+        run: docker compose up -d --build --wait
+      - name: The server answers an OPC UA Hello
+        run: |
+          for i in $(seq 1 20); do
+            # Hello (HELF, 56 bytes) for opc.tcp://localhost:4840; expect ACKF.
+            reply=$( { printf 'HELF\x38\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x18\x00\x00\x00opc.tcp://localhost:4840'; sleep 1; } \
+              | nc -q 2 localhost 4840 | head -c 4) || true
+            [ "$reply" = "ACKF" ] && { docker compose logs; exit 0; }
+            sleep 1
+          done
+          docker compose logs
+          exit 1
+      - run: docker compose down -v
+        if: always()
