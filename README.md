@@ -86,6 +86,32 @@ Main options (`fastua --help` lists them all):
 
 `echo -n 's3cret' | ./target/release/fastua hash-password` prints a password hash for the users file.
 
+### Docker
+
+One command builds the image and starts the server on port 4840:
+
+```bash
+docker compose up -d --build
+docker compose logs -f          # endpoints and connections
+docker compose down             # stop (the certificate store is kept)
+```
+
+Clients connect to `opc.tcp://localhost:4840`. The image is a multi-stage build: the release binary (same LTO profile as above) on `gcr.io/distroless/cc-debian12:nonroot`, about 12 MB compressed, no shell, non-root user.
+
+- `config/machines` is mounted read-only on `/config`: editing, adding or removing a namespace file on the host is picked up without a restart.
+- The `fastua-data` volume (`/data`) keeps the server certificate, the trusted and rejected client certificates (`/data/pki`) and the history (`/data/history`, used with `--history-dir /data/history`).
+- The advertised endpoint must be the address clients use, not the container's hostname. Set `FASTUA_HOST` (and `FASTUA_PORT` for another host port), for example `FASTUA_HOST=192.168.1.20 docker compose up -d`.
+- Other options go in the `command:` list of `docker-compose.yml`, which replaces the image's default arguments.
+- `docker build --build-arg TARGET_CPU=native -t fastua .` builds a binary tuned to the build machine's CPU, to run on that machine only.
+
+Without Compose:
+
+```bash
+docker build -t fastua .
+docker run -d -p 4840:4840 -v "$PWD/config/machines:/config:ro" -v fastua-data:/data fastua \
+  --config /config --pki /data/pki --endpoint opc.tcp://localhost:4840
+```
+
 ## Configuration
 
 Every `*.json` file in the directory, searched recursively, is one namespace:
