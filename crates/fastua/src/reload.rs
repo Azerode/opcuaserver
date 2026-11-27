@@ -69,10 +69,6 @@ impl Store {
         &self.info
     }
 
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
     /// Rebuilds from disk. On error the current snapshot stays in place.
     pub fn reload(&self) -> Result<u64, String> {
         let configs = config::load_dir(&self.dir)?;

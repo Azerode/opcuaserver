@@ -1738,10 +1738,6 @@ impl SessionSubs {
         self.subs.is_empty() && self.requests.is_empty() && self.status_msgs.is_empty()
     }
 
-    pub fn has_requests(&self) -> bool {
-        !self.requests.is_empty()
-    }
-
     pub fn has_status_changes(&self) -> bool {
         !self.status_msgs.is_empty()
     }

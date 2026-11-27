@@ -604,10 +604,6 @@ impl EventBus {
         }
     }
 
-    pub fn history_capacity(&self) -> usize {
-        self.history_capacity.load(Ordering::Relaxed)
-    }
-
     /// Runs `f` on the event history, under its lock.
     pub fn history_with<R>(&self, f: impl FnOnce(&EventHistory) -> R) -> R {
         f(&self.history.lock().unwrap_or_else(|e| e.into_inner()))

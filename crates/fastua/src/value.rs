@@ -299,11 +299,6 @@ impl ValueCell {
         }
     }
 
-    /// The condition of a variable with an Alarm.
-    pub fn alarm(&self) -> Option<std::sync::Arc<crate::alarms::Condition>> {
-        self.extras_get()?.alarm.load_full()
-    }
-
     #[inline]
     fn extras_get(&self) -> Option<&Extras> {
         // SAFETY: non-null pointers come from Box::into_raw and live as long
